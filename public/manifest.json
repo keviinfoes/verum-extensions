@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "web3",
+  "version": "0.1.0",
+  "description": "Browse web3:// dapps stored as calldata on Ethereum, verified by Helios light client",
+  "permissions": [
+    "tabs",
+    "storage",
+    "webNavigation",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://*.infura.io/*",
+    "*://*.alchemyapi.io/*",
+    "*://*.alchemy.com/*",
+    "*://*.chainsafe.io/*",
+    "*://*.quiknode.pro/*",
+    "*://*.publicnode.com/*",
+    "*://*.lightclientdata.org/*",
+    "*://*.drpc.org/*",
+    "*://*.ankr.com/*",
+    "*://cloudflare-eth.com/*",
+    "*://*.ethpandaops.io/*",
+    "*://*.ethstaker.cc/*",
+    "*://*.sigp.io/*",
+    "*://*.beaconstate.info/*",
+    "*://*.nimbus.team/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "omnibox": {
+    "keyword": "web3"
+  },
+  "action": {
+    "default_title": "Verum",
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "settings.html",
+    "open_in_tab": true
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["renderer.html", "chunks/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

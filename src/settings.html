@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Verum — Settings</title>
+  <link rel="stylesheet" href="./settings.css" />
+</head>
+<body>
+  <header>
+    <h1>Verum Settings</h1>
+    <p>Configure RPC endpoints per chain. Changes are saved automatically.</p>
+  </header>
+
+  <main>
+    <section id="default-chain-section">
+      <h2>Default chain</h2>
+      <p>Used when no chain ID is in the URL — e.g. <code>web3://myapp.eth</code></p>
+      <select id="default-chain-select"></select>
+    </section>
+
+    <div id="chains"></div>
+
+    <section id="add-chain">
+      <h2>Add chain</h2>
+      <div class="row">
+        <input id="new-chain-id"   type="number" placeholder="Chain ID (e.g. 17000)" />
+        <input id="new-chain-name" type="text"   placeholder="Name (e.g. Holesky)" />
+        <button id="add-chain-btn">Add</button>
+      </div>
+    </section>
+
+    <div id="saved-toast" class="hidden">Saved ✓</div>
+  </main>
+
+  <script type="module" src="./settings.ts"></script>
+</body>
+</html>

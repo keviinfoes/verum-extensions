@@ -1,0 +1,254 @@
+// Transaction inclusion proof via Patricia Merkle Trie reconstruction.
+//
+// All RPC calls go through IVerifiedRpc (Helios), which handles fallbacks,
+// retries, and consensus-layer header verification internally.
+//
+// We still reconstruct the transaction trie ourselves because Helios verifies
+// state (stateRoot) but not transaction calldata (transactionsRoot). The
+// transactionsRoot returned by Helios via eth_getBlockByNumber IS verified
+// against the sync committee — we use it as the anchor to prove our target
+// transaction's calldata is authentic.
+
+import { keccak256, getBytes, hexlify, encodeRlp, toBeArray } from 'ethers'
+import type { IVerifiedRpc } from './light-client.js'
+import type { VerificationResult } from '../types.js'
+
+// ---------------------------------------------------------------------------
+// Minimal Merkle Patricia Trie — build-only, no Node.js deps
+// ---------------------------------------------------------------------------
+
+type Nibbles = number[]
+
+function bytesToNibs(b: Uint8Array): Nibbles {
+  const n: Nibbles = []
+  for (const byte of b) n.push(byte >> 4, byte & 0xf)
+  return n
+}
+
+function hexPrefix(nibs: Nibbles, isLeaf: boolean): Uint8Array {
+  const flag = isLeaf ? 2 : 0
+  const even = nibs.length % 2 === 0
+  const all = even ? [flag, 0, ...nibs] : [flag + 1, ...nibs]
+  const out = new Uint8Array(all.length / 2)
+  for (let i = 0; i < out.length; i++) out[i] = (all[2 * i] << 4) | all[2 * i + 1]
+  return out
+}
+
+function sharedPrefix(a: Nibbles, b: Nibbles): number {
+  let i = 0
+  while (i < a.length && i < b.length && a[i] === b[i]) i++
+  return i
+}
+
+// ethers RLP.encode returns a hex string — wrap to get Uint8Array
+function rlpEncode(parts: (Uint8Array | Nibbles | string)[]): Uint8Array {
+  return getBytes(encodeRlp(parts as Parameters<typeof RLP.encode>[0]))
+}
+
+interface Item { key: Nibbles; val: Uint8Array }
+const EMPTY = new Uint8Array(0)
+
+// Returns the child-reference for a subtrie (hash if ≥32 bytes, inline otherwise)
+function nodeRef(items: Item[]): Uint8Array {
+  if (items.length === 0) return EMPTY
+  const rlp = nodeRlp(items)
+  return rlp.length >= 32 ? getBytes(keccak256(rlp)) : rlp
+}
+
+// Returns the RLP encoding of the node for a non-empty item set
+function nodeRlp(items: Item[]): Uint8Array {
+  if (items.length === 1) {
+    // Leaf: remaining path + value
+    return rlpEncode([hexPrefix(items[0].key, true), items[0].val])
+  }
+
+  // Shared prefix among all keys?
+  let pfx = items[0].key.length
+  for (let i = 1; i < items.length && pfx > 0; i++) {
+    pfx = Math.min(pfx, sharedPrefix(items[0].key, items[i].key))
+  }
+
+  if (pfx > 0) {
+    // Extension: shared prefix → recurse
+    const prefix = items[0].key.slice(0, pfx)
+    const rest = items.map((it) => ({ key: it.key.slice(pfx), val: it.val }))
+    return rlpEncode([hexPrefix(prefix, false), nodeRef(rest)])
+  }
+
+  // Branch: 16 slots by first nibble + optional value slot
+  const groups = new Map<number, Item[]>()
+  let branchVal = EMPTY
+  for (const it of items) {
+    if (it.key.length === 0) {
+      branchVal = it.val
+    } else {
+      const n = it.key[0]
+      if (!groups.has(n)) groups.set(n, [])
+      groups.get(n)!.push({ key: it.key.slice(1), val: it.val })
+    }
+  }
+  const slots: Uint8Array[] = []
+  for (let i = 0; i < 16; i++) {
+    const g = groups.get(i)
+    slots.push(g ? nodeRef(g) : EMPTY)
+  }
+  slots.push(branchVal)
+  return rlpEncode(slots)
+}
+
+// The transactions root is always keccak256 of the root node RLP
+function computeTrieRoot(items: Item[]): string {
+  if (items.length === 0) {
+    // keccak256(RLP('')) — the canonical empty trie root
+    return '0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421'
+  }
+  return keccak256(nodeRlp(items))
+}
+
+// ---------------------------------------------------------------------------
+// Transaction serialization (canonical, all EIP types)
+// ---------------------------------------------------------------------------
+
+interface RpcTx {
+  hash: string
+  blockHash: string
+  blockNumber: string
+  transactionIndex: string
+  type?: string
+  nonce: string
+  from: string
+  to: string | null
+  value: string
+  gas: string
+  gasPrice?: string
+  maxFeePerGas?: string
+  maxPriorityFeePerGas?: string
+  input: string
+  v: string
+  r: string
+  s: string
+  accessList?: { address: string; storageKeys: string[] }[]
+  maxFeePerBlobGas?: string
+  blobVersionedHashes?: string[]
+  chainId?: string
+  yParity?: string
+}
+
+// Strip leading zeros from a hex number for RLP (keeps 0x → empty, 0x0 → empty)
+function h(hex: string | undefined): Uint8Array {
+  if (!hex || hex === '0x' || hex === '0x0') return EMPTY
+  const clean = hex.length % 2 ? '0x0' + hex.slice(2) : hex
+  // Remove leading zero bytes (RLP positive integers have no leading zeros)
+  const raw = getBytes(clean)
+  let start = 0
+  while (start < raw.length - 1 && raw[start] === 0) start++
+  return raw.slice(start)
+}
+
+function addr(hex: string | null | undefined): Uint8Array {
+  return hex ? getBytes(hex) : EMPTY
+}
+
+function accessListRlp(list: RpcTx['accessList'] = []): unknown[] {
+  return list.map((item) => [
+    getBytes(item.address),
+    item.storageKeys.map((k) => getBytes(k)),
+  ])
+}
+
+function serializeTx(tx: RpcTx): Uint8Array {
+  const type = tx.type ? parseInt(tx.type, 16) : 0
+  const yParity = h(tx.yParity ?? tx.v)
+
+  if (type === 0) {
+    return getBytes(
+      encodeRlp([h(tx.nonce), h(tx.gasPrice), h(tx.gas), addr(tx.to), h(tx.value), getBytes(tx.input), h(tx.v), h(tx.r), h(tx.s)]),
+    )
+  }
+  if (type === 1) {
+    const inner = getBytes(
+      encodeRlp([h(tx.chainId), h(tx.nonce), h(tx.gasPrice), h(tx.gas), addr(tx.to), h(tx.value), getBytes(tx.input), accessListRlp(tx.accessList) as Parameters<typeof RLP.encode>[0], yParity, h(tx.r), h(tx.s)]),
+    )
+    return concat([new Uint8Array([0x01]), inner])
+  }
+  if (type === 2) {
+    const inner = getBytes(
+      encodeRlp([h(tx.chainId), h(tx.nonce), h(tx.maxPriorityFeePerGas), h(tx.maxFeePerGas), h(tx.gas), addr(tx.to), h(tx.value), getBytes(tx.input), accessListRlp(tx.accessList) as Parameters<typeof RLP.encode>[0], yParity, h(tx.r), h(tx.s)]),
+    )
+    return concat([new Uint8Array([0x02]), inner])
+  }
+  if (type === 3) {
+    const inner = getBytes(
+      encodeRlp([h(tx.chainId), h(tx.nonce), h(tx.maxPriorityFeePerGas), h(tx.maxFeePerGas), h(tx.gas), addr(tx.to), h(tx.value), getBytes(tx.input), accessListRlp(tx.accessList) as Parameters<typeof RLP.encode>[0], h(tx.maxFeePerBlobGas), (tx.blobVersionedHashes ?? []).map(getBytes), yParity, h(tx.r), h(tx.s)]),
+    )
+    return concat([new Uint8Array([0x03]), inner])
+  }
+  throw new Error(`Unsupported tx type: ${type}`)
+}
+
+function concat(parts: Uint8Array[]): Uint8Array {
+  const len = parts.reduce((s, p) => s + p.length, 0)
+  const out = new Uint8Array(len)
+  let pos = 0
+  for (const p of parts) { out.set(p, pos); pos += p.length }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Transaction trie key: RLP(index)
+// ---------------------------------------------------------------------------
+
+function txKey(index: number): Nibbles {
+  // RLP of integer index — for 0 this is 0x80 (empty bytes)
+  const indexBytes = index === 0 ? EMPTY : toBeArray(index)
+  return bytesToNibs(getBytes(encodeRlp(indexBytes)))
+}
+
+// ---------------------------------------------------------------------------
+// Public API — all RPC calls go through IVerifiedRpc (Helios)
+// ---------------------------------------------------------------------------
+
+export async function getVerifiedCalldata(
+  txHash: string,
+  rpc: IVerifiedRpc,
+): Promise<VerificationResult> {
+  // 1. Locate the transaction — Helios fetches via its configured endpoints
+  const tx = await rpc.request<RpcTx>('eth_getTransactionByHash', [txHash])
+  const blockNumber = parseInt(tx.blockNumber, 16)
+  const txIndex = parseInt(tx.transactionIndex, 16)
+
+  // 2. Fetch the full block — Helios verifies the header (transactionsRoot)
+  //    against the sync committee before returning it
+  interface RpcBlock { hash: string; transactionsRoot: string; timestamp: string; transactions: RpcTx[] }
+  const block = await rpc.request<RpcBlock>('eth_getBlockByNumber', [
+    `0x${blockNumber.toString(16)}`, true,
+  ])
+
+  // 3. Reconstruct the transaction trie locally and verify against the
+  //    Helios-verified transactionsRoot — proves calldata is authentic
+  const items: Item[] = block.transactions.map((t, i) => ({
+    key: txKey(i),
+    val: serializeTx(t),
+  }))
+  const computedRoot = computeTrieRoot(items)
+  const trieVerified = computedRoot.toLowerCase() === block.transactionsRoot.toLowerCase()
+
+  if (!trieVerified) {
+    throw new Error(
+      `Transaction trie mismatch!\n  computed:  ${computedRoot}\n  block:     ${block.transactionsRoot}\nData returned by the RPC is inconsistent.`,
+    )
+  }
+
+  return {
+    verified: true,
+    blockNumber,
+    blockHash: block.hash,
+    blockTimestamp: parseInt(block.timestamp, 16),
+    txHash,
+    txIndex,
+    trieVerified,
+    headerVerified: rpc.isHeliosBacked(),
+    calldata: getBytes(tx.input),
+  }
+}
+

@@ -1,0 +1,79 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0d1117; --surface: #161b22; --border: #30363d;
+  --text: #c9d1d9; --text-muted: #8b949e;
+  --green: #3fb950; --yellow: #d29922; --radius: 8px;
+}
+
+body {
+  width: 360px;
+  background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 12px;
+}
+
+#nav-bar {
+  display: flex; align-items: center;
+  border-bottom: 1px solid var(--border);
+  height: 36px; overflow: hidden;
+}
+#nav-scheme {
+  padding: 0 8px; color: var(--accent);
+  font-family: monospace; font-size: 12px;
+  border-right: 1px solid var(--border);
+  white-space: nowrap; line-height: 36px;
+}
+#nav-input {
+  flex: 1; border: none; outline: none;
+  background: transparent; color: var(--text);
+  font-family: monospace; font-size: 12px;
+  padding: 0 8px;
+}
+#nav-go {
+  background: transparent; border: none;
+  border-left: 1px solid var(--border);
+  color: var(--accent); cursor: pointer;
+  padding: 0 12px; height: 36px; font-size: 13px;
+}
+#nav-go:hover { background: rgba(88,166,255,0.1); }
+
+#idle {
+  padding: 20px; color: var(--text-muted); text-align: center;
+}
+
+#verdict {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+#verdict-icon { font-size: 20px; }
+#verdict-text { font-size: 13px; font-weight: 600; }
+#verdict.portal     #verdict-text { color: var(--green); }
+#verdict.verified   #verdict-text { color: var(--green); }
+#verdict.beacon     #verdict-text { color: var(--green); }
+#verdict.unverified #verdict-text { color: var(--yellow); }
+
+#proof-table { width: 100%; border-collapse: collapse; }
+#proof-table td {
+  padding: 6px 12px; border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+#proof-table td:first-child {
+  color: var(--text-muted); width: 100px; white-space: nowrap;
+}
+#proof-table td:last-child {
+  font-family: monospace; font-size: 11px;
+  word-break: break-all; color: var(--text);
+}
+
+#footer {
+  border-top: 1px solid var(--border); padding: 8px 12px; text-align: right;
+}
+#settings-btn {
+  background: transparent; border: none; color: var(--text-muted);
+  cursor: pointer; font-size: 11px; padding: 2px 6px;
+}
+#settings-btn:hover { color: var(--accent); }
+
+.hidden { display: none !important; }

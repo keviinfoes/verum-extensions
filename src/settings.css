@@ -1,0 +1,98 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0d1117; --surface: #161b22; --border: #30363d;
+  --text: #c9d1d9; --text-muted: #8b949e;
+  --accent: #58a6ff; --green: #3fb950; --red: #f85149;
+  --radius: 8px;
+}
+
+body {
+  background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 14px; min-height: 100vh; padding: 32px;
+}
+
+header { max-width: 720px; margin: 0 auto 32px; }
+header h1 { font-size: 20px; color: var(--accent); margin-bottom: 6px; }
+header p  { color: var(--text-muted); font-size: 13px; }
+
+main { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
+
+/* ---- Chain card ---- */
+.chain-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px;
+}
+.chain-header {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 16px;
+}
+.chain-id   { font-size: 11px; color: var(--text-muted); font-family: monospace; }
+.chain-name { font-size: 15px; font-weight: 600; }
+.delete-chain {
+  margin-left: auto; background: transparent; border: none;
+  color: var(--text-muted); cursor: pointer; font-size: 16px; padding: 2px 6px;
+}
+.delete-chain:hover { color: var(--red); }
+
+.rpc-group { margin-bottom: 16px; }
+.rpc-group:last-child { margin-bottom: 0; }
+.rpc-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase;
+  letter-spacing: 0.5px; margin-bottom: 8px; }
+
+.rpc-row {
+  display: flex; gap: 8px; margin-bottom: 6px; align-items: center;
+}
+.rpc-row input {
+  flex: 1; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); padding: 6px 10px;
+  font-family: monospace; font-size: 12px; outline: none;
+}
+.rpc-row input:focus { border-color: var(--accent); }
+.rpc-row button {
+  background: transparent; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text-muted); cursor: pointer; padding: 4px 10px; font-size: 12px;
+}
+.rpc-row button:hover { border-color: var(--red); color: var(--red); }
+
+.add-rpc {
+  background: transparent; border: 1px dashed var(--border); border-radius: 6px;
+  color: var(--text-muted); cursor: pointer; padding: 5px 12px;
+  font-size: 12px; width: 100%; margin-top: 4px;
+}
+.add-rpc:hover { border-color: var(--accent); color: var(--accent); }
+
+.rpc-hint { font-size: 10px; color: var(--green); text-transform: none; letter-spacing: 0; }
+.portal-rpc {
+  width: 100%; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); padding: 6px 10px;
+  font-family: monospace; font-size: 12px; outline: none;
+}
+.portal-rpc:focus { border-color: var(--green); }
+
+/* ---- Add chain ---- */
+#add-chain { background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px; }
+#add-chain h2 { font-size: 14px; margin-bottom: 12px; color: var(--text-muted); }
+
+.row { display: flex; gap: 8px; }
+.row input {
+  flex: 1; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); padding: 7px 10px;
+  font-size: 13px; outline: none;
+}
+.row input:focus { border-color: var(--accent); }
+.row button, #add-chain-btn {
+  background: var(--accent); border: none; border-radius: 6px;
+  color: #000; padding: 7px 16px; cursor: pointer; font-size: 13px; font-weight: 600;
+}
+
+/* ---- Toast ---- */
+#saved-toast {
+  position: fixed; bottom: 24px; right: 24px;
+  background: var(--green); color: #000;
+  padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 600;
+  transition: opacity 0.3s;
+}
+
+.hidden { display: none !important; }
