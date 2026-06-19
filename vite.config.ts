@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite'
 import { resolve } from 'path'
-import { copyFileSync, mkdirSync } from 'fs'
+import { copyFileSync, mkdirSync, readdirSync } from 'fs'
 
 export default defineConfig({
   // Set root to src/ so HTML files resolve relative to it and output flat
@@ -13,6 +13,7 @@ export default defineConfig({
         popup: resolve(__dirname, 'src/popup.html'),
         settings: resolve(__dirname, 'src/settings.html'),
         background: resolve(__dirname, 'src/background.ts'),
+        'dapp-sandbox':   resolve(__dirname, 'src/dapp-sandbox.html'),
       },
       output: {
         entryFileNames: '[name].js',
@@ -25,6 +26,21 @@ export default defineConfig({
   },
   plugins: [
     {
+      // dapp-sandbox.html is a null-origin sandbox page — Vite's default crossorigin=""
+      // on module scripts triggers CORS with Origin: null, which fails for extension
+      // resources. Strip it (and the modulepreload link) from the built output.
+      name: 'strip-sandbox-crossorigin',
+      transformIndexHtml: {
+        order: 'post',
+        handler(html, ctx) {
+          if (!ctx.filename.endsWith('dapp-sandbox.html')) return html
+          return html
+            .replace(/<link rel="modulepreload"[^>]*>/gi, '')
+            .replace(/(<script[^>]*)\s+crossorigin(?:="[^"]*")?/gi, '$1')
+        },
+      },
+    },
+    {
       name: 'copy-manifest',
       closeBundle() {
         mkdirSync(resolve(__dirname, 'dist/icons'), { recursive: true })
@@ -32,9 +48,9 @@ export default defineConfig({
           resolve(__dirname, 'public/manifest.json'),
           resolve(__dirname, 'dist/manifest.json'),
         )
-        try { copyFileSync(resolve(__dirname, 'public/icons/16.png'), resolve(__dirname, 'dist/icons/16.png')) } catch {}
-        try { copyFileSync(resolve(__dirname, 'public/icons/48.png'), resolve(__dirname, 'dist/icons/48.png')) } catch {}
-        try { copyFileSync(resolve(__dirname, 'public/icons/128.png'), resolve(__dirname, 'dist/icons/128.png')) } catch {}
+        for (const f of readdirSync(resolve(__dirname, 'public/icons'))) {
+          copyFileSync(resolve(__dirname, 'public/icons', f), resolve(__dirname, 'dist/icons', f))
+        }
       },
     },
   ],

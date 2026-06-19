@@ -726,6 +726,8 @@ export interface BeaconStateVerification {
   computedRoot: string
   /** Extract historical_summaries[era].block_summary_root from the verified state. */
   getBlockSummaryRoot(era: number): string | null
+  /** Read block_roots[slot % 8192] from the verified state (0x-hex, 32 bytes). */
+  getBlockRootAtSlot(slot: number): string
 }
 
 /**
@@ -783,7 +785,7 @@ export function computeBeaconStateRoot(stateSSZ: Uint8Array): BeaconStateVerific
   const isElectra = fixedPrefixSize >= 2736713
 
   const isFulu = fixedPrefixSize >= 2737225
-  console.log(`[web3] computeBeaconStateRoot: stateLen=${stateSSZ.length} fixedPrefixSize=${fixedPrefixSize} isElectra=${isElectra} isFulu=${isFulu}`)
+  console.log(`[portal] computeBeaconStateRoot: stateLen=${stateSSZ.length} fixedPrefixSize=${fixedPrefixSize} isElectra=${isElectra} isFulu=${isFulu}`)
 
   // ── Variable-field offset pointers ─────────────────────────────────────
   const offHistoricalRoots = fixedPrefixSize          // same value we just read
@@ -876,7 +878,7 @@ export function computeBeaconStateRoot(stateSSZ: Uint8Array): BeaconStateVerific
   const computedRoot = hexlify(merkleizeExact(fieldRoots))
 
   const nHistSummaries = Math.floor(histSummaries.length / 64)
-  console.log(`[web3] historical_summaries count = ${nHistSummaries} (CAPELLA_ERA = anchorEra - ${nHistSummaries})`)
+  console.log(`[portal] historical_summaries count = ${nHistSummaries} (CAPELLA_ERA = anchorEra - ${nHistSummaries})`)
 
   return {
     computedRoot,
@@ -884,6 +886,10 @@ export function computeBeaconStateRoot(stateSSZ: Uint8Array): BeaconStateVerific
       const offset = era * 64
       if (offset + 64 > histSummaries.length) return null
       return hexlify(histSummaries.slice(offset, offset + 32))
+    },
+    getBlockRootAtSlot(slot: number): string {
+      const idx = slot % 8192
+      return hexlify(stateSSZ.slice(176 + idx * 32, 176 + (idx + 1) * 32))
     },
   }
 }

@@ -17,6 +17,12 @@ dist/
 .env
 .env.*
 
+# Encoded bundles
+*.hex
+
+# Local test dapps
+scripts/dapp_multi_file/
+
 # Logs
 *.log
 npm-debug.log*

@@ -3,13 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>web3://</title>
+  <title>portal://</title>
   <link rel="stylesheet" href="./renderer.css" />
 </head>
 <body>
   <!-- Full-viewport states -->
   <div id="splash">
-    <h1>web3://</h1>
+    <h1>portal://</h1>
     <p>Browse dapps stored as calldata on Ethereum.<br />Every byte is verified against the chain.</p>
     <p class="hint">Type <code>web3</code> + Tab in the address bar, then enter a tx hash.</p>
   </div>
@@ -29,8 +29,27 @@
     <button id="warning-dismiss">✕</button>
   </div>
 
-  <!-- Dapp renders here via Shadow DOM -->
-  <div id="dapp-host" class="hidden"></div>
+  <!-- Wallet picker — shown when multiple wallets are detected -->
+  <div id="wallet-picker" class="hidden">
+    <div id="wallet-picker-backdrop"></div>
+    <div id="wallet-picker-modal">
+      <h3>Select wallet</h3>
+      <div id="wallet-list"></div>
+    </div>
+  </div>
+
+  <!-- Wallet approval toast (Frame + MetaMask) -->
+  <div id="frame-toast" class="hidden">
+    <span class="frame-toast-dot"></span>
+    <span id="toast-wallet-label">Approve in wallet</span>
+    <button id="frame-toast-close">✕</button>
+  </div>
+
+  <!-- Dapp renders here; div is the fixed viewport element, iframe is its block child.
+       Sandbox src is set eagerly so it loads while the div is still hidden. -->
+  <div id="dapp-host">
+    <iframe id="dapp-frame" src="dapp-sandbox.html"></iframe>
+  </div>
 
   <!-- Verifying badge — shown until Helios confirms or denies -->
   <div id="verify-badge" class="hidden">

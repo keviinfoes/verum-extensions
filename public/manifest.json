@@ -1,14 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "web3",
+  "name": "Verum",
+  "short_name": "portal",
   "version": "0.1.0",
-  "description": "Browse web3:// dapps stored as calldata on Ethereum, verified by Helios light client",
+  "description": "Browse portal:// dapps stored as calldata on Ethereum, verified by Helios light client",
   "permissions": [
     "tabs",
     "storage",
     "webNavigation",
-    "activeTab",
-    "scripting"
+    "activeTab"
   ],
   "host_permissions": [
     "*://*.infura.io/*",
@@ -25,14 +25,23 @@
     "*://*.ethstaker.cc/*",
     "*://*.sigp.io/*",
     "*://*.beaconstate.info/*",
-    "*://*.nimbus.team/*"
+    "*://*.nimbus.team/*",
+    "*://raw.githubusercontent.com/*",
+    "*://*.beaconcha.in/*",
+    "http://127.0.0.1:*/*",
+    "http://localhost:*/*",
+    "ws://localhost:*/*",
+    "ws://127.0.0.1:*/*"
   ],
+  "icons": {
+    "128": "icons/128.png"
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "omnibox": {
-    "keyword": "web3"
+    "keyword": "portal"
   },
   "action": {
     "default_title": "Verum",
@@ -43,11 +52,15 @@
     "open_in_tab": true
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'",
+    "sandbox": "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals; script-src 'self' 'unsafe-inline' data: blob:; style-src 'self' 'unsafe-inline'; default-src 'self' blob: data:"
+  },
+  "sandbox": {
+    "pages": ["dapp-sandbox.html"]
   },
   "web_accessible_resources": [
     {
-      "resources": ["renderer.html", "chunks/*"],
+      "resources": ["renderer.html", "dapp-sandbox.html", "chunks/*"],
       "matches": ["<all_urls>"]
     }
   ]

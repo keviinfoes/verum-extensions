@@ -1,9 +1,9 @@
-// ENS resolution for web3:// URLs.
+// ENS resolution for portal:// URLs.
 //
 // Record layout (set via ENS app or scripts/set-ens.js):
-//   text record "web3" = JSON array of tx hashes: ["0xhash1", "0xhash2", ...]
+//   text record "portal" = JSON array: [[blockNumber, txIndex], ...]
 //
-// The chain is determined by the URL prefix, e.g. web3://11155111:myapp.eth
+// The chain is determined by the URL prefix, e.g. portal://11155111:myapp.eth
 // uses Sepolia ENS. Chain ID is NOT stored in the record.
 
 import { keccak256, concat, getBytes, toUtf8Bytes, hexlify } from 'ethers'
@@ -12,8 +12,14 @@ import type { IVerifiedRpc } from './light-client.js'
 // Same address on mainnet and Sepolia
 const ENS_REGISTRY = '0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e'
 
+export interface TxRef {
+  txHash?: string      // present for legacy records; derived on fetch for new records
+  blockNumber?: number
+  txIndex?: number
+}
+
 export interface EnsResolution {
-  txHashes: string[]
+  chunks: TxRef[]
 }
 
 // ---------------------------------------------------------------------------
@@ -46,7 +52,7 @@ function encodeUint256(n: number): Uint8Array {
 }
 
 async function ethCall(rpc: IVerifiedRpc, to: string, data: Uint8Array): Promise<string> {
-  return rpc.request<string>('eth_call', [{ to, data: hexlify(data) }, 'latest'])
+  return rpc.request<string>('eth_call', [{ to, data: hexlify(data) }, 'finalized'])
 }
 
 // resolver(bytes32 node) → address
@@ -90,24 +96,34 @@ export async function resolveEns(
   const resolver = await getResolver(rpc, node)
   if (!resolver) throw new Error(`No ENS resolver found for "${name}". Is the name registered on this chain?`)
 
-  const raw = await getText(rpc, resolver, node, 'web3').catch(() => null)
-  if (!raw) throw new Error(`ENS "${name}" has no "web3" text record. Set it to ["0xhash1", "0xhash2", ...]`)
+  const raw = await getText(rpc, resolver, node, 'portal').catch((e: unknown) => {
+    console.warn(`[portal] getText failed for "${name}":`, (e as Error).message ?? e)
+    return null
+  })
+  if (!raw) throw new Error(`ENS "${name}" has no "portal" text record at the finalized block.`)
 
   let parsed: unknown
   try { parsed = JSON.parse(raw) } catch {
-    throw new Error(`ENS "web3" record is not valid JSON: "${raw}"`)
+    throw new Error(`ENS "portal" record is not valid JSON: "${raw}"`)
   }
 
   if (!Array.isArray(parsed)) {
-    throw new Error(`ENS "web3" record must be a JSON array of tx hashes, got: "${raw}"`)
+    throw new Error(`ENS "portal" record must be a JSON array, got: "${raw}"`)
   }
 
-  const txHashes = (parsed as unknown[]).map((h, i) => {
-    if (typeof h !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(h)) {
-      throw new Error(`ENS "web3" record: invalid tx hash at index ${i}: "${h}"`)
+  const chunks = (parsed as unknown[]).map((entry, i): TxRef => {
+    // New format: [blockNumber, txIndex]
+    if (Array.isArray(entry)) {
+      const [blockNumber, txIndex] = entry as unknown[]
+      if (typeof blockNumber !== 'number' || typeof txIndex !== 'number')
+        throw new Error(`ENS "portal" record: expected [blockNumber, txIndex] at index ${i}`)
+      return { blockNumber, txIndex }
     }
-    return h
+    // Legacy format: "0xhash"
+    if (typeof entry !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(entry))
+      throw new Error(`ENS "portal" record: invalid entry at index ${i}: "${entry}"`)
+    return { txHash: entry }
   })
 
-  return { txHashes }
+  return { chunks }
 }

@@ -7,7 +7,7 @@ const navGo    = document.getElementById('nav-go') as HTMLButtonElement
 function navigate() {
   const raw = navInput.value.trim()
   if (!raw) return
-  const url = raw.startsWith('web3://') ? raw : `web3://${raw}`
+  const url = raw.startsWith('portal://') ? raw : `portal://${raw}`
   const rendererUrl = chrome.runtime.getURL('renderer.html') + '#' + url
   chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
     if (tab?.id) chrome.tabs.update(tab.id, { url: rendererUrl })
@@ -53,7 +53,7 @@ function showIdle() {
 }
 
 function showProof(d: any) {
-  if (d.url) navInput.value = d.url.replace('web3://', '')
+  if (d.url) navInput.value = d.url.replace('portal://', '')
   idle.classList.add('hidden')
   proof.classList.remove('hidden')
 
@@ -80,7 +80,9 @@ function showProof(d: any) {
   set('pf-url',        d.url ?? '—')
   set('pf-block',      d.blockNumber ? String(d.blockNumber) : pending ? '…' : '—')
   set('pf-block-hash', d.blockHash || (pending ? '…' : '—'))
-  set('pf-tx-hash',    d.txHash ?? '—')
+  const txHashRow = document.getElementById('pf-tx-hash-row')!
+  if (d.txHash) { txHashRow.classList.remove('hidden'); set('pf-tx-hash', d.txHash) }
+  else { txHashRow.classList.add('hidden') }
   set('pf-tx-index',   d.txIndex !== undefined && !pending ? String(d.txIndex) : pending ? '…' : '—')
   set('pf-trie',       d.trieVerified ? 'YES — cryptographically proven' : pending ? 'Verifying…' : 'NO')
   let headerText = 'NO — trusted RPC only'
@@ -97,6 +99,20 @@ function showProof(d: any) {
     headerText = 'Verifying…'
   }
   set('pf-header', headerText)
+  const isEns = typeof d.url === 'string' && /portal:\/\/[^/]+\.eth/.test(d.url)
+  const ensRow = document.getElementById('pf-ens-row')!
+  if (isEns) {
+    ensRow.classList.remove('hidden')
+    set('pf-ens',
+      d.ensVerified === true  ? 'YES — confirmed by Helios' :
+      d.ensVerified === false ? 'MISMATCH — record differs from Helios (possible forgery)' :
+      pending                 ? 'Verifying…' :
+                                'Unverified — Helios could not confirm',
+    )
+  } else {
+    ensRow.classList.add('hidden')
+  }
+
   set('pf-ct',         d.contentType ?? '—')
   set('pf-size',       d.payloadSize ?? '—')
 }

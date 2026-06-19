@@ -45,7 +45,7 @@ function rlpEncode(parts: (Uint8Array | Nibbles | string)[]): Uint8Array {
   return getBytes(encodeRlp(parts as Parameters<typeof RLP.encode>[0]))
 }
 
-interface Item { key: Nibbles; val: Uint8Array }
+export interface Item { key: Nibbles; val: Uint8Array }
 const EMPTY = new Uint8Array(0)
 
 // Returns the child-reference for a subtrie (hash if ≥32 bytes, inline otherwise)
@@ -97,7 +97,7 @@ function nodeRlp(items: Item[]): Uint8Array {
 }
 
 // The transactions root is always keccak256 of the root node RLP
-function computeTrieRoot(items: Item[]): string {
+export function computeTrieRoot(items: Item[]): string {
   if (items.length === 0) {
     // keccak256(RLP('')) — the canonical empty trie root
     return '0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421'
@@ -198,7 +198,7 @@ function concat(parts: Uint8Array[]): Uint8Array {
 // Transaction trie key: RLP(index)
 // ---------------------------------------------------------------------------
 
-function txKey(index: number): Nibbles {
+export function txKey(index: number): Nibbles {
   // RLP of integer index — for 0 this is 0x80 (empty bytes)
   const indexBytes = index === 0 ? EMPTY : toBeArray(index)
   return bytesToNibs(getBytes(encodeRlp(indexBytes)))
@@ -207,6 +207,38 @@ function txKey(index: number): Nibbles {
 // ---------------------------------------------------------------------------
 // Public API — all RPC calls go through IVerifiedRpc (Helios)
 // ---------------------------------------------------------------------------
+
+// Fetch by block number + tx index directly — used when ENS record has no txHash.
+// Derives the tx hash from the fetched transaction data.
+export async function getVerifiedCalldataByLocation(
+  blockNumber: number,
+  txIndex: number,
+  rpc: IVerifiedRpc,
+): Promise<VerificationResult> {
+  interface RpcBlock { hash: string; transactionsRoot: string; timestamp: string; transactions: RpcTx[] }
+  const block = await rpc.request<RpcBlock>('eth_getBlockByNumber', [
+    `0x${blockNumber.toString(16)}`, true,
+  ])
+  if (!block.transactions[txIndex]) throw new Error(`No tx at index ${txIndex} in block ${blockNumber}`)
+
+  const tx = block.transactions[txIndex]
+  const items: Item[] = block.transactions.map((t, i) => ({ key: txKey(i), val: serializeTx(t) }))
+  const computedRoot = computeTrieRoot(items)
+  const trieVerified = computedRoot.toLowerCase() === block.transactionsRoot.toLowerCase()
+  if (!trieVerified) throw new Error(`Transaction trie mismatch in block ${blockNumber}`)
+
+  return {
+    verified: true,
+    blockNumber,
+    blockHash: block.hash,
+    blockTimestamp: parseInt(block.timestamp, 16),
+    txHash: tx.hash,
+    txIndex,
+    trieVerified,
+    headerVerified: rpc.isHeliosBacked(),
+    calldata: getBytes(tx.input),
+  }
+}
 
 export async function getVerifiedCalldata(
   txHash: string,

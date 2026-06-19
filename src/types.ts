@@ -1,13 +1,8 @@
 export interface Web3URL {
   raw: string
   chainId: number
-  target: TxTarget | EnsTarget
+  target: EnsTarget
   path: string
-}
-
-export interface TxTarget {
-  type: 'tx'
-  hash: string
 }
 
 export interface EnsTarget {
@@ -83,6 +78,13 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
   },
 }
 
+export interface WalletInfo {
+  tabId: number
+  title: string
+  walletName: string
+  url: string
+}
+
 // Messages between background and renderer
 export type BgMessage =
   | { type: 'resolve'; url: string }
@@ -98,10 +100,10 @@ export interface VerificationUpdate {
   trieVerified: boolean
   portalVerified?: boolean   // verified via local Portal Network node
   beaconVerified?: boolean
-  beaconRpcs?: number
   beaconHeliosAnchored?: boolean    // parentBeaconBlockRoot anchor resolved
   beaconEraVerified?: boolean       // historical_summaries era cross-check passed
   beaconStateHashVerified?: boolean // full hash_tree_root(BeaconState) computed locally
+  ensVerified?: boolean | null      // true = confirmed; false = mismatch (possible forgery); null/undefined = unverified
   proof: {
     url: string
     blockNumber: number

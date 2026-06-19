@@ -7,9 +7,89 @@
 //   [4]  chunk index (big-endian, 0-based)
 //   [4]  total chunks (big-endian)
 //   [*]  payload bytes
+//
+// Multi-file bundle (contentType = "application/x-w3fs-bundle"):
+//   Payload (after decompression) is a binary file table:
+//   [4]  file count (uint32 BE)
+//   for each file:
+//     [2]  path length (uint16 BE)
+//     [N]  path (UTF-8, starts with /)
+//     [2]  mime length (uint16 BE)
+//     [M]  mime type (UTF-8)
+//     [4]  data length (uint32 BE)
+//     [D]  raw file bytes
 
 import type { ContentChunk, Compression } from '../types.js'
 import { W3FS_MAGIC } from '../types.js'
+
+// ---------------------------------------------------------------------------
+// Bundle support
+// ---------------------------------------------------------------------------
+
+export const BUNDLE_CONTENT_TYPE = 'application/x-w3fs-bundle'
+
+export interface BundleFile {
+  path: string
+  mimeType: string
+  data: Uint8Array
+}
+
+export function parseBundle(raw: Uint8Array): BundleFile[] {
+  const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength)
+  let off = 0
+  const count = view.getUint32(off, false); off += 4
+  const files: BundleFile[] = []
+  for (let i = 0; i < count; i++) {
+    const pLen = view.getUint16(off, false); off += 2
+    const path = new TextDecoder().decode(raw.slice(off, off + pLen)); off += pLen
+    const mLen = view.getUint16(off, false); off += 2
+    const mime = new TextDecoder().decode(raw.slice(off, off + mLen)); off += mLen
+    const dLen = view.getUint32(off, false); off += 4
+    files.push({ path, mimeType: mime, data: raw.slice(off, off + dLen) }); off += dLen
+  }
+  return files
+}
+
+export function bundleFileAt(files: BundleFile[], requestPath: string): BundleFile | null {
+  const norm = !requestPath || requestPath === '/' ? '/index.html' : requestPath
+  return files.find(f => f.path === norm) ?? files.find(f => f.path === requestPath) ?? null
+}
+
+// Replace relative <link>, <script src>, <img src> references with inline content
+// so the iframe (which has no HTTP server) can render all assets correctly.
+export function rewriteHtmlResources(html: string, files: BundleFile[]): string {
+  const map = new Map(files.map(f => [f.path, f]))
+
+  function resolve(src: string): BundleFile | undefined {
+    if (!src || /^(https?:|data:|blob:)/.test(src)) return undefined
+    return map.get('/' + src.replace(/^\.?\//, ''))
+  }
+
+  // <link href="..."> → <style>
+  html = html.replace(/<link([^>]*?)>/gi, (match, attrs) => {
+    const href = /\shref="([^"]+)"/i.exec(attrs)?.[1]
+    const rel  = /\srel="([^"]+)"/i.exec(attrs)?.[1] ?? 'stylesheet'
+    if (!href || !rel.includes('stylesheet')) return match
+    const f = resolve(href)
+    return f ? `<style>${new TextDecoder().decode(f.data)}</style>` : match
+  })
+
+  // <script src="..."> → inline
+  html = html.replace(/<script([^>]*?)\ssrc="([^"]+)"([^>]*?)>/gi, (match, pre, src, post) => {
+    const f = resolve(src)
+    return f ? `<script${pre}${post}>${new TextDecoder().decode(f.data)}` : match
+  })
+
+  // <img src="..."> → data URI
+  html = html.replace(/(<img[^>]*?\ssrc=")([^"]+)(")/gi, (match, pre, src, post) => {
+    const f = resolve(src)
+    if (!f) return match
+    const b64 = btoa(Array.from(f.data).map(b => String.fromCharCode(b)).join(''))
+    return `${pre}data:${f.mimeType};base64,${b64}${post}`
+  })
+
+  return html
+}
 
 export function parseCalldata(data: Uint8Array): ContentChunk {
   if (data.length < 16) throw new Error('Calldata too short to be W3FS content')
@@ -111,6 +191,21 @@ export async function assembleContent(
     throw new Error(`Expected ${expected} chunks, got ${sorted.length}`)
   }
 
+  const contentType = sorted[0].contentType
+  const allNone = sorted.every(c => c.compression === 'none')
+  const allSame = sorted.every(c => c.compression === sorted[0].compression)
+
+  // Bundle chunks: pre-compressed slices stored as 'none' — concatenate then decompress whole gzip stream
+  if (contentType === BUNDLE_CONTENT_TYPE && allNone) {
+    const total = sorted.reduce((n, c) => n + c.data.length, 0)
+    const cat = new Uint8Array(total)
+    let pos = 0
+    for (const c of sorted) { cat.set(c.data, pos); pos += c.data.length }
+    const data = await runDecompressionStream(cat, 'gzip')
+    return { data, contentType }
+  }
+
+  // Normal path: decompress each chunk independently then concatenate
   const decompressed = await Promise.all(sorted.map(decompressChunk))
 
   const total = decompressed.reduce((n, c) => n + c.length, 0)
@@ -121,7 +216,7 @@ export async function assembleContent(
     pos += c.length
   }
 
-  return { data: assembled, contentType: sorted[0].contentType }
+  return { data: assembled, contentType }
 }
 
 // Sniff the content type from bytes when not specified
