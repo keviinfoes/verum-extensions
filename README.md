@@ -23,7 +23,7 @@ npm run dev         # watch mode
 
 ## Usage
 
-In the address bar, type `web3` + Tab, then enter a `web3://` URL or ENS name.
+In the address bar, type `portal` + Tab, then enter a `portal://` URL or ENS name.
 
 ## Deploy a website to Ethereum
 

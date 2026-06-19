@@ -14,7 +14,7 @@ function getSocket(): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(FRAME_URL)
 
-    const timer = setTimeout(() => { ws.close(); reject(new Error('Frame connection timeout')) }, 3000)
+    const timer = setTimeout(() => { ws.close(); reject(new Error('Frame connection timeout')) }, 500)
 
     ws.onopen = () => {
       clearTimeout(timer)

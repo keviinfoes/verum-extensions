@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Set ENS text records so portal://<name>.eth resolves to your calldata.
+// Set ENS text records so w3://<name>.eth resolves to your calldata.
 //
 // Usage:
 //   node scripts/set-ens.js <ens-name> <rpc-url> <private-key> <ref> [<ref2> ...]
@@ -79,11 +79,11 @@ async function main() {
 
   const resolver = new ethers.Contract(resolverAddr, RESOLVER_ABI, wallet)
   const value = JSON.stringify(chunks)
-  console.log(`\nSetting text record "portal" = ${value}`)
-  const tx = await resolver.setText(node, 'portal', value)
+  console.log(`\nSetting text record "w3" = ${value}`)
+  const tx = await resolver.setText(node, 'w3', value)
   await tx.wait()
   const chainPrefix = chainId.toString() === '1' ? '' : `${chainId}:`
-  console.log(`✓ Done. Browse at: portal://${chainPrefix}${ensName}`)
+  console.log(`✓ Done. Browse at: w3://${chainPrefix}${ensName}`)
 }
 
 main().catch((err) => { console.error(err.message); process.exit(1) })

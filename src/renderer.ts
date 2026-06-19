@@ -33,11 +33,36 @@ function setPhase(phase: Phase) {
     verifyBadge.className = 'syncing'
     verifyIcon.textContent = '⟳'
     verifyLabel.textContent = 'Verifying…'
+    gateVerificationFailed = false
+    unverifiedModalMsg.textContent = 'This dApp is still being verified. Content authenticity is not yet confirmed.'
+    unverifiedGate.classList.remove('hidden')
+    unverifiedModal.classList.add('hidden')
+  } else {
+    unverifiedGate.classList.add('hidden')
+    unverifiedModal.classList.add('hidden')
   }
 }
 
+const unverifiedGate         = document.getElementById('unverified-gate') as HTMLDivElement
+const unverifiedModal        = document.getElementById('unverified-modal') as HTMLDivElement
+const unverifiedModalBackdrop = document.getElementById('unverified-modal-backdrop') as HTMLDivElement
+const unverifiedModalMsg     = document.getElementById('unverified-modal-msg') as HTMLParagraphElement
+const unverifiedModalCancel  = document.getElementById('unverified-modal-cancel') as HTMLButtonElement
+const unverifiedModalAccept  = document.getElementById('unverified-modal-accept') as HTMLButtonElement
+
+let gateVerificationFailed = false
+
+unverifiedGate.addEventListener('click', () => unverifiedModal.classList.remove('hidden'))
+unverifiedModalBackdrop.addEventListener('click', () => unverifiedModal.classList.add('hidden'))
+unverifiedModalCancel.addEventListener('click', () => unverifiedModal.classList.add('hidden'))
+unverifiedModalAccept.addEventListener('click', () => {
+  unverifiedGate.classList.add('hidden')
+  unverifiedModal.classList.add('hidden')
+})
+
 const walletPicker         = document.getElementById('wallet-picker') as HTMLDivElement
 const walletPickerBackdrop = document.getElementById('wallet-picker-backdrop') as HTMLDivElement
+const walletPickerTitle    = document.getElementById('wallet-picker-title') as HTMLHeadingElement
 const walletList           = document.getElementById('wallet-list') as HTMLDivElement
 const frameToast         = document.getElementById('frame-toast') as HTMLDivElement
 const frameToastClose    = document.getElementById('frame-toast-close') as HTMLButtonElement
@@ -106,7 +131,9 @@ window.addEventListener('message', async (e) => {
     connectInProgress = true
     const wallets = await chrome.runtime.sendMessage({ type: 'list-wallets' }) as Array<{ name: string; id: string }>
     if (!wallets || wallets.length === 0) {
+      await pickWallet([])
       connectInProgress = false
+      connectSuppressedUntil = Date.now() + 1000
       sendBack(undefined, 'No wallet found. Install MetaMask or Frame.')
       return
     }
@@ -116,6 +143,7 @@ window.addEventListener('message', async (e) => {
     const picked = await pickWallet(wallets)
     connectInProgress = false
     if (!picked) {
+      connectSuppressedUntil = Date.now() + 1000
       sendBack(undefined, 'User rejected wallet selection')
       return
     }
@@ -195,28 +223,51 @@ const WALLET_ICON_FILES: Record<string, string> = {
   'Frame':          'icons/frame.png',
 }
 
+const WALLET_ICON_STYLE: Record<string, string> = {
+  'Frame': 'border-radius:10px;filter:invert(1)',
+}
+
 function walletIcon(name: string): string {
   const file = WALLET_ICON_FILES[name]
   if (file) {
     const url = chrome.runtime.getURL(file)
-    return `<span class="wallet-icon"><img src="${url}" width="44" height="44" style="border-radius:10px" /></span>`
+    const style = WALLET_ICON_STYLE[name] ?? 'border-radius:10px'
+    return `<span class="wallet-icon"><img src="${url}" width="44" height="44" style="${style}" /></span>`
   }
   const label = name.slice(0, 2).toUpperCase()
   return `<span class="wallet-icon" style="background:#30363d;border-radius:10px;color:#fff;font-size:13px;font-weight:700">${label}</span>`
 }
 
+const PRIMARY_WALLETS = [
+  { name: 'MetaMask', url: 'https://metamask.io/download/' },
+  { name: 'Frame',    url: 'https://frame.sh' },
+]
+
 function pickWallet(wallets: Array<{ name: string; id: string }>): Promise<string | null> {
   return new Promise((resolve) => {
-    const close = (id: string | null) => { walletPicker.classList.add('hidden'); resolve(id) }
+    const installedNames = new Set(wallets.map(w => w.name))
+    const missing = PRIMARY_WALLETS.filter(w => !installedNames.has(w.name))
+
+    walletPickerTitle.textContent = wallets.length === 0 ? 'No wallet found' : 'Select wallet'
     walletList.innerHTML = ''
+
     for (const w of wallets) {
       const btn = document.createElement('button')
       btn.className = 'wallet-option'
       btn.innerHTML = `${walletIcon(w.name)}<span>${w.name}</span>`
-      btn.addEventListener('click', () => close(w.id))
+      btn.addEventListener('click', () => { walletPicker.classList.add('hidden'); resolve(w.id) })
       walletList.appendChild(btn)
     }
-    walletPickerBackdrop.onclick = () => close(null)
+
+    for (const w of missing) {
+      const btn = document.createElement('button')
+      btn.className = 'wallet-option'
+      btn.innerHTML = `${walletIcon(w.name)}<span>Get ${w.name}</span>`
+      btn.addEventListener('click', () => { chrome.tabs.create({ url: w.url }); walletPicker.classList.add('hidden'); resolve(null) })
+      walletList.appendChild(btn)
+    }
+
+    walletPickerBackdrop.onclick = () => { walletPicker.classList.add('hidden'); resolve(null) }
     walletPicker.classList.remove('hidden')
   })
 }
@@ -316,16 +367,19 @@ function applyVerification(msg: VerificationUpdate) {
     verifyIcon.textContent = '✓'
     verifyLabel.textContent = `Portal verified${ensTag}`
     setTimeout(() => verifyBadge.classList.add('hidden'), 2000)
+    unverifiedGate.classList.add('hidden')
   } else if (msg.heliosBacked && msg.trieVerified) {
     verifyBadge.className = 'verified'
     verifyIcon.textContent = '✓'
     verifyLabel.textContent = `Verified${ensTag}`
     setTimeout(() => verifyBadge.classList.add('hidden'), 2000)
+    unverifiedGate.classList.add('hidden')
   } else if (msg.beaconVerified && msg.beaconHeliosAnchored) {
     verifyBadge.className = 'beacon'
     verifyIcon.textContent = '✓'
     verifyLabel.textContent = `Beacon verified (SHA-256 Merkle · Helios anchor)${ensTag}`
     setTimeout(() => verifyBadge.classList.add('hidden'), 3000)
+    unverifiedGate.classList.add('hidden')
   } else {
     verifyBadge.className = 'failed'
     verifyIcon.textContent = '✗'
@@ -333,6 +387,8 @@ function applyVerification(msg: VerificationUpdate) {
     warningText.textContent = 'Block header unverified — content authenticity is NOT guaranteed. The RPC endpoint is trusted without cryptographic proof.'
     warningBanner.classList.remove('hidden')
     dappHost.classList.add('with-warning')
+    gateVerificationFailed = true
+    unverifiedModalMsg.textContent = 'This dApp could not be verified against the blockchain. Its content may have been tampered with. Continue at your own risk.'
   }
 }
 

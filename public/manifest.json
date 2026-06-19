@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Verum",
-  "short_name": "portal",
+  "short_name": "verum",
   "version": "0.1.0",
-  "description": "Browse portal:// dapps stored as calldata on Ethereum, verified by Helios light client",
+  "description": "Browse w3:// dapps stored as calldata on Ethereum, verified by Helios light client",
   "permissions": [
     "tabs",
     "storage",
@@ -41,7 +41,7 @@
     "type": "module"
   },
   "omnibox": {
-    "keyword": "portal"
+    "keyword": "w3"
   },
   "action": {
     "default_title": "Verum",

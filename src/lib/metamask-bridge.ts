@@ -74,7 +74,7 @@ function tryConnect(id: string): Promise<chrome.runtime.Port | null> {
 
     let settled = false
     const settle = (v: chrome.runtime.Port | null) => { if (!settled) { settled = true; resolve(v) } }
-    const timer = setTimeout(() => settle(null), 2000)
+    const timer = setTimeout(() => settle(null), 500)
     port.onDisconnect.addListener(() => { void chrome.runtime.lastError; clearTimeout(timer); settle(null) })
     port.onMessage.addListener((raw: unknown) => {
       const msg = raw as { name?: string; data?: { id?: number } }
@@ -108,6 +108,7 @@ function detectAll(): Promise<DetectedWallet[]> {
 
 // Returns every installed wallet that speaks this protocol.
 export async function listWallets(): Promise<Array<{ name: string; id: string }>> {
+  detectedCache = null
   const wallets = await detectAll()
   return wallets.map(w => ({ name: w.name, id: w.id }))
 }

@@ -7,7 +7,7 @@ const navGo    = document.getElementById('nav-go') as HTMLButtonElement
 function navigate() {
   const raw = navInput.value.trim()
   if (!raw) return
-  const url = raw.startsWith('portal://') ? raw : `portal://${raw}`
+  const url = raw.startsWith('w3://') ? raw : `w3://${raw}`
   const rendererUrl = chrome.runtime.getURL('renderer.html') + '#' + url
   chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
     if (tab?.id) chrome.tabs.update(tab.id, { url: rendererUrl })
@@ -53,7 +53,7 @@ function showIdle() {
 }
 
 function showProof(d: any) {
-  if (d.url) navInput.value = d.url.replace('portal://', '')
+  if (d.url) navInput.value = d.url.replace('w3://', '')
   idle.classList.add('hidden')
   proof.classList.remove('hidden')
 

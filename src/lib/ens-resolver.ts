@@ -1,9 +1,9 @@
-// ENS resolution for portal:// URLs.
+// ENS resolution for w3:// URLs.
 //
 // Record layout (set via ENS app or scripts/set-ens.js):
-//   text record "portal" = JSON array: [[blockNumber, txIndex], ...]
+//   text record "w3" = JSON array: [[blockNumber, txIndex], ...]
 //
-// The chain is determined by the URL prefix, e.g. portal://11155111:myapp.eth
+// The chain is determined by the URL prefix, e.g. w3://11155111:myapp.eth
 // uses Sepolia ENS. Chain ID is NOT stored in the record.
 
 import { keccak256, concat, getBytes, toUtf8Bytes, hexlify } from 'ethers'
@@ -96,19 +96,19 @@ export async function resolveEns(
   const resolver = await getResolver(rpc, node)
   if (!resolver) throw new Error(`No ENS resolver found for "${name}". Is the name registered on this chain?`)
 
-  const raw = await getText(rpc, resolver, node, 'portal').catch((e: unknown) => {
-    console.warn(`[portal] getText failed for "${name}":`, (e as Error).message ?? e)
+  const raw = await getText(rpc, resolver, node, 'w3').catch((e: unknown) => {
+    console.warn(`[w3] getText failed for "${name}":`, (e as Error).message ?? e)
     return null
   })
-  if (!raw) throw new Error(`ENS "${name}" has no "portal" text record at the finalized block.`)
+  if (!raw) throw new Error(`ENS "${name}" has no "w3" text record at the finalized block.`)
 
   let parsed: unknown
   try { parsed = JSON.parse(raw) } catch {
-    throw new Error(`ENS "portal" record is not valid JSON: "${raw}"`)
+    throw new Error(`ENS "w3" record is not valid JSON: "${raw}"`)
   }
 
   if (!Array.isArray(parsed)) {
-    throw new Error(`ENS "portal" record must be a JSON array, got: "${raw}"`)
+    throw new Error(`ENS "w3" record must be a JSON array, got: "${raw}"`)
   }
 
   const chunks = (parsed as unknown[]).map((entry, i): TxRef => {
@@ -116,12 +116,12 @@ export async function resolveEns(
     if (Array.isArray(entry)) {
       const [blockNumber, txIndex] = entry as unknown[]
       if (typeof blockNumber !== 'number' || typeof txIndex !== 'number')
-        throw new Error(`ENS "portal" record: expected [blockNumber, txIndex] at index ${i}`)
+        throw new Error(`ENS "w3" record: expected [blockNumber, txIndex] at index ${i}`)
       return { blockNumber, txIndex }
     }
     // Legacy format: "0xhash"
     if (typeof entry !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(entry))
-      throw new Error(`ENS "portal" record: invalid entry at index ${i}: "${entry}"`)
+      throw new Error(`ENS "w3" record: invalid entry at index ${i}: "${entry}"`)
     return { txHash: entry }
   })
 

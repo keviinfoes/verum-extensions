@@ -111,6 +111,41 @@ html, body {
 
 
 
+/* ---- Unverified gate — transparent click-blocker; dApp visible underneath ---- */
+#unverified-gate {
+  position: fixed; inset: 0; z-index: 60;
+  background: transparent; cursor: pointer;
+}
+
+/* ---- Unverified accept modal ---- */
+#unverified-modal-backdrop {
+  position: fixed; inset: 0; z-index: 62; background: rgba(0,0,0,0.5);
+}
+#unverified-modal-box {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  z-index: 63; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 16px; padding: 32px 36px;
+  display: flex; flex-direction: column; align-items: center; gap: 16px;
+  text-align: center; max-width: 360px; width: calc(100% - 48px);
+}
+#unverified-modal-icon { font-size: 28px; }
+#unverified-modal-msg { color: var(--text-muted); font-size: 14px; line-height: 1.6; }
+#unverified-modal-actions { display: flex; gap: 10px; }
+#unverified-modal-cancel {
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text-muted); border-radius: 8px;
+  padding: 8px 20px; cursor: pointer; font-size: 13px;
+  transition: border-color 0.15s;
+}
+#unverified-modal-cancel:hover { border-color: var(--text); color: var(--text); }
+#unverified-modal-accept {
+  background: transparent; border: 1px solid var(--yellow);
+  color: var(--yellow); border-radius: 8px;
+  padding: 8px 20px; cursor: pointer; font-size: 13px; font-weight: 500;
+  transition: background 0.15s;
+}
+#unverified-modal-accept:hover { background: rgba(210,153,34,0.15); }
+
 /* ---- Wallet picker ---- */
 #wallet-picker-backdrop {
   position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 100;

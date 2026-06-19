@@ -1,12 +1,12 @@
 import type { Web3URL } from '../types.js'
 
 // Supported formats:
-//   portal://myapp.eth              ENS name (resolved at fetch time)
-//   portal://<chainId>:myapp.eth    ENS on specific chain
+//   w3://myapp.eth              ENS name (resolved at fetch time)
+//   w3://<chainId>:myapp.eth    ENS on specific chain
 //   ...with optional /path suffix
 
 export function parseWeb3URL(raw: string, defaultChainId = 1): Web3URL {
-  const stripped = raw.replace(/^portal:\/\//i, '')
+  const stripped = raw.replace(/^w3:\/\//i, '')
 
   let rest = stripped
   let chainId = defaultChainId
@@ -34,11 +34,11 @@ export function parseWeb3URL(raw: string, defaultChainId = 1): Web3URL {
     return { raw, chainId, target: { type: 'ens', name: rest.toLowerCase() }, path }
   }
 
-  throw new Error(`Invalid portal URL: expected an ENS name (e.g. myapp.eth)`)
+  throw new Error(`Invalid w3 URL: expected an ENS name (e.g. myapp.eth)`)
 }
 
 export function formatWeb3URL(parsed: Web3URL): string {
   const chain = parsed.chainId !== 1 ? `${parsed.chainId}:` : ''
   const path = parsed.path === '/' ? '' : parsed.path
-  return `portal://${chain}${parsed.target.name}${path}`
+  return `w3://${chain}${parsed.target.name}${path}`
 }

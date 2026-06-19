@@ -70,7 +70,7 @@ async function fetchCalldataFromPortal(
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const url = changeInfo.url ?? tab.pendingUrl ?? tab.url ?? ''
-  if (url.startsWith('portal://')) {
+  if (url.startsWith('w3://')) {
     chrome.tabs.update(tabId, { url: rendererFor(url) })
   }
 })
@@ -81,7 +81,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 chrome.omnibox.onInputEntered.addListener((text, disposition) => {
   const trimmed = text.trim()
-  const url = trimmed.startsWith('portal://') ? trimmed : `portal://${trimmed}`
+  const url = trimmed.startsWith('w3://') ? trimmed : `w3://${trimmed}`
   if (disposition === 'currentTab') {
     chrome.tabs.update({ url: rendererFor(url) })
   } else {
@@ -90,7 +90,7 @@ chrome.omnibox.onInputEntered.addListener((text, disposition) => {
 })
 
 chrome.omnibox.onInputChanged.addListener((_text, suggest) => {
-  suggest([{ content: 'portal://', description: 'Enter an ENS name (e.g. myapp.eth)' }])
+  suggest([{ content: 'w3://', description: 'Enter an ENS name (e.g. myapp.eth)' }])
 })
 
 // ---------------------------------------------------------------------------

@@ -3,13 +3,13 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>portal://</title>
+  <title>w3://</title>
   <link rel="stylesheet" href="./renderer.css" />
 </head>
 <body>
   <!-- Full-viewport states -->
   <div id="splash">
-    <h1>portal://</h1>
+    <h1>w3://</h1>
     <p>Browse dapps stored as calldata on Ethereum.<br />Every byte is verified against the chain.</p>
     <p class="hint">Type <code>web3</code> + Tab in the address bar, then enter a tx hash.</p>
   </div>
@@ -33,7 +33,7 @@
   <div id="wallet-picker" class="hidden">
     <div id="wallet-picker-backdrop"></div>
     <div id="wallet-picker-modal">
-      <h3>Select wallet</h3>
+      <h3 id="wallet-picker-title">Select wallet</h3>
       <div id="wallet-list"></div>
     </div>
   </div>
@@ -49,6 +49,22 @@
        Sandbox src is set eagerly so it loads while the div is still hidden. -->
   <div id="dapp-host">
     <iframe id="dapp-frame" src="dapp-sandbox.html"></iframe>
+  </div>
+
+  <!-- Transparent click-blocker; dApp visible underneath. -->
+  <div id="unverified-gate" class="hidden"></div>
+
+  <!-- Accept modal — appears when user clicks the gate -->
+  <div id="unverified-modal" class="hidden">
+    <div id="unverified-modal-backdrop"></div>
+    <div id="unverified-modal-box">
+      <span id="unverified-modal-icon">⚠</span>
+      <p id="unverified-modal-msg">This dApp is still being verified. Content authenticity is not yet confirmed.</p>
+      <div id="unverified-modal-actions">
+        <button id="unverified-modal-cancel">Cancel</button>
+        <button id="unverified-modal-accept">Continue anyway</button>
+      </div>
+    </div>
   </div>
 
   <!-- Verifying badge — shown until Helios confirms or denies -->
