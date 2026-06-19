@@ -18,10 +18,6 @@ const KNOWN_WALLETS = [
 
 interface DetectedWallet { name: string; id: string; port: chrome.runtime.Port }
 
-type EventCallback = (method: string, params: unknown) => void
-let walletEventCb: EventCallback | null = null
-export function onWalletEvent(cb: EventCallback) { walletEventCb = cb }
-
 let detectedCache: DetectedWallet[] | null = null
 let detectingPromise: Promise<DetectedWallet[]> | null = null
 let activePort: chrome.runtime.Port | null = null

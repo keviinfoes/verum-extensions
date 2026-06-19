@@ -33,7 +33,6 @@ function setPhase(phase: Phase) {
     verifyBadge.className = 'syncing'
     verifyIcon.textContent = '⟳'
     verifyLabel.textContent = 'Verifying…'
-    gateVerificationFailed = false
     unverifiedModalMsg.textContent = 'This dApp is still being verified. Content authenticity is not yet confirmed.'
     unverifiedGate.classList.remove('hidden')
     unverifiedModal.classList.add('hidden')
@@ -49,8 +48,6 @@ const unverifiedModalBackdrop = document.getElementById('unverified-modal-backdr
 const unverifiedModalMsg     = document.getElementById('unverified-modal-msg') as HTMLParagraphElement
 const unverifiedModalCancel  = document.getElementById('unverified-modal-cancel') as HTMLButtonElement
 const unverifiedModalAccept  = document.getElementById('unverified-modal-accept') as HTMLButtonElement
-
-let gateVerificationFailed = false
 
 unverifiedGate.addEventListener('click', () => unverifiedModal.classList.remove('hidden'))
 unverifiedModalBackdrop.addEventListener('click', () => unverifiedModal.classList.add('hidden'))
@@ -217,21 +214,17 @@ window.addEventListener('message', async (e) => {
 
 // ---------------------------------------------------------------------------
 
-const WALLET_ICON_FILES: Record<string, string> = {
-  'MetaMask':       'icons/metamask.png',
-  'MetaMask Flask': 'icons/metamask.png',
-  'Frame':          'icons/frame.png',
-}
-
-const WALLET_ICON_STYLE: Record<string, string> = {
-  'Frame': 'border-radius:10px;filter:invert(1)',
+const WALLET_ICONS: Record<string, { file: string; style?: string }> = {
+  'MetaMask':       { file: 'icons/metamask.png' },
+  'MetaMask Flask': { file: 'icons/metamask.png' },
+  'Frame':          { file: 'icons/frame.png', style: 'filter:invert(1)' },
 }
 
 function walletIcon(name: string): string {
-  const file = WALLET_ICON_FILES[name]
-  if (file) {
-    const url = chrome.runtime.getURL(file)
-    const style = WALLET_ICON_STYLE[name] ?? 'border-radius:10px'
+  const w = WALLET_ICONS[name]
+  if (w) {
+    const url = chrome.runtime.getURL(w.file)
+    const style = ['border-radius:10px', w.style].filter(Boolean).join(';')
     return `<span class="wallet-icon"><img src="${url}" width="44" height="44" style="${style}" /></span>`
   }
   const label = name.slice(0, 2).toUpperCase()
@@ -362,24 +355,19 @@ function applyVerification(msg: VerificationUpdate) {
   }
 
   const ensTag = isEnsTarget ? ' · ENS ✓' : ''
+  const verified = (cls: string, label: string, delay = 2000) => {
+    verifyBadge.className = cls
+    verifyIcon.textContent = '✓'
+    verifyLabel.textContent = label
+    setTimeout(() => verifyBadge.classList.add('hidden'), delay)
+    unverifiedGate.classList.add('hidden')
+  }
   if (msg.portalVerified) {
-    verifyBadge.className = 'portal'
-    verifyIcon.textContent = '✓'
-    verifyLabel.textContent = `Portal verified${ensTag}`
-    setTimeout(() => verifyBadge.classList.add('hidden'), 2000)
-    unverifiedGate.classList.add('hidden')
+    verified('portal', `Portal verified${ensTag}`)
   } else if (msg.heliosBacked && msg.trieVerified) {
-    verifyBadge.className = 'verified'
-    verifyIcon.textContent = '✓'
-    verifyLabel.textContent = `Verified${ensTag}`
-    setTimeout(() => verifyBadge.classList.add('hidden'), 2000)
-    unverifiedGate.classList.add('hidden')
+    verified('verified', `Verified${ensTag}`)
   } else if (msg.beaconVerified && msg.beaconHeliosAnchored) {
-    verifyBadge.className = 'beacon'
-    verifyIcon.textContent = '✓'
-    verifyLabel.textContent = `Beacon verified (SHA-256 Merkle · Helios anchor)${ensTag}`
-    setTimeout(() => verifyBadge.classList.add('hidden'), 3000)
-    unverifiedGate.classList.add('hidden')
+    verified('beacon', `Beacon verified (SHA-256 Merkle · Helios anchor)${ensTag}`, 3000)
   } else {
     verifyBadge.className = 'failed'
     verifyIcon.textContent = '✗'
@@ -387,7 +375,6 @@ function applyVerification(msg: VerificationUpdate) {
     warningText.textContent = 'Block header unverified — content authenticity is NOT guaranteed. The RPC endpoint is trusted without cryptographic proof.'
     warningBanner.classList.remove('hidden')
     dappHost.classList.add('with-warning')
-    gateVerificationFailed = true
     unverifiedModalMsg.textContent = 'This dApp could not be verified against the blockchain. Its content may have been tampered with. Continue at your own risk.'
   }
 }

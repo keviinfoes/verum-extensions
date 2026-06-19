@@ -1,9 +1,5 @@
 const FRAME_URL = 'ws://localhost:1248'
 
-type EventCallback = (method: string, params: unknown) => void
-let frameEventCb: EventCallback | null = null
-export function onWalletEvent(cb: EventCallback) { frameEventCb = cb }
-
 let frameWs: WebSocket | undefined
 let nextId = 1
 const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
@@ -22,10 +18,7 @@ function getSocket(): Promise<WebSocket> {
 
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data as string)
-        if (msg.id == null) {
-          if (msg.method && frameEventCb) frameEventCb(msg.method, msg.params)
-          return
-        }
+        if (msg.id == null) return
         const cb = pending.get(msg.id)
         if (!cb) return
         pending.delete(msg.id)
