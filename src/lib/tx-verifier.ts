@@ -214,9 +214,8 @@ export async function getVerifiedCalldataByLocation(
   blockNumber: number,
   txIndex: number,
   rpc: IVerifiedRpc,
-): Promise<VerificationResult> {
-  interface RpcBlock { hash: string; transactionsRoot: string; timestamp: string; transactions: RpcTx[] }
-  const block = await rpc.request<RpcBlock>('eth_getBlockByNumber', [
+): Promise<VerificationResult & { block: RpcBlockFull }> {
+  const block = await rpc.request<RpcBlockFull>('eth_getBlockByNumber', [
     `0x${blockNumber.toString(16)}`, true,
   ])
   if (!block.transactions[txIndex]) throw new Error(`No tx at index ${txIndex} in block ${blockNumber}`)
@@ -237,13 +236,98 @@ export async function getVerifiedCalldataByLocation(
     trieVerified,
     headerVerified: rpc.isHeliosBacked(),
     calldata: getBytes(tx.input),
+    block,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Block header RLP — proves transactionsRoot is authentic given a known blockHash
+// ---------------------------------------------------------------------------
+
+export interface RpcBlockFull {
+  hash: string
+  parentHash: string; sha3Uncles: string; miner: string; stateRoot: string
+  transactionsRoot: string; receiptsRoot: string; logsBloom: string
+  difficulty: string; number: string; gasLimit: string; gasUsed: string
+  timestamp: string; extraData: string; mixHash: string; nonce: string
+  baseFeePerGas?: string
+  withdrawalsRoot?: string
+  blobGasUsed?: string
+  excessBlobGas?: string
+  parentBeaconBlockRoot?: string
+  requestsHash?: string
+  transactions: RpcTx[]
+}
+
+// Conditional fork fields must appear in exact fork order (London → Shanghai → Cancun).
+function encodeBlockHeader(block: RpcBlockFull): Uint8Array {
+  const fields: Uint8Array[] = [
+    getBytes(block.parentHash), getBytes(block.sha3Uncles), getBytes(block.miner),
+    getBytes(block.stateRoot), getBytes(block.transactionsRoot), getBytes(block.receiptsRoot),
+    getBytes(block.logsBloom), h(block.difficulty), h(block.number),
+    h(block.gasLimit), h(block.gasUsed), h(block.timestamp),
+    getBytes(block.extraData), getBytes(block.mixHash), getBytes(block.nonce),
+  ]
+  if (block.baseFeePerGas !== undefined)         fields.push(h(block.baseFeePerGas))
+  if (block.withdrawalsRoot !== undefined)       fields.push(getBytes(block.withdrawalsRoot))
+  if (block.blobGasUsed !== undefined)           fields.push(h(block.blobGasUsed))
+  if (block.excessBlobGas !== undefined)         fields.push(h(block.excessBlobGas))
+  if (block.parentBeaconBlockRoot !== undefined) fields.push(getBytes(block.parentBeaconBlockRoot))
+  if (block.requestsHash !== undefined)         fields.push(getBytes(block.requestsHash))
+  return getBytes(encodeRlp(fields as Parameters<typeof encodeRlp>[0]))
+}
+
+// Verify txIndex is authentically included in a beacon-proven block.
+// Trust chain: keccak256(RLP(header)) === blockHash → transactionsRoot is authentic
+//              computeTrieRoot(txs) === transactionsRoot → tx at txIndex is authentic
+export async function verifyTxInBlock(
+  blockHash: string,
+  txIndex: number,
+  execRpcs: string[],
+  cachedBlock?: RpcBlockFull,
+): Promise<{ txHash: string; calldata: Uint8Array }> {
+  let block: RpcBlockFull | null = cachedBlock ?? null
+  if (!block) {
+    for (const rpc of execRpcs) {
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => ctrl.abort(), 12_000)
+      try {
+        const res = await fetch(rpc, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', method: 'eth_getBlockByHash', params: [blockHash, true], id: 1 }),
+          signal: ctrl.signal,
+        })
+        if (!res.ok) { clearTimeout(timer); continue }
+        const json = await res.json() as { result: RpcBlockFull | null }
+        clearTimeout(timer)
+        if (json.result) { block = json.result; break }
+      } catch { clearTimeout(timer) }
+    }
+    if (!block) throw new Error(`Could not fetch block ${blockHash} from any exec RPC`)
+  }
+
+  const computedHash = keccak256(encodeBlockHeader(block))
+  if (computedHash.toLowerCase() !== blockHash.toLowerCase())
+    throw new Error(`Block header hash mismatch: computed ${computedHash} ≠ ${blockHash}`)
+  console.log(`[w3] Block ${block.number}: header keccak256 ✓`)
+
+  const items: Item[] = block.transactions.map((t, i) => ({ key: txKey(i), val: serializeTx(t) }))
+  const computedRoot = computeTrieRoot(items)
+  if (computedRoot.toLowerCase() !== block.transactionsRoot.toLowerCase())
+    throw new Error(`Tx trie mismatch: computed ${computedRoot} ≠ ${block.transactionsRoot}`)
+  console.log(`[w3] Block ${block.number}: tx trie root ✓ (${block.transactions.length} txs)`)
+
+  const tx = block.transactions[txIndex]
+  if (!tx) throw new Error(`No tx at index ${txIndex} in block ${blockHash}`)
+  console.log(`[w3] Block ${block.number}: tx[${txIndex}] = ${tx.hash} ✓`)
+
+  return { txHash: tx.hash, calldata: getBytes(tx.input) }
 }
 
 export async function getVerifiedCalldata(
   txHash: string,
   rpc: IVerifiedRpc,
-): Promise<VerificationResult> {
+): Promise<VerificationResult & { block: RpcBlockFull }> {
   // 1. Locate the transaction — Helios fetches via its configured endpoints
   const tx = await rpc.request<RpcTx>('eth_getTransactionByHash', [txHash])
   const blockNumber = parseInt(tx.blockNumber, 16)
@@ -251,8 +335,7 @@ export async function getVerifiedCalldata(
 
   // 2. Fetch the full block — Helios verifies the header (transactionsRoot)
   //    against the sync committee before returning it
-  interface RpcBlock { hash: string; transactionsRoot: string; timestamp: string; transactions: RpcTx[] }
-  const block = await rpc.request<RpcBlock>('eth_getBlockByNumber', [
+  const block = await rpc.request<RpcBlockFull>('eth_getBlockByNumber', [
     `0x${blockNumber.toString(16)}`, true,
   ])
 
@@ -281,6 +364,7 @@ export async function getVerifiedCalldata(
     trieVerified,
     headerVerified: rpc.isHeliosBacked(),
     calldata: getBytes(tx.input),
+    block,
   }
 }
 

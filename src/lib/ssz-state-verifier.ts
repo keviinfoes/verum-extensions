@@ -785,7 +785,7 @@ export function computeBeaconStateRoot(stateSSZ: Uint8Array): BeaconStateVerific
   const isElectra = fixedPrefixSize >= 2736713
 
   const isFulu = fixedPrefixSize >= 2737225
-  console.log(`[portal] computeBeaconStateRoot: stateLen=${stateSSZ.length} fixedPrefixSize=${fixedPrefixSize} isElectra=${isElectra} isFulu=${isFulu}`)
+  console.log(`[w3] computeBeaconStateRoot: stateLen=${stateSSZ.length} fixedPrefixSize=${fixedPrefixSize} isElectra=${isElectra} isFulu=${isFulu}`)
 
   // ── Variable-field offset pointers ─────────────────────────────────────
   const offHistoricalRoots = fixedPrefixSize          // same value we just read
@@ -878,7 +878,7 @@ export function computeBeaconStateRoot(stateSSZ: Uint8Array): BeaconStateVerific
   const computedRoot = hexlify(merkleizeExact(fieldRoots))
 
   const nHistSummaries = Math.floor(histSummaries.length / 64)
-  console.log(`[portal] historical_summaries count = ${nHistSummaries} (CAPELLA_ERA = anchorEra - ${nHistSummaries})`)
+  console.log(`[w3] historical_summaries count = ${nHistSummaries} (CAPELLA_ERA = anchorEra - ${nHistSummaries})`)
 
   return {
     computedRoot,

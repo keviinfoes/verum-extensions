@@ -1,3 +1,4 @@
+import { ensNormalize } from 'ethers'
 import type { Web3URL } from '../types.js'
 
 // Supported formats:
@@ -31,7 +32,13 @@ export function parseWeb3URL(raw: string, defaultChainId = 1): Web3URL {
 
   // ENS name — anything with a dot
   if (rest.includes('.')) {
-    return { raw, chainId, target: { type: 'ens', name: rest.toLowerCase() }, path }
+    let name: string
+    try {
+      name = ensNormalize(rest)
+    } catch {
+      throw new Error(`Invalid ENS name: "${rest}"`)
+    }
+    return { raw, chainId, target: { type: 'ens', name }, path }
   }
 
   throw new Error(`Invalid w3 URL: expected an ENS name (e.g. myapp.eth)`)

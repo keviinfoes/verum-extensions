@@ -181,7 +181,7 @@ async function getAnchorStateRoot(
   for (const rpc of consensusRpcs) {
     try {
       const { root, stateRoot, msg } = await fetchVerifiedBeaconHeader(rpc, 'finalized')
-      console.log(`[portal] Consensus anchor: slot ${msg.slot} via ${rpc}`)
+      console.log(`[w3] Consensus anchor: slot ${msg.slot} via ${rpc}`)
       return { slot: Number(msg.slot), stateRoot, blockRoot: root }
     } catch { /* try next */ }
   }
@@ -213,10 +213,10 @@ async function confirmWithHelios(
         )
         if (result && result !== '0x' && result !== '0x' + '0'.repeat(64)) {
           beaconRoot = result.length === 66 ? result : ('0x' + result.slice(-64))
-          console.log('[portal] EIP-4788 contract beacon root:', beaconRoot)
+          console.log('[w3] EIP-4788 contract beacon root:', beaconRoot)
         }
       } catch (e) {
-        console.warn('[portal] EIP-4788 contract call failed:', (e as Error).message)
+        console.warn('[w3] EIP-4788 contract call failed:', (e as Error).message)
       }
     }
     if (!beaconRoot) return false
@@ -225,11 +225,11 @@ async function confirmWithHelios(
       try {
         const { root: heliosBlockRoot, stateRoot: heliosStateRoot, msg } = await fetchVerifiedBeaconHeader(rpc, beaconRoot)
         const heliosSlot = Number(msg.slot)
-        console.log(`[portal] Helios EIP-4788 anchor: slot ${heliosSlot} state_root ${heliosStateRoot}`)
+        console.log(`[w3] Helios EIP-4788 anchor: slot ${heliosSlot} state_root ${heliosStateRoot}`)
 
         // Case 1: same slot — direct comparison
         if (heliosStateRoot.toLowerCase() === effectiveStateRoot.toLowerCase()) {
-          console.log('[portal] Helios confirmed effective state root ✓')
+          console.log('[w3] Helios confirmed effective state root ✓')
           return true
         }
 
@@ -242,7 +242,7 @@ async function confirmWithHelios(
               let parentRoot = effMsg.parent_root
               for (let step = 0; step < 200; step++) {
                 if (parentRoot.toLowerCase() === heliosBlockRoot.toLowerCase()) {
-                  console.log(`[portal] Helios confirmed via ${effectiveSlot - heliosSlot}-slot walk (effective→helios) ✓`)
+                  console.log(`[w3] Helios confirmed via ${effectiveSlot - heliosSlot}-slot walk (effective→helios) ✓`)
                   return true
                 }
                 const { root: fr, msg: pm } = await fetchVerifiedBeaconHeader(rpc, parentRoot)
@@ -265,7 +265,7 @@ async function confirmWithHelios(
               const s = Number(pm.slot)
               if (s === effectiveSlot) {
                 if (pm.state_root.toLowerCase() === effectiveStateRoot.toLowerCase()) {
-                  console.log(`[portal] Helios confirmed via ${heliosSlot - effectiveSlot}-slot walk (helios→effective) ✓`)
+                  console.log(`[w3] Helios confirmed via ${heliosSlot - effectiveSlot}-slot walk (helios→effective) ✓`)
                   return true
                 }
                 break
@@ -276,12 +276,12 @@ async function confirmWithHelios(
           } catch { /* try next RPC */ }
         }
 
-        console.warn(`[portal] Helios state root mismatch: helios=${heliosStateRoot} effective=${effectiveStateRoot} (slots: helios=${heliosSlot} effective=${effectiveSlot})`)
+        console.warn(`[w3] Helios state root mismatch: helios=${heliosStateRoot} effective=${effectiveStateRoot} (slots: helios=${heliosSlot} effective=${effectiveSlot})`)
         return false
       } catch { /* try next RPC */ }
     }
   } catch (err) {
-    console.warn('[portal] Helios confirmation failed:', (err as Error).message)
+    console.warn('[w3] Helios confirmation failed:', (err as Error).message)
   }
   return false
 }
@@ -314,7 +314,7 @@ async function getBlockSummaryRoot(
 
   const attempt = async (rpc: string, stateId: number | 'finalized'): Promise<StateSummary> => {
     const label = stateId === 'finalized' ? 'finalized (checkpoint)' : `slot ${stateId}`
-    console.log(`[portal] Fetching state (${label}) from ${rpc}…`)
+    console.log(`[w3] Fetching state (${label}) from ${rpc}…`)
     const res = await fetch(`${rpc}/eth/v2/debug/beacon/states/${stateId}`, {
       headers: { Accept: 'application/octet-stream', 'Accept-Encoding': 'gzip' },
       signal: ctrl.signal,
@@ -327,9 +327,9 @@ async function getBlockSummaryRoot(
     const stateSlot = readU32LE(stateSSZ, 40)
 
     if (verifier.computedRoot.toLowerCase() !== anchorStateRoot.toLowerCase()) {
-      console.log(`[portal] State slot=${stateSlot} anchorSlot=${anchorSlot} diff=${stateSlot - anchorSlot} — Helios will confirm at end`)
+      console.log(`[w3] State slot=${stateSlot} anchorSlot=${anchorSlot} diff=${stateSlot - anchorSlot} — Helios will confirm at end`)
     } else {
-      console.log(`[portal] State hash_tree_root matches anchor ✓ (slot ${stateSlot}, from ${rpc})`)
+      console.log(`[w3] State hash_tree_root matches anchor ✓ (slot ${stateSlot}, from ${rpc})`)
     }
 
     // Fast path: if target slot is within the rolling block_roots window of this state,
@@ -339,7 +339,7 @@ async function getBlockSummaryRoot(
       const root = verifier.getBlockRootAtSlot(targetSlot)
       if (!/^0x0+$/.test(root)) {
         blockRootAtSlot = root
-        console.log(`[portal] block_roots[${targetSlot % 8192}] from BeaconState: ${root}`)
+        console.log(`[w3] block_roots[${targetSlot % 8192}] from BeaconState: ${root}`)
       }
     }
 
@@ -347,7 +347,7 @@ async function getBlockSummaryRoot(
     if (!blockSummaryRoot && !blockRootAtSlot)
       throw new Error(`historical_summaries[${hsIndex}] (era ${era}) not found and slot not in rolling window`)
     if (blockSummaryRoot)
-      console.log(`[portal] historical_summaries[${hsIndex}] (era ${era}) block_summary_root: ${blockSummaryRoot}`)
+      console.log(`[w3] historical_summaries[${hsIndex}] (era ${era}) block_summary_root: ${blockSummaryRoot}`)
     return { blockSummaryRoot: blockSummaryRoot ?? '', effectiveStateRoot: verifier.computedRoot, effectiveSlot: stateSlot, blockRootAtSlot }
   }
 
@@ -380,7 +380,7 @@ async function getBlockSummaryRoot(
       staggered.map(p =>
         p.catch(err => {
           if ((err as DOMException).name !== 'AbortError')
-            console.warn('[portal] State fetch failed:', (err as Error).message)
+            console.warn('[w3] State fetch failed:', (err as Error).message)
           throw err
         }),
       ),
@@ -410,18 +410,29 @@ function fetchWithTimeout(url: string, init: RequestInit, ms: number): Promise<R
   return fetch(url, { ...init, signal: ctrl.signal }).finally(() => clearTimeout(id))
 }
 
+// RPCs that deliver HTTP headers quickly but stall the response body.
+// Populated at runtime; individual-block fetches skip these and try them last.
+const slowBodyRpcs = new Set<string>()
+
 async function execRpcCall(rpcs: string[], body: object): Promise<unknown> {
   let lastErr: unknown
-  for (const rpc of rpcs) {
+  const fast = rpcs.filter(r => !slowBodyRpcs.has(r))
+  const ordered = fast.length > 0 ? [...fast, ...rpcs.filter(r => slowBodyRpcs.has(r))] : rpcs
+  for (const rpc of ordered) {
+    let gotHeaders = false
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => { ctrl.abort(); if (gotHeaders) slowBodyRpcs.add(rpc) }, 8000)
     try {
-      const res = await fetchWithTimeout(rpc, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      }, 8000)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      return await res.json()
-    } catch (err) { lastErr = err }
+      const res = await fetch(rpc, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), signal: ctrl.signal,
+      })
+      gotHeaders = true
+      if (!res.ok) { clearTimeout(timer); throw new Error(`HTTP ${res.status}`) }
+      const json = await res.json()
+      clearTimeout(timer)
+      return json
+    } catch (err) { clearTimeout(timer); lastErr = err }
   }
   throw lastErr ?? new Error('All exec RPCs failed')
 }
@@ -430,22 +441,29 @@ async function execRpcCall(rpcs: string[], body: object): Promise<unknown> {
 // Unlike execRpcCall, a null result is treated as "try next RPC" — needed when RPCs
 // return null due to rate limiting rather than the block not existing.
 async function fetchExecBlock(rpcs: string[], blockNum: number): Promise<ExecBlockHeader | null> {
+  const fast = rpcs.filter(r => !slowBodyRpcs.has(r))
+  const ordered = fast.length > 0 ? [...fast, ...rpcs.filter(r => slowBodyRpcs.has(r))] : rpcs
   const delays = [0, 800, 1600]
   for (const delay of delays) {
     if (delay > 0) await new Promise(r => setTimeout(r, delay))
-    for (const rpc of rpcs) {
+    for (const rpc of ordered) {
+      let gotHeaders = false
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => { ctrl.abort(); if (gotHeaders) slowBodyRpcs.add(rpc) }, 8000)
       try {
-        const res = await fetchWithTimeout(rpc, {
+        const res = await fetch(rpc, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             jsonrpc: '2.0', method: 'eth_getBlockByNumber',
             params: ['0x' + blockNum.toString(16), false], id: 0,
-          }),
-        }, 8000)
-        if (!res.ok) continue
+          }), signal: ctrl.signal,
+        })
+        gotHeaders = true
+        if (!res.ok) { clearTimeout(timer); continue }
         const json = await res.json() as { result: ExecBlockHeader | null }
+        clearTimeout(timer)
         if (json.result != null) return json.result
-      } catch { /* try next */ }
+      } catch { clearTimeout(timer) }
     }
   }
   return null
@@ -454,16 +472,20 @@ async function fetchExecBlock(rpcs: string[], blockNum: number): Promise<ExecBlo
 // Returns null if no RPC supports batch (response not an array).
 async function execBatch(rpcs: string[], requests: object[]): Promise<{ result?: ExecBlockHeader }[] | null> {
   for (const rpc of rpcs) {
+    let gotHeaders = false
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => { ctrl.abort(); if (gotHeaders) slowBodyRpcs.add(rpc) }, 25000)
     try {
-      const res = await fetchWithTimeout(rpc, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requests),
-      }, 12000)
-      if (!res.ok) continue
+      const res = await fetch(rpc, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requests), signal: ctrl.signal,
+      })
+      gotHeaders = true
+      if (!res.ok) { clearTimeout(timer); continue }
       const json = await res.json()
+      clearTimeout(timer)
       if (Array.isArray(json)) return json as { result?: ExecBlockHeader }[]
-    } catch { /* try next */ }
+    } catch { clearTimeout(timer) }
   }
   return null
 }
@@ -493,7 +515,7 @@ async function findEraFirstBlockNumber(
   let lo = Math.max(0, anchorNum - estimatedOffset * 2)
   let hi = anchorNum
 
-  console.log(`[portal] findEraFirst: anchorNum=${anchorNum} estimatedOffset=${estimatedOffset} lo=${lo}`)
+  console.log(`[w3] findEraFirst: anchorNum=${anchorNum} estimatedOffset=${estimatedOffset} lo=${lo}`)
 
   // Binary search for first block with timestamp >= targetTs (~log2(estimatedOffset*2) ≈ 17 steps)
   while (lo < hi) {
@@ -523,8 +545,8 @@ async function fetchEraBlockRootsFromExecHeaders(
   const endNum = startNum + 11200
 
   const startTsCheck = slotToTimestamp(eraStartSlot + 1, chainId)
-  console.log(`[portal] Era ${era}: startNum=${startNum} targetTs=${startTsCheck} eraEndTs=${eraEndTs}`)
-  console.log(`[portal] Era ${era}: fetching exec headers ${startNum}–${endNum}…`)
+  console.log(`[w3] Era ${era}: startNum=${startNum} targetTs=${startTsCheck} eraEndTs=${eraEndTs}`)
+  console.log(`[w3] Era ${era}: fetching exec headers ${startNum}–${endNum}…`)
 
   const rawRoots = new Array<Uint8Array | null>(8192).fill(null)
   const BATCH = 50
@@ -543,7 +565,7 @@ async function fetchEraBlockRootsFromExecHeaders(
     if (ts > eraEndTs) {
       if (!eraCovered) {
         const postSlot = timestampToSlot(ts, chainId)
-        console.log(`[portal] eraCovered: first postEra block execNum=${b.number} ts=${ts} slot=${postSlot} (eraEndTs=${eraEndTs})`)
+        console.log(`[w3] eraCovered: first postEra block execNum=${b.number} ts=${ts} slot=${postSlot} (eraEndTs=${eraEndTs})`)
       }
       cntPostEra++; eraCovered = true; return
     }
@@ -556,7 +578,7 @@ async function fetchEraBlockRootsFromExecHeaders(
       rawRoots[j] = getBytes(b.parentBeaconBlockRoot)
       if (!firstInEraLogged) {
         firstInEraLogged = true
-        console.log(`[portal] firstInEra: execNum=${b.number} ts=${ts} slot=${slot} j=${j} pbbr=${b.parentBeaconBlockRoot}`)
+        console.log(`[w3] firstInEra: execNum=${b.number} ts=${ts} slot=${slot} j=${j} pbbr=${b.parentBeaconBlockRoot}`)
       }
     } else cntNoRoot++
   }
@@ -575,6 +597,8 @@ async function fetchEraBlockRootsFromExecHeaders(
   }
 
   let firstBatch = true
+  let batchCount = 0
+  const LOG_EVERY = 4  // log progress every N batches (~200 blocks)
   const runBatch = async (batchStart: number): Promise<void> => {
     if (eraCovered) return
     const blockNums = Array.from({ length: BATCH }, (_, i) => batchStart + i)
@@ -583,10 +607,14 @@ async function fetchEraBlockRootsFromExecHeaders(
       params: ['0x' + n.toString(16), false], id: i,
     }))
     const results = await execBatch(execRpcs, requests)
+    batchCount++
     if (results) {
       if (firstBatch) {
         firstBatch = false
-        console.log(`[portal] first batch: array len=${results.length}/${requests.length}, nulls=${results.filter(r => !r.result).length}`)
+        console.log(`[w3] first batch: array len=${results.length}/${requests.length}, nulls=${results.filter(r => !r.result).length}`)
+      } else if (batchCount % LOG_EVERY === 0) {
+        const pct = Math.round(((batchStart - startNum) / (endNum - startNum)) * 100)
+        console.log(`[w3] Era ${era}: batch ${batchCount}/${batches.length} (block ${batchStart}, ~${pct}%) inEra=${cntInEra} postEra=${cntPostEra}`)
       }
 
       const retryNums: number[] = []
@@ -614,11 +642,15 @@ async function fetchEraBlockRootsFromExecHeaders(
         }
       }
       if (retryNums.length > 0) {
-        console.log(`[portal] Batch ${batchStart}: re-fetching ${retryNums.length}`)
+        console.log(`[w3] Batch ${batchStart}: re-fetching ${retryNums.length}`)
         await fetchBlocksIndividually(retryNums, 2)
       }
     } else {
-      if (firstBatch) { firstBatch = false; console.log('[portal] first batch: execBatch returned null (fallback mode)') }
+      if (firstBatch) { firstBatch = false; console.log('[w3] first batch: execBatch returned null (fallback mode)') }
+      else if (batchCount % LOG_EVERY === 0) {
+        const pct = Math.round(((batchStart - startNum) / (endNum - startNum)) * 100)
+        console.log(`[w3] Era ${era}: batch ${batchCount}/${batches.length} fallback (block ${batchStart}, ~${pct}%) inEra=${cntInEra} postEra=${cntPostEra}`)
+      }
       await fetchBlocksIndividually(blockNums, 2)
     }
   }
@@ -647,17 +679,17 @@ async function fetchEraBlockRootsFromExecHeaders(
 
   const filled = rawRoots.filter(r => r === null).length
   const nonNull = 8192 - filled
-  console.log(`[portal] Era ${era}: preEra=${cntPreEra} inEra=${cntInEra} noRoot=${cntNoRoot} postEra=${cntPostEra} null=${cntNull}`)
-  console.log(`[portal] Era ${era}: ${nonNull} exec headers fetched (rawRoots), ${filled} backward-filled`)
-  console.log(`[portal] rawRoots[0]=${rawRoots[0] ? hexlify(rawRoots[0]) : 'null'} rawRoots[8191]=${rawRoots[8191] ? hexlify(rawRoots[8191]) : 'null'}`)
-  console.log(`[portal] roots[0]=${hexlify(roots[0])} roots[8191]=${hexlify(roots[8191])}`)
+  console.log(`[w3] Era ${era}: preEra=${cntPreEra} inEra=${cntInEra} noRoot=${cntNoRoot} postEra=${cntPostEra} null=${cntNull}`)
+  console.log(`[w3] Era ${era}: ${nonNull} exec headers fetched (rawRoots), ${filled} backward-filled`)
+  console.log(`[w3] rawRoots[0]=${rawRoots[0] ? hexlify(rawRoots[0]) : 'null'} rawRoots[8191]=${rawRoots[8191] ? hexlify(rawRoots[8191]) : 'null'}`)
+  console.log(`[w3] roots[0]=${hexlify(roots[0])} roots[8191]=${hexlify(roots[8191])}`)
 
   const computed = computeEraBlockSummaryRoot(roots)
   if (computed.toLowerCase() !== expectedBlockSummaryRoot.toLowerCase())
     throw new Error(
       `Era ${era}: computed block_summary_root ${computed} ≠ historical_summaries value ${expectedBlockSummaryRoot}`,
     )
-  console.log(`[portal] Era ${era}: block_roots Merkle root verified against historical_summaries ✓`)
+  console.log(`[w3] Era ${era}: block_roots Merkle root verified against historical_summaries ✓`)
   return roots
 }
 
@@ -826,7 +858,7 @@ async function fetchEraBlockRootsFromEraFile(
       const roots = await tryEraUrl(url, era, expectedBlockSummaryRoot)
       if (roots) return roots
     } catch (e) {
-      console.warn(`[portal] Era ${era}: ${url} → ${(e as Error).message}`)
+      console.warn(`[w3] Era ${era}: ${url} → ${(e as Error).message}`)
     }
   }
   return null
@@ -842,16 +874,16 @@ async function tryEraUrl(
   //   offset[j] = (dataAbsPos + 8) − offsetFieldAbsPos   (signed, relative to field)
   // So:  stateDataAbsPos  = offsetFieldAbsPos + offsetVal − 8
   //      stateHeaderAbsPos = stateDataAbsPos − 8  (the 8-byte e2store header)
-  console.log(`[portal] Era ${era}: tail fetch (${ERA_TAIL_FETCH >> 10}KB) from ${url}`)
+  console.log(`[w3] Era ${era}: tail fetch (${ERA_TAIL_FETCH >> 10}KB) from ${url}`)
   const tail = await eraFetch(url, `bytes=-${ERA_TAIL_FETCH}`, 30_000)
-  if (!tail) { console.warn(`[portal] Era ${era}: tail fetch failed`); return null }
+  if (!tail) { console.warn(`[w3] Era ${era}: tail fetch failed`); return null }
   const { buf: tailBuf, fileSize } = tail
-  if (!fileSize) { console.warn(`[portal] Era ${era}: no Content-Range, cannot locate state`); return null }
+  if (!fileSize) { console.warn(`[w3] Era ${era}: no Content-Range, cannot locate state`); return null }
 
   // The last 8 bytes of the file = count field of the trailing StateRef record (always 1 per era)
   const count = readU32LE(tailBuf, tailBuf.length - 8)
   if (count === 0 || count > 8192) {
-    console.warn(`[portal] Era ${era}: invalid tail count ${count}`); return null
+    console.warn(`[w3] Era ${era}: invalid tail count ${count}`); return null
   }
   // StateRef record = 8 (e2store header) + 8 (start_slot) + count×8 (offsets) + 8 (count)
   const stateRefRecordSize = count * 8 + 24
@@ -865,28 +897,28 @@ async function tryEraUrl(
   const stateHeaderAbsPos = offsetAbsPos + offsetVal - 16  // = dataAbsPos + 8 − 8 − 8
 
   if (stateHeaderAbsPos <= 0 || stateHeaderAbsPos >= fileSize) {
-    console.warn(`[portal] Era ${era}: bad stateHeaderAbsPos=${stateHeaderAbsPos}`); return null
+    console.warn(`[w3] Era ${era}: bad stateHeaderAbsPos=${stateHeaderAbsPos}`); return null
   }
-  console.log(`[portal] Era ${era}: count=${count} stateHeaderAbsPos=${stateHeaderAbsPos}`)
+  console.log(`[w3] Era ${era}: count=${count} stateHeaderAbsPos=${stateHeaderAbsPos}`)
 
   // ── Step 2: fetch state entry (header + compressed data) ─────────────────────
   const fetchEnd = Math.min(stateHeaderAbsPos + ERA_STATE_FETCH - 1, fileSize - 1)
-  console.log(`[portal] Era ${era}: state fetch bytes ${stateHeaderAbsPos}–${fetchEnd}`)
+  console.log(`[w3] Era ${era}: state fetch bytes ${stateHeaderAbsPos}–${fetchEnd}`)
   const sf = await eraFetch(url, `bytes=${stateHeaderAbsPos}-${fetchEnd}`, 120_000)
-  if (!sf) { console.warn(`[portal] Era ${era}: state fetch failed`); return null }
+  if (!sf) { console.warn(`[w3] Era ${era}: state fetch failed`); return null }
   const stateBuf = sf.buf
 
   // Parse state e2store header (8 bytes: type(2) + length(6))
-  if (stateBuf.length < 8) { console.warn(`[portal] Era ${era}: state fetch too small`); return null }
+  if (stateBuf.length < 8) { console.warn(`[w3] Era ${era}: state fetch too small`); return null }
   const stateType = stateBuf[0] | (stateBuf[1] << 8)
   if (stateType !== E2S_STATE) {
     const hex16 = Array.from(stateBuf.subarray(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(' ')
-    console.warn(`[portal] Era ${era}: expected state (0x${E2S_STATE.toString(16)}), got 0x${stateType.toString(16)} — first 16B: ${hex16}`)
+    console.warn(`[w3] Era ${era}: expected state (0x${E2S_STATE.toString(16)}), got 0x${stateType.toString(16)} — first 16B: ${hex16}`)
     return null
   }
   const stateDataLen = readU32LE(stateBuf, 2)
   const stateData    = stateBuf.subarray(8)
-  console.log(`[portal] Era ${era}: state compressed=${stateDataLen}B fetched ${stateData.length}B`)
+  console.log(`[w3] Era ${era}: state compressed=${stateDataLen}B fetched ${stateData.length}B`)
 
   // ── Step 3: decompress and extract block_roots ───────────────────────────────
   const need = BLOCK_ROOTS_SSZ_OFFSET + BLOCK_ROOTS_SSZ_LEN  // 262320 bytes
@@ -901,7 +933,7 @@ async function tryEraUrl(
     : snappyDecompressBlock(stateData, need)
 
   if (stateSSZ.length < need) {
-    console.warn(`[portal] Era ${era}: decompressed ${stateSSZ.length}/${need}B — increase ERA_STATE_FETCH?`); return null
+    console.warn(`[w3] Era ${era}: decompressed ${stateSSZ.length}/${need}B — increase ERA_STATE_FETCH?`); return null
   }
 
   const roots: Uint8Array[] = []
@@ -912,10 +944,10 @@ async function tryEraUrl(
 
   const computed = computeEraBlockSummaryRoot(roots)
   if (computed.toLowerCase() !== expectedBlockSummaryRoot.toLowerCase()) {
-    console.warn(`[portal] Era ${era}: block_summary_root mismatch: computed=${computed} expected=${expectedBlockSummaryRoot}`); return null
+    console.warn(`[w3] Era ${era}: block_summary_root mismatch: computed=${computed} expected=${expectedBlockSummaryRoot}`); return null
   }
 
-  console.log(`[portal] Era ${era}: block_roots verified via era file ✓ (stateCompressed=${stateDataLen}B)`)
+  console.log(`[w3] Era ${era}: block_roots verified via era file ✓ (stateCompressed=${stateDataLen}B)`)
   return roots
 }
 
@@ -944,7 +976,7 @@ export async function verifyViaBeacon(
   const slotInEra = slot % 8192
   const hsIndex   = historicalSummariesIndex(era, chainId)
 
-  console.log(`[portal] Verifying slot ${slot} (era ${era}, offset ${slotInEra})`)
+  console.log(`[w3] Verifying slot ${slot} (era ${era}, offset ${slotInEra})`)
 
   const execRpcs = executionRpcs?.length ? executionRpcs : []
   if (!execRpcs.length) throw new Error('No execution RPCs provided for era block root verification')
@@ -957,9 +989,10 @@ export async function verifyViaBeacon(
   // parallel so it's ready instantly if the era file path is also needed.
   const currentEra = Math.floor(anchor.slot / 8192)
   const needExecHeaders = era + 1 >= currentEra  // era file won't exist for current/recent eras
+  // Always compute eraStartNum in parallel — if the era file fails we need the correct start block.
   const [{ blockSummaryRoot, effectiveStateRoot, effectiveSlot, blockRootAtSlot }, eraStartNum] = await Promise.all([
     getBlockSummaryRoot(consensusRpcs, anchor.slot, anchor.stateRoot, hsIndex, era, chainId, slot),
-    needExecHeaders ? findEraFirstBlockNumber(execRpcs, era * 8192, chainId) : Promise.resolve(0),
+    findEraFirstBlockNumber(execRpcs, era * 8192, chainId),
   ])
 
   // Step 3: Determine expected beacon block root using the fastest available method.
@@ -968,7 +1001,7 @@ export async function verifyViaBeacon(
   // Slow paths: era file (one range request) or sequential exec headers (many RPC calls).
   let expectedBeaconRoot: string
   if (blockRootAtSlot) {
-    console.log(`[portal] Era ${era}: block_roots[${slot % 8192}] from BeaconState — skipping era file ✓`)
+    console.log(`[w3] Era ${era}: block_roots[${slot % 8192}] from BeaconState — skipping era file ✓`)
     expectedBeaconRoot = blockRootAtSlot
   } else {
     let eraBlockRoots: Uint8Array[] | null = null
@@ -976,7 +1009,7 @@ export async function verifyViaBeacon(
       eraBlockRoots = await fetchEraBlockRootsFromEraFile(era + 1, chainId, blockSummaryRoot)
     }
     if (!eraBlockRoots) {
-      console.log(`[portal] Era ${era}: era file unavailable, falling back to sequential exec headers`)
+      console.log(`[w3] Era ${era}: era file unavailable, falling back to sequential exec headers`)
       eraBlockRoots = await fetchEraBlockRootsFromExecHeaders(
         execRpcs, era, chainId, blockSummaryRoot, eraStartNum,
       )
@@ -994,7 +1027,7 @@ export async function verifyViaBeacon(
         throw new Error(`Beacon header root ${root} ≠ era block_roots[${slotInEra}] ${expectedBeaconRoot}`)
       verifiedBodyRoot  = msg.body_root
       verifiedBeaconRoot = root
-      console.log(`[portal] Beacon header at slot ${slot} verified against era block_roots ✓`)
+      console.log(`[w3] Beacon header at slot ${slot} verified against era block_roots ✓`)
       break
     } catch (err) {
       if ((err as Error).message.includes('≠')) throw err
@@ -1009,7 +1042,7 @@ export async function verifyViaBeacon(
       executionHash = await fetchVerifyBeaconBodyHash(rpc, slot, verifiedBodyRoot)
       break
     } catch (err) {
-      console.warn(`[portal] Body verification failed (${rpc}):`, (err as Error).message)
+      console.warn(`[w3] Body verification failed (${rpc}):`, (err as Error).message)
     }
   }
   if (!executionHash) throw new Error(`Could not verify beacon block body at slot ${slot}`)
@@ -1018,7 +1051,7 @@ export async function verifyViaBeacon(
     throw new Error(
       `Execution hash mismatch: beacon body says ${executionHash}, tx says ${expectedExecutionHash}`,
     )
-  console.log('[portal] execution_block_hash verified end-to-end ✓')
+  console.log('[w3] execution_block_hash verified end-to-end ✓')
 
   // Step 6: Confirm effective state root against Helios (ran in parallel since step 1).
   // heliosRpc may already be resolved if init was fast, or resolves now after the wait.
@@ -1027,7 +1060,7 @@ export async function verifyViaBeacon(
   if (resolvedHelios) {
     heliosAnchored = await confirmWithHelios(resolvedHelios, consensusRpcs, effectiveStateRoot, effectiveSlot)
   }
-  console.log(`[portal] Helios anchor: ${heliosAnchored ? '✓ confirmed' : 'not confirmed (unanchored result)'}`)
+  console.log(`[w3] Helios anchor: ${heliosAnchored ? '✓ confirmed' : 'not confirmed (unanchored result)'}`)
 
   return {
     slot,

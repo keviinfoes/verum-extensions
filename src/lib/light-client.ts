@@ -42,7 +42,7 @@ export async function createVerifiedRpc(chain: ChainConfig): Promise<IVerifiedRp
   const attempts = chain.consensusRpcs.map(consensusRpc =>
     HeliosWasmClient.create(network, consensusRpc, execRpc)
       .catch(err => {
-        console.warn(`[portal] Helios init failed (consensus=${consensusRpc}):`, (err as Error).message)
+        console.warn(`[w3] Helios init failed (consensus=${consensusRpc}):`, (err as Error).message)
         return Promise.reject(err)
       })
   )
@@ -50,7 +50,7 @@ export async function createVerifiedRpc(chain: ChainConfig): Promise<IVerifiedRp
   try {
     return await Promise.any(attempts)
   } catch {
-    console.warn('[portal] Helios init failed for all consensus RPCs, using plain fallback')
+    console.warn('[w3] Helios init failed for all consensus RPCs, using plain fallback')
     return new RpcClient(chain.rpcs)
   }
 }

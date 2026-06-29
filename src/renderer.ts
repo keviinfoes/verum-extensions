@@ -23,6 +23,8 @@ warningDismiss.addEventListener('click', () => {
 
 type Phase = 'idle' | 'loading' | 'ok' | 'error'
 
+let pageHasScripts = false
+
 function setPhase(phase: Phase) {
   splash.classList.toggle('hidden',      phase !== 'idle')
   loading.classList.toggle('hidden',     phase !== 'loading')
@@ -34,7 +36,7 @@ function setPhase(phase: Phase) {
     verifyIcon.textContent = '⟳'
     verifyLabel.textContent = 'Verifying…'
     unverifiedModalMsg.textContent = 'This dApp is still being verified. Content authenticity is not yet confirmed.'
-    unverifiedGate.classList.remove('hidden')
+    unverifiedGate.classList.toggle('hidden', !pageHasScripts)
     unverifiedModal.classList.add('hidden')
   } else {
     unverifiedGate.classList.add('hidden')
@@ -518,6 +520,7 @@ function renderContent(data: Uint8Array, contentType: string, assetMap: Record<s
     html = `<!DOCTYPE html><html><body><pre style="font-family:monospace;padding:16px;white-space:pre-wrap">${esc(new TextDecoder().decode(data))}</pre></body></html>`
   }
 
+  pageHasScripts = /<script[\s>]/i.test(html)
   sendToSandbox({ type: 'render', html, assetMap })
   setPhase('ok')
 }

@@ -39,7 +39,7 @@ export class HeliosWasmClient implements IVerifiedRpc {
     try {
       return await HeliosWasmClient.trySync(network, consensusRpc, executionRpc, cachedCheckpoint)
     } catch {
-      console.warn('[portal] Stale Helios checkpoint, clearing and resyncing')
+      console.warn('[w3] Stale Helios checkpoint, clearing and resyncing')
       await chrome.storage.session.remove(checkpointKey)
       return HeliosWasmClient.syncFresh(network, consensusRpc, executionRpc)
     }
@@ -86,6 +86,7 @@ export class HeliosWasmClient implements IVerifiedRpc {
         setTimeout(() => reject(new Error('Helios waitSynced timeout')), 30_000),
       ),
     ])
+    console.log(`[w3] Helios synced (${network}, consensus=${consensusRpc})`)
     return provider
   }
 

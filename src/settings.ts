@@ -44,10 +44,12 @@ function buildCard(chain: ChainConfig): HTMLElement {
   const card = document.createElement('div')
   card.className = 'chain-card'
 
+  const hasDefaults = !!DEFAULT_CHAINS[chain.chainId]
   card.innerHTML = `
     <div class="chain-header">
       <span class="chain-id">chainId ${chain.chainId}</span>
       <span class="chain-name">${chain.name}</span>
+      ${hasDefaults ? '<button class="reset-chain" title="Reset RPCs to defaults">↺ Reset</button>' : ''}
       <button class="delete-chain" title="Remove chain">✕</button>
     </div>
     <div class="rpc-group">
@@ -71,6 +73,17 @@ function buildCard(chain: ChainConfig): HTMLElement {
 
   chain.consensusRpcs.forEach((url) => consensusList.appendChild(rpcRow(url)))
   chain.rpcs.forEach((url) => executionList.appendChild(rpcRow(url)))
+
+  card.querySelector('.reset-chain')?.addEventListener('click', () => {
+    const defaults = DEFAULT_CHAINS[chain.chainId]
+    if (!defaults) return
+    chains[chain.chainId] = {
+      ...chains[chain.chainId],
+      consensusRpcs: [...defaults.consensusRpcs],
+      rpcs: [...defaults.rpcs],
+    }
+    save()
+  })
 
   card.querySelector('.delete-chain')!.addEventListener('click', () => {
     delete chains[chain.chainId]
@@ -96,8 +109,11 @@ function buildCard(chain: ChainConfig): HTMLElement {
       rpcs: rpcValues(executionList),
       ...(portalVal ? { portalRpc: portalVal } : { portalRpc: undefined }),
     }
-    save()
+    saveQuiet()
   }
+
+  enableDragReorder(consensusList, syncCard)
+  enableDragReorder(executionList, syncCard)
 
   card.addEventListener('change', syncCard)
   card.addEventListener('input', debounce(syncCard, 600))
@@ -109,15 +125,58 @@ function rpcRow(url: string): HTMLElement {
   const row = document.createElement('div')
   row.className = 'rpc-row'
   row.innerHTML = `
+    <span class="drag-handle">⠿</span>
     <input type="url" value="${url}" placeholder="https://…" />
     <button title="Remove">✕</button>
   `
   row.querySelector('button')!.addEventListener('click', () => {
     row.remove()
-    // trigger sync via parent
     row.dispatchEvent(new Event('change', { bubbles: true }))
   })
+  // Only allow drag when the handle is the pointer-down target
+  row.addEventListener('mousedown', (e) => {
+    row.draggable = (row.querySelector('.drag-handle') as HTMLElement).contains(e.target as Node)
+  })
   return row
+}
+
+function enableDragReorder(list: HTMLElement, onChange: () => void) {
+  let dragging: HTMLElement | null = null
+
+  list.addEventListener('dragstart', (e) => {
+    dragging = (e.target as HTMLElement).closest('.rpc-row') as HTMLElement | null
+    setTimeout(() => dragging?.classList.add('dragging'), 0)
+  })
+
+  list.addEventListener('dragend', () => {
+    dragging?.classList.remove('dragging')
+    dragging = null
+    list.querySelectorAll('.drop-above, .drop-below').forEach(el =>
+      el.classList.remove('drop-above', 'drop-below'))
+  })
+
+  list.addEventListener('dragover', (e) => {
+    e.preventDefault()
+    if (!dragging) return
+    const target = (e.target as HTMLElement).closest<HTMLElement>('.rpc-row')
+    list.querySelectorAll('.drop-above, .drop-below').forEach(el =>
+      el.classList.remove('drop-above', 'drop-below'))
+    if (!target || target === dragging) return
+    const { top, height } = target.getBoundingClientRect()
+    target.classList.add(e.clientY < top + height / 2 ? 'drop-above' : 'drop-below')
+  })
+
+  list.addEventListener('drop', (e) => {
+    e.preventDefault()
+    if (!dragging) return
+    const above = list.querySelector('.drop-above')
+    const below = list.querySelector('.drop-below')
+    list.querySelectorAll('.drop-above, .drop-below').forEach(el =>
+      el.classList.remove('drop-above', 'drop-below'))
+    if (above) list.insertBefore(dragging, above)
+    else if (below) below.after(dragging)
+    onChange()
+  })
 }
 
 function rpcValues(container: HTMLElement): string[] {
@@ -136,6 +195,7 @@ addBtn.addEventListener('click', () => {
   save()
 })
 
+// Save + re-render — use for structural changes (add/delete chain, reset, drag-reorder)
 function save() {
   chrome.storage.sync.set({ chains }).then(async () => {
     const stored = await chrome.storage.sync.get('defaultChain')
@@ -143,6 +203,11 @@ function save() {
     render()
     showToast()
   })
+}
+
+// Save only — use while the user is typing to avoid destroying the focused input
+function saveQuiet() {
+  chrome.storage.sync.set({ chains }).then(showToast)
 }
 
 let toastTimer: ReturnType<typeof setTimeout>
