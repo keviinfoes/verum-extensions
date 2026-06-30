@@ -1,13 +1,18 @@
 export interface Web3URL {
   raw: string
   chainId: number
-  target: EnsTarget
+  target: EnsTarget | TxTarget
   path: string
 }
 
 export interface EnsTarget {
   type: 'ens'
   name: string
+}
+
+export interface TxTarget {
+  type: 'tx'
+  refs: Array<{ blockNumber: number; txIndex: number }>
 }
 
 // W3FS calldata encoding

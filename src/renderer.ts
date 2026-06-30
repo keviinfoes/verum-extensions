@@ -9,6 +9,7 @@ const errorPanel      = document.getElementById('error-panel') as HTMLDivElement
 const errorMessage    = document.getElementById('error-message') as HTMLPreElement
 const dappHost        = document.getElementById('dapp-host') as HTMLDivElement
 const dappFrame       = document.getElementById('dapp-frame') as HTMLIFrameElement
+const rawView         = document.getElementById('raw-view') as HTMLDivElement
 const warningBanner   = document.getElementById('warning-banner') as HTMLDivElement
 const warningText     = document.getElementById('warning-text') as HTMLSpanElement
 const warningDismiss  = document.getElementById('warning-dismiss') as HTMLButtonElement
@@ -16,27 +17,48 @@ const verifyBadge     = document.getElementById('verify-badge') as HTMLDivElemen
 const verifyIcon      = document.getElementById('verify-icon') as HTMLSpanElement
 const verifyLabel     = document.getElementById('verify-label') as HTMLSpanElement
 
+function showWarning() {
+  warningBanner.classList.remove('hidden')
+  dappHost.classList.add('with-warning')
+  rawView.classList.add('with-warning')
+}
+
 warningDismiss.addEventListener('click', () => {
   warningBanner.classList.add('hidden')
   dappHost.classList.remove('with-warning')
+  rawView.classList.remove('with-warning')
 })
 
 type Phase = 'idle' | 'loading' | 'ok' | 'error'
 
 let pageHasScripts = false
+let renderMode: 'dapp' | 'raw' = 'dapp'
+let rawBlobUrl: string | null = null
+let listingBlobUrls: string[] = []
+let bundleCache: { key: string; data: Uint8Array } | null = null
+let lastVerification: VerificationUpdate | null = null
+
+function bundleCacheKey(parsed: ReturnType<typeof parseWeb3URL>): string {
+  if (parsed.target.type === 'tx') {
+    return parsed.target.refs.map(r => `${r.blockNumber}:${r.txIndex}`).join('+')
+  }
+  return `${parsed.chainId}:${parsed.target.name}`
+}
 
 function setPhase(phase: Phase) {
   splash.classList.toggle('hidden',      phase !== 'idle')
   loading.classList.toggle('hidden',     phase !== 'loading')
   errorPanel.classList.toggle('hidden',  phase !== 'error')
-  dappHost.classList.toggle('dapp-visible', phase === 'ok')
+  dappHost.classList.toggle('dapp-visible', phase === 'ok' && renderMode === 'dapp')
+  rawView.classList.toggle('raw-visible', phase === 'ok' && renderMode === 'raw')
   verifyBadge.classList.toggle('hidden', phase !== 'ok')
   if (phase === 'ok') {
     verifyBadge.className = 'syncing'
     verifyIcon.textContent = '⟳'
     verifyLabel.textContent = 'Verifying…'
-    unverifiedModalMsg.textContent = 'This dApp is still being verified. Content authenticity is not yet confirmed.'
-    unverifiedGate.classList.toggle('hidden', !pageHasScripts)
+    const contentLabel = renderMode === 'raw' ? 'file' : 'dApp'
+    unverifiedModalMsg.textContent = `This ${contentLabel} is still being verified. Content authenticity is not yet confirmed.`
+    unverifiedGate.classList.toggle('hidden', !pageHasScripts && renderMode !== 'raw')
     unverifiedModal.classList.add('hidden')
   } else {
     unverifiedGate.classList.add('hidden')
@@ -94,8 +116,15 @@ const FRAME_APPROVAL_METHODS = new Set([
 ])
 
 window.addEventListener('message', async (e) => {
-  if (!e.data || e.data.type !== 'eth-request') return
+  if (!e.data) return
   if (e.source !== dappFrame.contentWindow) return
+
+  if (e.data.type === 'w3-navigate' && typeof e.data.url === 'string') {
+    location.hash = e.data.url
+    return
+  }
+
+  if (e.data.type !== 'eth-request') return
   const { id, method, params } = e.data
 
   const sendBack = (result: unknown, error?: string) =>
@@ -305,6 +334,23 @@ async function navigate(web3Url: string) {
     return
   }
 
+  renderMode = 'dapp'
+  if (rawBlobUrl) { URL.revokeObjectURL(rawBlobUrl); rawBlobUrl = null }
+  for (const u of listingBlobUrls) URL.revokeObjectURL(u)
+  listingBlobUrls = []
+  rawView.innerHTML = ''
+  dappFrame.contentWindow?.postMessage({ type: 'render', html: '' }, '*')  // clear stale dapp
+
+  // Same bundle, different path — render from cache without re-fetching or re-verifying.
+  const cacheKey = bundleCacheKey(parsedUrl)
+  if (bundleCache?.key === cacheKey) {
+    renderBundle(bundleCache.data, web3Url)
+    if (lastVerification) applyVerification(lastVerification)
+    return
+  }
+
+  bundleCache = null
+  lastVerification = null
   setPhase('loading')
   loadingText.textContent = 'Loading…'
 
@@ -318,12 +364,15 @@ async function navigate(web3Url: string) {
         resolve()
       } else if (msg.type === 'content') {
         if (msg.contentType === 'application/x-w3fs-bundle') {
-          renderBundle(new Uint8Array(msg.assembled), web3Url)
+          const data = new Uint8Array(msg.assembled)
+          bundleCache = { key: cacheKey, data }
+          renderBundle(data, web3Url)
         } else {
           renderContent(new Uint8Array(msg.assembled), msg.contentType)
         }
         resolve()  // page shown — keep port open for verification update
       } else if (msg.type === 'verification-update') {
+        lastVerification = msg
         applyVerification(msg)
       }
     })
@@ -350,8 +399,7 @@ function applyVerification(msg: VerificationUpdate) {
       : 'Unverified — ENS not confirmed by Helios'
     if (msg.ensVerified === false) {
       warningText.textContent = 'ENS record mismatch — the RPC returned a different record than Helios confirmed. This may indicate a compromised RPC endpoint.'
-      warningBanner.classList.remove('hidden')
-      dappHost.classList.add('with-warning')
+      showWarning()
     }
     return
   }
@@ -365,19 +413,19 @@ function applyVerification(msg: VerificationUpdate) {
     unverifiedGate.classList.add('hidden')
   }
   if (msg.portalVerified) {
-    verified('portal', `Portal verified${ensTag}`)
+    verified('portal', `Portal Network verified${ensTag}`)
   } else if (msg.heliosBacked && msg.trieVerified) {
-    verified('verified', `Verified${ensTag}`)
+    verified('verified', `Verified by Helios sync-committee${ensTag}`)
   } else if (msg.beaconVerified && msg.beaconHeliosAnchored) {
-    verified('beacon', `Beacon verified (SHA-256 Merkle · Helios anchor)${ensTag}`, 3000)
+    verified('beacon', `Beacon verified — Helios anchor + Merkle proof${ensTag}`, 3000)
   } else {
     verifyBadge.className = 'failed'
     verifyIcon.textContent = '✗'
-    verifyLabel.textContent = 'Unverified'
+    verifyLabel.textContent = 'Unverified — RPC trusted without proof'
     warningText.textContent = 'Block header unverified — content authenticity is NOT guaranteed. The RPC endpoint is trusted without cryptographic proof.'
-    warningBanner.classList.remove('hidden')
-    dappHost.classList.add('with-warning')
-    unverifiedModalMsg.textContent = 'This dApp could not be verified against the blockchain. Its content may have been tampered with. Continue at your own risk.'
+    showWarning()
+    const contentLabel = renderMode === 'raw' ? 'file' : 'dApp'
+    unverifiedModalMsg.textContent = `This ${contentLabel} could not be verified against the blockchain. Its content may have been tampered with. Continue at your own risk.`
   }
 }
 
@@ -418,8 +466,69 @@ function toB64(bytes: Uint8Array): string {
 function renderBundle(data: Uint8Array, web3Url: string) {
   const parsed = parseWeb3URL(web3Url)
   const files = parseBundle(data)
-  const file = bundleFileAt(files, parsed.path)
-  if (!file) { showError(`Not found in bundle: ${parsed.path}`); return }
+  let file = bundleFileAt(files, parsed.path)
+
+  // No index.html — show a directory listing so non-HTML bundles are navigable.
+  // Rendered directly in raw-view (not the sandbox) so links update location.hash
+  // and trigger navigate(). DOM construction avoids XSS from untrusted file paths.
+  if (!file) {
+    const isRoot = !parsed.path || parsed.path === '/'
+    if (!isRoot) { showError(`Not found in bundle: ${parsed.path}`); return }
+
+    renderMode = 'raw'
+    rawView.innerHTML = ''
+    const wrap = document.createElement('div')
+    wrap.className = 'raw-listing'
+    const h2 = document.createElement('h2')
+    h2.textContent = 'Bundle contents'
+    wrap.appendChild(h2)
+    const table = document.createElement('table')
+    for (const f of files) {
+      const mime = f.mimeType.toLowerCase().split(';')[0].trim()
+      // All files get hash navigation links — renderBundle shows download UI for html/js
+      const filename = f.path.split('/').pop() || f.path
+      const tr = document.createElement('tr')
+      const tdPath = document.createElement('td')
+      const a = document.createElement('a')
+      a.href = `#${web3Url.replace(/\/$/, '')}${f.path}`
+      a.textContent = f.path
+      tdPath.appendChild(a)
+      const tdMime = document.createElement('td')
+      tdMime.textContent = f.mimeType
+      const tdSize = document.createElement('td')
+      tdSize.textContent = `${f.data.length.toLocaleString()} B`
+      tr.append(tdPath, tdMime, tdSize)
+      table.appendChild(tr)
+    }
+    wrap.appendChild(table)
+    rawView.appendChild(wrap)
+    pageHasScripts = false
+    setPhase('ok')
+    return
+  }
+
+  // Non-HTML entry file in bundle — pass through directly without HTML inlining.
+  const entryMime = file.mimeType.toLowerCase().split(';')[0].trim()
+  if (!entryMime.includes('html')) {
+    renderContent(file.data, file.mimeType)
+    return
+  }
+
+  // HTML accessed at an explicit path (not root/index entry): show download UI.
+  // Avoids running untrusted HTML in the sandbox when navigating a file listing.
+  if (parsed.path && parsed.path !== '/') {
+    renderMode = 'raw'
+    pageHasScripts = false
+    rawBlobUrl = URL.createObjectURL(new Blob([file.data], { type: file.mimeType }))
+    const dlName = file.path.split('/').pop() || file.path
+    rawView.innerHTML =
+      `<div class="raw-download">` +
+      `<p>HTML file &nbsp;·&nbsp; ${file.data.length.toLocaleString()} bytes</p>` +
+      `<a href="${rawBlobUrl}" download="${esc(dlName)}">Download ${esc(dlName)}</a>` +
+      `</div>`
+    setPhase('ok')
+    return
+  }
 
   const fileMap = new Map(files.map(f => [f.path, f]))
   function resolve(src: string) {
@@ -500,11 +609,52 @@ function renderBundle(data: Uint8Array, web3Url: string) {
 }
 
 function renderContent(data: Uint8Array, contentType: string, assetMap: Record<string, string> = {}) {
-  // No warning banner shown yet — wait for verification result
   warningBanner.classList.add('hidden')
   dappHost.classList.remove('with-warning')
+  rawView.classList.remove('with-warning')
 
-  const ct = contentType.toLowerCase()
+  // Normalise: strip parameters (e.g. "text/plain; charset=utf-8" → "text/plain")
+  const ct = contentType.toLowerCase().split(';')[0].trim()
+
+  // SAFETY GATE: text/html and */javascript MUST go through the sandboxed iframe,
+  // never raw-view, to prevent extension-origin code execution.
+  // Images are safe in rawView via <img> — browsers block script execution in SVGs
+  // loaded via <img>. Blob URLs created here can't cross into the sandboxed iframe origin.
+  const needsSandbox =
+    ct.includes('html') ||
+    ct.includes('javascript') ||
+    ct.includes('json')
+
+  if (!needsSandbox) {
+    renderMode = 'raw'
+    pageHasScripts = false
+
+    if (ct === 'application/pdf') {
+      rawBlobUrl = URL.createObjectURL(new Blob([data], { type: 'application/pdf' }))
+      // Use a plain <iframe> (no sandbox attr) so Chrome's built-in PDF viewer activates.
+      rawView.innerHTML = `<iframe src="${rawBlobUrl}"></iframe>`
+    } else if (ct.startsWith('text/')) {
+      rawView.innerHTML = `<div class="raw-text"><pre>${esc(new TextDecoder().decode(data))}</pre></div>`
+    } else if (ct.startsWith('image/')) {
+      rawBlobUrl = URL.createObjectURL(new Blob([data], { type: ct }))
+      rawView.innerHTML =
+        `<div style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;height:100%">` +
+        `<img src="${rawBlobUrl}" style="max-width:100%;max-height:100vh"/>` +
+        `</div>`
+    } else {
+      rawBlobUrl = URL.createObjectURL(new Blob([data], { type: ct || 'application/octet-stream' }))
+      rawView.innerHTML =
+        `<div class="raw-download">` +
+        `<p>Content type: <code>${esc(ct || 'unknown')}</code> &nbsp;·&nbsp; ${data.length.toLocaleString()} bytes</p>` +
+        `<a href="${rawBlobUrl}" download>Download file</a>` +
+        `</div>`
+    }
+
+    setPhase('ok')
+    return
+  }
+
+  renderMode = 'dapp'
   let html: string
   if (ct.includes('html')) {
     html = new TextDecoder().decode(data)
@@ -513,11 +663,8 @@ function renderContent(data: Uint8Array, contentType: string, assetMap: Record<s
     html = `<!DOCTYPE html><html><body><div id="root"></div><script type="module">${code}<\/script></body></html>`
   } else if (ct.includes('json')) {
     html = `<!DOCTYPE html><html><body><pre style="font-family:monospace;padding:16px">${esc(new TextDecoder().decode(data))}</pre></body></html>`
-  } else if (ct.startsWith('image/')) {
-    const url = URL.createObjectURL(new Blob([data], { type: contentType }))
-    html = `<!DOCTYPE html><html><body style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;height:100vh"><img src="${url}" style="max-width:100%;max-height:100vh"/></body></html>`
   } else {
-    html = `<!DOCTYPE html><html><body><pre style="font-family:monospace;padding:16px;white-space:pre-wrap">${esc(new TextDecoder().decode(data))}</pre></body></html>`
+    html = ''
   }
 
   pageHasScripts = /<script[\s>]/i.test(html)

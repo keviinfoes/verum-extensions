@@ -22,6 +22,7 @@ dist/
 
 # Local test dapps
 scripts/dapp_multi_file/
+scripts/test-bundle/
 
 # Logs
 *.log

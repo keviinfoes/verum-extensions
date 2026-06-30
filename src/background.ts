@@ -91,7 +91,7 @@ chrome.omnibox.onInputEntered.addListener((text, disposition) => {
 })
 
 chrome.omnibox.onInputChanged.addListener((_text, suggest) => {
-  suggest([{ content: 'w3://', description: 'Enter an ENS name (e.g. myapp.eth)' }])
+  suggest([{ content: 'w3://', description: 'Enter an ENS name (e.g. myapp.eth) or block:txIndex' }])
 })
 
 // ---------------------------------------------------------------------------
@@ -163,9 +163,11 @@ async function twoPhaseResolve(
     const fastRpc = new RpcClient(chain.rpcs)
     const target = parsed.target
 
-    const resolution = await resolveEns(target.name, fastRpc)
-    phase1EnsChunks = resolution.chunks
-    const results = await Promise.all(resolution.chunks.map(async (chunk) => {
+    const txRefs: TxRef[] = target.type === 'tx'
+      ? target.refs.map(r => ({ blockNumber: r.blockNumber, txIndex: r.txIndex }))
+      : (await resolveEns(target.name, fastRpc)).chunks
+    phase1EnsChunks = txRefs
+    const results = await Promise.all(txRefs.map(async (chunk) => {
       // New format: blockNumber + txIndex, no txHash — use Portal or direct block fetch
       if (chunk.txHash === undefined) {
         if (chain.portalRpc) {
@@ -495,10 +497,13 @@ function setBadgeLoading(tabId: number) {
 }
 
 async function updateBadge(tabId: number, update: VerificationUpdate) {
-  const heliosVerified = update.heliosBacked && update.trieVerified
-  const beaconTrusted = update.beaconVerified && update.beaconHeliosAnchored && (update.trieVerified ?? false)
-  const portalTrusted = update.portalVerified === true && update.ensVerified === true
-  const fullyVerified = heliosVerified || portalTrusted || beaconTrusted
+  let isEnsTarget = false
+  try { isEnsTarget = parseWeb3URL(update.proof.url).target.type === 'ens' } catch {}
+  const ensOk = !isEnsTarget || update.ensVerified === true
+  const portalTrusted  = update.portalVerified === true && ensOk
+  const heliosVerified = update.heliosBacked && update.trieVerified && ensOk
+  const beaconTrusted  = update.beaconVerified && update.beaconHeliosAnchored && (update.trieVerified ?? false) && ensOk
+  const fullyVerified  = heliosVerified || portalTrusted || beaconTrusted
   const color = fullyVerified ? '#3fb950' : '#d29922'
   const text = fullyVerified ? '✓' : '✗'
   // Tab may have been closed before verification finished — swallow the rejection.
@@ -509,11 +514,11 @@ async function updateBadge(tabId: number, update: VerificationUpdate) {
   // Store flat object with all fields so popup.ts can read everything directly
   await chrome.storage.session.set({
     [`proof_${tabId}`]: {
-      heliosBacked: update.heliosBacked,
+      heliosBacked: ensOk ? update.heliosBacked : false,
       trieVerified: update.trieVerified,
-      portalVerified: update.portalVerified ?? false,
-      beaconVerified: update.beaconVerified ?? false,
-      beaconHeliosAnchored: update.beaconHeliosAnchored ?? false,
+      portalVerified: portalTrusted,
+      beaconVerified: ensOk ? (update.beaconVerified ?? false) : false,
+      beaconHeliosAnchored: ensOk ? (update.beaconHeliosAnchored ?? false) : false,
       beaconEraVerified: update.beaconEraVerified ?? false,
       beaconStateHashVerified: update.beaconStateHashVerified ?? false,
       ensVerified: update.ensVerified ?? null,

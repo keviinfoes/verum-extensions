@@ -51,6 +51,11 @@
     <iframe id="dapp-frame" src="dapp-sandbox.html"></iframe>
   </div>
 
+  <!-- Raw content viewer for non-dapp files (PDF, plain text, binary).
+       No sandbox so Chrome's built-in PDF viewer can activate inside a child iframe.
+       MUST NEVER receive text/html or */javascript content — those go to dapp-host. -->
+  <div id="raw-view"></div>
+
   <!-- Transparent click-blocker; dApp visible underneath. -->
   <div id="unverified-gate" class="hidden"></div>
 

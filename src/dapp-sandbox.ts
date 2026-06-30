@@ -20,6 +20,10 @@ window.addEventListener('message', (event: MessageEvent<BridgeMessage | RenderMe
     window.parent.postMessage(event.data, '*')
   }
 
+  if (event.data.type === 'w3-navigate' && event.source === frame.contentWindow) {
+    window.parent.postMessage(event.data, '*')
+  }
+
   if (event.data.type === 'eth-response' && event.source === window.parent) {
     frame.contentWindow?.postMessage(event.data, '*')
   }
@@ -87,11 +91,14 @@ const LS_POLYFILL = '<scr' + 'ipt>(function(){' +
       'window.ethereum.emit(e.data.method,d);' +
     '}' +
   '});' +
-  // External link interceptor: open http/https links in a new browser tab.
+  // External link interceptor: open http/https links in a new tab; route w3:// links through the extension.
   'document.addEventListener("click",function(e){' +
     'var a=e.target.closest("a");if(!a||!a.href)return;' +
     'try{var u=new URL(a.href);' +
       'if(u.hostname==="dapp.w3fs")return;' +
+      'if(u.protocol==="w3:"){' +
+        'e.preventDefault();window.parent.postMessage({type:"w3-navigate",url:a.href},"*");return;' +
+      '}' +
       'if(u.protocol==="http:"||u.protocol==="https:"){' +
         'e.preventDefault();window.open(a.href,"_blank");' +
       '}' +

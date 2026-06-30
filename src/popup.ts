@@ -59,14 +59,19 @@ function showProof(d: any) {
 
   const pending = d.pending === true
   const beaconTrusted = d.beaconVerified && d.beaconHeliosAnchored
-  const cls = d.portalVerified ? 'portal' : d.heliosBacked ? 'verified' : beaconTrusted ? 'beacon' : pending ? 'pending' : 'unverified'
+  const isEns = typeof d.url === 'string' && /portal:\/\/[^/]+\.eth/.test(d.url)
+  const ensBlocked = isEns && d.ensVerified !== true && !pending
+  const cls = ensBlocked ? 'unverified' : d.portalVerified ? 'portal' : d.heliosBacked ? 'verified' : beaconTrusted ? 'beacon' : pending ? 'pending' : 'unverified'
   verdict.className = cls
   document.getElementById('verdict-icon')!.textContent =
+    ensBlocked        ? '⚠️' :
     d.portalVerified  ? '⚡' :
     d.heliosBacked    ? '🔒' :
     beaconTrusted     ? '✓' :
     pending           ? '⟳' : '⚠️'
   document.getElementById('verdict-text')!.textContent =
+    ensBlocked && d.ensVerified === false ? 'ENS forged — record differs from Helios' :
+    ensBlocked        ? 'Unverified — ENS not confirmed by Helios' :
     d.portalVerified  ? 'Portal Network verified' :
     d.heliosBacked    ? 'Verified by Helios sync-committee' :
     beaconTrusted     ? 'Beacon verified — Helios anchor + Merkle proof' :
@@ -99,7 +104,6 @@ function showProof(d: any) {
     headerText = 'Verifying…'
   }
   set('pf-header', headerText)
-  const isEns = typeof d.url === 'string' && /portal:\/\/[^/]+\.eth/.test(d.url)
   const ensRow = document.getElementById('pf-ens-row')!
   if (isEns) {
     ensRow.classList.remove('hidden')
