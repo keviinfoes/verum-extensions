@@ -4,6 +4,9 @@
 import { sha256, getBytes, hexlify } from 'ethers'
 import type { IVerifiedRpc } from './light-client.js'
 import { computeBeaconStateRoot, computeBeaconBlockBodyRoot } from './ssz-state-verifier.js'
+import { parquetRead, asyncBufferFromUrl } from 'hyparquet'
+import { compressors } from 'hyparquet-compressors'
+import type { AsyncBuffer } from 'hyparquet/src/types.js'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -43,6 +46,10 @@ const ERA_SERVERS: Record<number, { baseUrl: string; network: string }[]> = {
   1:        [{ baseUrl: 'https://mainnet.era.nimbus.team', network: 'mainnet' }],
   11155111: [{ baseUrl: 'https://sepolia.era.nimbus.team', network: 'sepolia' }],
   17000:    [{ baseUrl: 'https://holesky.era.nimbus.team', network: 'holesky' }],
+}
+
+const CHAIN_NETWORK: Record<number, string> = {
+  1: 'mainnet', 11155111: 'sepolia', 17000: 'holesky',
 }
 // Tail fetch: covers the full BlockIndex record (≤8192*8+24 = 65,560 B) + state entry header (8 B).
 const ERA_TAIL_FETCH  = 70_000
@@ -309,6 +316,7 @@ async function getBlockSummaryRoot(
   era: number,
   chainId: number,
   targetSlot: number,
+  customCheckpointUrls?: string[],
 ): Promise<StateSummary> {
   const ctrl = new AbortController()
 
@@ -351,7 +359,10 @@ async function getBlockSummaryRoot(
     return { blockSummaryRoot: blockSummaryRoot ?? '', effectiveStateRoot: verifier.computedRoot, effectiveSlot: stateSlot, blockRootAtSlot }
   }
 
-  const checkpointRpcs = CHECKPOINT_SYNC_RPCS[chainId] ?? []
+  // Use configured URLs when provided; fall back to built-in defaults only when undefined.
+  const checkpointRpcs = customCheckpointUrls !== undefined
+    ? customCheckpointUrls
+    : (CHECKPOINT_SYNC_RPCS[chainId] ?? [])
 
   // Checkpoint providers first (gzip, ~39s mainnet), consensus RPCs as fallback.
   // Stagger 3s between each start: a fast failure (CORS, 404) triggers the next
@@ -543,9 +554,10 @@ async function fetchEraBlockRootsFromExecHeaders(
   expectedBlockSummaryRoot: string,
   startNum: number,
   endNum: number,
+  rpcBatchSizes?: Record<string, number>,
 ): Promise<Uint8Array[]> {
   const eraStartSlot = era * 8192
-  const BATCH = 50
+  const DEFAULT_BATCH = 200
   const LOG_EVERY = 4
 
   const rawRoots = new Array<Uint8Array | null>(8192).fill(null)
@@ -573,9 +585,12 @@ async function fetchEraBlockRootsFromExecHeaders(
   }
 
   const processSegment = async (segStart: number, segEnd: number, primaryRpc: string): Promise<void> => {
-    const allRpcs = [primaryRpc, ...execRpcs.filter(r => r !== primaryRpc)]
-    const host = new URL(primaryRpc).hostname
-    let batchCount = 0
+    const allRpcs   = [primaryRpc, ...execRpcs.filter(r => r !== primaryRpc)]
+    const otherRpcs = execRpcs.filter(r => r !== primaryRpc)
+    const host      = new URL(primaryRpc).hostname
+    const BATCH     = rpcBatchSizes?.[primaryRpc] ?? DEFAULT_BATCH
+    const total     = Math.ceil((segEnd - segStart) / BATCH)
+    let done = 0
 
     for (let n = segStart; n < segEnd; n += BATCH) {
       const blockNums = Array.from({ length: Math.min(BATCH, segEnd - n) }, (_, i) => n + i)
@@ -583,11 +598,8 @@ async function fetchEraBlockRootsFromExecHeaders(
         jsonrpc: '2.0', method: 'eth_getBlockByNumber',
         params: ['0x' + bn.toString(16), false], id: i,
       }))
-
-      const otherRpcs = execRpcs.filter(r => r !== primaryRpc)
       const batchResult = await execBatch([primaryRpc], requests)
         ?? (otherRpcs.length > 0 ? await execBatch(otherRpcs, requests) : null)
-      batchCount++
 
       if (batchResult) {
         const { results } = batchResult
@@ -617,9 +629,9 @@ async function fetchEraBlockRootsFromExecHeaders(
         await fetchBlocksIndividually(allRpcs, blockNums)
       }
 
-      if (batchCount % LOG_EVERY === 0) {
-        const pct = Math.round(((n - segStart) / (segEnd - segStart)) * 100)
-        console.log(`[w3] Era ${era}: ${host} batch ${batchCount} ~${pct}% (block ${n}) inEra=${cntInEra}`)
+      done++
+      if (done % LOG_EVERY === 0 || done === total) {
+        console.log(`[w3] Era ${era}: ${host} ${done}/${total} batches (${Math.round(done / total * 100)}%) inEra=${cntInEra}`)
       }
     }
   }
@@ -672,6 +684,123 @@ async function fetchEraBlockRootsFromExecHeaders(
     )
   console.log(`[w3] Era ${era}: block_roots Merkle root verified against historical_summaries ✓`)
   return roots
+}
+
+// ---------------------------------------------------------------------------
+// Parquet: ethpandaops xatu canonical_beacon_block
+// ---------------------------------------------------------------------------
+
+const XATU_CHAIN: Record<number, string> = {
+  1:        'mainnet',
+  11155111: 'sepolia',
+  17000:    'holesky',
+}
+const XATU_BASE = 'https://data.ethpandaops.io/xatu'
+
+function dateKey(unixTs: number): string {
+  const d = new Date(unixTs * 1000)
+  return `${d.getUTCFullYear()}/${d.getUTCMonth() + 1}/${d.getUTCDate()}`
+}
+
+function eraDates(eraStartSlot: number, chainId: number): string[] {
+  const keys = new Set<string>()
+  for (const slot of [eraStartSlot, eraStartSlot + 4096, eraStartSlot + 8191]) {
+    keys.add(dateKey(slotToTimestamp(slot, chainId)))
+  }
+  return [...keys]
+}
+
+interface ParquetRow { slot: bigint; block_root: Uint8Array }
+
+async function fetchParquetDayRoots(
+  url: string,
+  eraStartSlot: number,
+  eraEndSlot: number,
+): Promise<ParquetRow[]> {
+  let asyncBuffer: AsyncBuffer
+  try {
+    asyncBuffer = await asyncBufferFromUrl({ url })
+  } catch {
+    return []
+  }
+  const rows: ParquetRow[] = []
+  await parquetRead({
+    file: asyncBuffer,
+    compressors,
+    columns: ['slot', 'block_root'],
+    rowFormat: 'object',
+    onComplete(data: Record<string, unknown>[]) {
+      for (const row of data) {
+        const s = Number(row['slot'] as bigint)
+        if (s >= eraStartSlot && s <= eraEndSlot) rows.push(row as unknown as ParquetRow)
+      }
+    },
+  })
+  return rows
+}
+
+async function fetchEraBlockRootsFromParquet(
+  era: number,
+  chainId: number,
+  expectedBlockSummaryRoot: string,
+  customParquetUrls?: string[],
+): Promise<Uint8Array[] | null> {
+  const network = XATU_CHAIN[chainId]
+  if (!network && !customParquetUrls?.length) return null
+
+  const eraStartSlot = era * 8192
+  const eraEndSlot   = eraStartSlot + 8191
+  const defaultBase  = network ? `${XATU_BASE}/${network}/databases/default/canonical_beacon_block` : null
+  const bases        = customParquetUrls?.length
+    ? [...customParquetUrls, ...(defaultBase ? [defaultBase] : [])]
+    : (defaultBase ? [defaultBase] : [])
+
+  const slotSet = new Set<number>()
+  const allRows: ParquetRow[] = []
+  for (const base of bases) {
+    for (const d of eraDates(eraStartSlot, chainId)) {
+      try {
+        const rows = await fetchParquetDayRoots(`${base}/${d}.parquet`, eraStartSlot, eraEndSlot)
+        console.log(`[w3] Parquet ${d}: ${rows.length} rows in era range`)
+        for (const row of rows) {
+          if (!slotSet.has(Number(row.slot))) { slotSet.add(Number(row.slot)); allRows.push(row) }
+        }
+      } catch (e) {
+        console.log(`[w3] Parquet ${d}: ${(e as Error).message}`)
+      }
+    }
+    if (allRows.length > 0) break  // first base that returned data wins
+  }
+
+  if (allRows.length === 0) {
+    console.log(`[w3] Parquet: no data for era ${era}`)
+    return null
+  }
+
+  // Build block_roots[8192] — FixedString(66) arrives as Uint8Array of ASCII "0xabcd..."
+  const roots: (Uint8Array | null)[] = new Array(8192).fill(null)
+  const decoder = new TextDecoder()
+  for (const row of allRows) {
+    const j = Number(row.slot) - eraStartSlot
+    if (j >= 0 && j < 8192) roots[j] = getBytes(decoder.decode(row.block_root))
+  }
+  // Forward-fill: missed slot inherits the most recent non-null root to its left
+  for (let j = 1; j < 8192; j++) {
+    if (roots[j] === null) roots[j] = roots[j - 1]
+  }
+  const ZERO = new Uint8Array(32)
+  for (let j = 0; j < 8192; j++) {
+    if (roots[j] === null) roots[j] = ZERO
+  }
+  const finalRoots = roots as Uint8Array[]
+
+  const computed = computeEraBlockSummaryRoot(finalRoots)
+  if (computed.toLowerCase() !== expectedBlockSummaryRoot.toLowerCase()) {
+    console.warn(`[w3] Parquet: block_summary_root mismatch (era may be incomplete)`)
+    return null
+  }
+  console.log(`[w3] Parquet: era ${era} block_roots verified ✓`)
+  return finalRoots
 }
 
 // ---------------------------------------------------------------------------
@@ -765,8 +894,12 @@ function snappyFramedDecompress(data: Uint8Array, need: number): Uint8Array {
 // The 8-char hash comes from a server-specific derivation we don't fully control, so we
 // first try the directory listing to find the exact filename, then fall back to the
 // block_summary_root-derived guess (first 4 bytes of the root).
-async function findEraFileUrls(era: number, chainId: number, blockSummaryRoot: string): Promise<string[]> {
-  const servers = ERA_SERVERS[chainId] ?? []
+async function findEraFileUrls(era: number, chainId: number, blockSummaryRoot: string, customEraUrls?: string[]): Promise<string[]> {
+  const network = CHAIN_NETWORK[chainId] ?? 'mainnet'
+  // Use configured URLs when provided; fall back to built-in defaults only when undefined.
+  const servers = customEraUrls !== undefined
+    ? customEraUrls.map(baseUrl => ({ baseUrl: baseUrl.replace(/\/$/, ''), network }))
+    : (ERA_SERVERS[chainId] ?? [])
   const eraStr = era.toString().padStart(5, '0')
   const urls: string[] = []
 
@@ -830,8 +963,9 @@ async function fetchEraBlockRootsFromEraFile(
   era: number,
   chainId: number,
   expectedBlockSummaryRoot: string,
+  customEraUrls?: string[],
 ): Promise<Uint8Array[] | null> {
-  const urls = await findEraFileUrls(era, chainId, expectedBlockSummaryRoot)
+  const urls = await findEraFileUrls(era, chainId, expectedBlockSummaryRoot, customEraUrls)
   if (!urls.length) return null
 
   for (const url of urls) {
@@ -936,6 +1070,13 @@ async function tryEraUrl(
 // Public API
 // ---------------------------------------------------------------------------
 
+export interface BeaconVerifyOptions {
+  checkpointUrls?: string[]
+  eraFileUrls?: string[]
+  parquetUrls?: string[]
+  rpcBatchSizes?: Record<string, number>
+}
+
 export interface BeaconVerification {
   slot: number
   beaconBlockRoot: string
@@ -951,6 +1092,7 @@ export async function verifyViaBeacon(
   consensusRpcs: string[],
   heliosRpc?: IVerifiedRpc | Promise<IVerifiedRpc | undefined>,
   executionRpcs?: string[],
+  options?: BeaconVerifyOptions,
 ): Promise<BeaconVerification> {
   const slot      = timestampToSlot(blockTimestamp, chainId)
   const era       = Math.floor(slot / 8192)
@@ -972,7 +1114,7 @@ export async function verifyViaBeacon(
   const needExecHeaders = era + 1 >= currentEra  // era file won't exist for current/recent eras
   // Always compute eraStartNum in parallel — if the era file fails we need the correct start block.
   const [{ blockSummaryRoot, effectiveStateRoot, effectiveSlot, blockRootAtSlot }, { startNum: eraStartNum, endNum: eraEndNum }] = await Promise.all([
-    getBlockSummaryRoot(consensusRpcs, anchor.slot, anchor.stateRoot, hsIndex, era, chainId, slot),
+    getBlockSummaryRoot(consensusRpcs, anchor.slot, anchor.stateRoot, hsIndex, era, chainId, slot, options?.checkpointUrls),
     findEraBlockRange(execRpcs, era * 8192, chainId),
   ])
 
@@ -987,12 +1129,16 @@ export async function verifyViaBeacon(
   } else {
     let eraBlockRoots: Uint8Array[] | null = null
     if (!needExecHeaders) {
-      eraBlockRoots = await fetchEraBlockRootsFromEraFile(era + 1, chainId, blockSummaryRoot)
+      eraBlockRoots = await fetchEraBlockRootsFromEraFile(era + 1, chainId, blockSummaryRoot, options?.eraFileUrls)
+    }
+    if (!eraBlockRoots && !needExecHeaders) {
+      console.log(`[w3] Era ${era}: trying parquet (ethpandaops xatu)`)
+      eraBlockRoots = await fetchEraBlockRootsFromParquet(era, chainId, blockSummaryRoot, options?.parquetUrls)
     }
     if (!eraBlockRoots) {
-      console.log(`[w3] Era ${era}: era file unavailable, falling back to sequential exec headers`)
+      console.log(`[w3] Era ${era}: falling back to exec headers`)
       eraBlockRoots = await fetchEraBlockRootsFromExecHeaders(
-        execRpcs, era, chainId, blockSummaryRoot, eraStartNum, eraEndNum,
+        execRpcs, era, chainId, blockSummaryRoot, eraStartNum, eraEndNum, options?.rpcBatchSizes,
       )
     }
     expectedBeaconRoot = hexlify(eraBlockRoots[slotInEra])

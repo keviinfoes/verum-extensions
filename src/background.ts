@@ -317,6 +317,7 @@ async function twoPhaseResolve(
         chain.consensusRpcs,
         heliosPromise,
         chain.rpcs,
+        { checkpointUrls: chain.checkpointUrls, eraFileUrls: chain.eraFileUrls, parquetUrls: chain.parquetUrls, rpcBatchSizes: chain.rpcBatchSizes },
       )
       console.log('[w3] Beacon verification succeeded, heliosAnchored:', beacon.heliosAnchored, 'eraVerified:', beacon.eraVerified)
       let trieVerified = false
@@ -418,6 +419,7 @@ async function twoPhaseResolve(
           chain.consensusRpcs,
           heliosRpc,
           chain.rpcs,
+          { checkpointUrls: chain.checkpointUrls, eraFileUrls: chain.eraFileUrls, parquetUrls: chain.parquetUrls, rpcBatchSizes: chain.rpcBatchSizes },
         )
         console.log(
           '[w3] Beacon verification succeeded, heliosAnchored:', beacon.heliosAnchored,

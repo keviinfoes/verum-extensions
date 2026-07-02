@@ -58,9 +58,24 @@ function buildCard(chain: ChainConfig): HTMLElement {
       <button class="add-rpc" data-type="consensus">+ Add consensus RPC</button>
     </div>
     <div class="rpc-group">
-      <div class="rpc-label">Execution RPCs</div>
+      <div class="rpc-label">Execution RPCs <span class="rpc-hint">(batch = max requests per POST — leave blank for default 200)</span></div>
       <div class="execution-list"></div>
       <button class="add-rpc" data-type="execution">+ Add execution RPC</button>
+    </div>
+    <div class="rpc-group">
+      <div class="rpc-label">Checkpoint sync URLs <span class="rpc-hint">(optional — prepended before built-in defaults for state download)</span></div>
+      <div class="checkpoint-list"></div>
+      <button class="add-rpc" data-type="checkpoint">+ Add checkpoint URL</button>
+    </div>
+    <div class="rpc-group">
+      <div class="rpc-label">Era file URLs <span class="rpc-hint">(optional — prepended before built-in defaults for block_roots)</span></div>
+      <div class="era-list"></div>
+      <button class="add-rpc" data-type="era">+ Add era file URL</button>
+    </div>
+    <div class="rpc-group">
+      <div class="rpc-label">Parquet base URLs <span class="rpc-hint">(optional — xatu canonical_beacon_block base URL, prepended before built-in defaults)</span></div>
+      <div class="parquet-list"></div>
+      <button class="add-rpc" data-type="parquet">+ Add parquet URL</button>
     </div>
     <div class="rpc-group">
       <div class="rpc-label">Portal Network node <span class="rpc-hint">(optional — instant verification)</span></div>
@@ -68,11 +83,17 @@ function buildCard(chain: ChainConfig): HTMLElement {
     </div>
   `
 
-  const consensusList = card.querySelector('.consensus-list') as HTMLDivElement
-  const executionList = card.querySelector('.execution-list') as HTMLDivElement
+  const consensusList  = card.querySelector('.consensus-list')  as HTMLDivElement
+  const executionList  = card.querySelector('.execution-list')  as HTMLDivElement
+  const checkpointList = card.querySelector('.checkpoint-list') as HTMLDivElement
+  const eraList        = card.querySelector('.era-list')        as HTMLDivElement
+  const parquetList    = card.querySelector('.parquet-list')    as HTMLDivElement
 
   chain.consensusRpcs.forEach((url) => consensusList.appendChild(rpcRow(url)))
-  chain.rpcs.forEach((url) => executionList.appendChild(rpcRow(url)))
+  chain.rpcs.forEach((url) => executionList.appendChild(execRpcRow(url, chain.rpcBatchSizes?.[url])))
+  ;(chain.checkpointUrls ?? []).forEach((url) => checkpointList.appendChild(rpcRow(url)))
+  ;(chain.eraFileUrls ?? []).forEach((url) => eraList.appendChild(rpcRow(url)))
+  ;(chain.parquetUrls ?? []).forEach((url) => parquetList.appendChild(rpcRow(url)))
 
   card.querySelector('.reset-chain')?.addEventListener('click', () => {
     const defaults = DEFAULT_CHAINS[chain.chainId]
@@ -81,6 +102,10 @@ function buildCard(chain: ChainConfig): HTMLElement {
       ...chains[chain.chainId],
       consensusRpcs: [...defaults.consensusRpcs],
       rpcs: [...defaults.rpcs],
+      rpcBatchSizes: defaults.rpcBatchSizes ? { ...defaults.rpcBatchSizes } : undefined,
+      checkpointUrls: defaults.checkpointUrls ? [...defaults.checkpointUrls] : undefined,
+      eraFileUrls: defaults.eraFileUrls ? [...defaults.eraFileUrls] : undefined,
+      parquetUrls: defaults.parquetUrls ? [...defaults.parquetUrls] : undefined,
     }
     save()
   })
@@ -92,9 +117,21 @@ function buildCard(chain: ChainConfig): HTMLElement {
 
   card.querySelectorAll<HTMLButtonElement>('.add-rpc').forEach((btn) => {
     btn.addEventListener('click', () => {
-      const list = btn.dataset.type === 'consensus' ? consensusList : executionList
-      list.appendChild(rpcRow(''))
-      ;(list.lastElementChild?.querySelector('input') as HTMLInputElement)?.focus()
+      let list: HTMLDivElement
+      let row: HTMLElement
+      if (btn.dataset.type === 'execution') {
+        list = executionList; row = execRpcRow('')
+      } else if (btn.dataset.type === 'checkpoint') {
+        list = checkpointList; row = rpcRow('')
+      } else if (btn.dataset.type === 'era') {
+        list = eraList; row = rpcRow('')
+      } else if (btn.dataset.type === 'parquet') {
+        list = parquetList; row = rpcRow('')
+      } else {
+        list = consensusList; row = rpcRow('')
+      }
+      list.appendChild(row)
+      ;(list.lastElementChild?.querySelector('input[type=url]') as HTMLInputElement)?.focus()
     })
   })
 
@@ -103,10 +140,19 @@ function buildCard(chain: ChainConfig): HTMLElement {
 
   function syncCard() {
     const portalVal = portalInput.value.trim()
+    const execUrls = rpcValues(executionList)
+    const batchSizes = execBatchSizes(executionList)
+    const cpUrls      = rpcValues(checkpointList)
+    const eraUrls     = rpcValues(eraList)
+    const parquetUrls = rpcValues(parquetList)
     chains[chain.chainId] = {
       ...chain,
       consensusRpcs: rpcValues(consensusList),
-      rpcs: rpcValues(executionList),
+      rpcs: execUrls,
+      ...(Object.keys(batchSizes).length > 0 ? { rpcBatchSizes: batchSizes } : { rpcBatchSizes: undefined }),
+      ...(cpUrls.length > 0 ? { checkpointUrls: cpUrls } : { checkpointUrls: undefined }),
+      ...(eraUrls.length > 0 ? { eraFileUrls: eraUrls } : { eraFileUrls: undefined }),
+      ...(parquetUrls.length > 0 ? { parquetUrls } : { parquetUrls: undefined }),
       ...(portalVal ? { portalRpc: portalVal } : { portalRpc: undefined }),
     }
     saveQuiet()
@@ -114,6 +160,9 @@ function buildCard(chain: ChainConfig): HTMLElement {
 
   enableDragReorder(consensusList, syncCard)
   enableDragReorder(executionList, syncCard)
+  enableDragReorder(checkpointList, syncCard)
+  enableDragReorder(eraList, syncCard)
+  enableDragReorder(parquetList, syncCard)
 
   card.addEventListener('change', syncCard)
   card.addEventListener('input', debounce(syncCard, 600))
@@ -133,11 +182,39 @@ function rpcRow(url: string): HTMLElement {
     row.remove()
     row.dispatchEvent(new Event('change', { bubbles: true }))
   })
-  // Only allow drag when the handle is the pointer-down target
   row.addEventListener('mousedown', (e) => {
     row.draggable = (row.querySelector('.drag-handle') as HTMLElement).contains(e.target as Node)
   })
   return row
+}
+
+function execRpcRow(url: string, batchSize?: number): HTMLElement {
+  const row = document.createElement('div')
+  row.className = 'rpc-row'
+  row.innerHTML = `
+    <span class="drag-handle">⠿</span>
+    <input type="url" value="${url}" placeholder="https://…" />
+    <input type="number" class="batch-size" value="${batchSize ?? ''}" min="1" max="10000" placeholder="batch" title="Max JSON-RPC batch size for this endpoint" />
+    <button title="Remove">✕</button>
+  `
+  row.querySelector('button')!.addEventListener('click', () => {
+    row.remove()
+    row.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+  row.addEventListener('mousedown', (e) => {
+    row.draggable = (row.querySelector('.drag-handle') as HTMLElement).contains(e.target as Node)
+  })
+  return row
+}
+
+function execBatchSizes(container: HTMLElement): Record<string, number> {
+  const result: Record<string, number> = {}
+  container.querySelectorAll<HTMLElement>('.rpc-row').forEach(row => {
+    const url = row.querySelector<HTMLInputElement>('input[type=url]')?.value.trim()
+    const val = parseInt(row.querySelector<HTMLInputElement>('.batch-size')?.value ?? '')
+    if (url && val > 0) result[url] = val
+  })
+  return result
 }
 
 function enableDragReorder(list: HTMLElement, onChange: () => void) {
@@ -180,7 +257,7 @@ function enableDragReorder(list: HTMLElement, onChange: () => void) {
 }
 
 function rpcValues(container: HTMLElement): string[] {
-  return Array.from(container.querySelectorAll<HTMLInputElement>('input'))
+  return Array.from(container.querySelectorAll<HTMLInputElement>('input[type=url]'))
     .map((i) => i.value.trim())
     .filter(Boolean)
 }

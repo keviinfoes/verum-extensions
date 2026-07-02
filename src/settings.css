@@ -66,6 +66,9 @@ main { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; 
   font-family: monospace; font-size: 12px; outline: none;
 }
 .rpc-row input:focus { border-color: var(--accent); }
+.rpc-row .batch-size {
+  flex: 0 0 68px; font-family: monospace; font-size: 12px;
+}
 .rpc-row button {
   background: transparent; border: 1px solid var(--border); border-radius: 6px;
   color: var(--text-muted); cursor: pointer; padding: 4px 10px; font-size: 12px;

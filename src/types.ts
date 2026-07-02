@@ -47,11 +47,16 @@ export interface ChainConfig {
   rpcs: string[]           // execution RPC endpoints tried in order
   name: string
   portalRpc?: string       // optional local Portal Network node (e.g. http://localhost:8545)
+  checkpointUrls?: string[]           // checkpoint sync providers (prepended before built-in defaults)
+  eraFileUrls?: string[]              // era file base URLs (prepended before built-in defaults)
+  parquetUrls?: string[]              // xatu parquet base URLs (prepended before built-in defaults)
+  rpcBatchSizes?: Record<string, number>  // max JSON-RPC batch size per execution RPC URL
 }
 
 export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
   1: {
     chainId: 1,
+    name: 'Mainnet',
     consensusRpcs: [
       'https://lighthouse.mainnet.ethpandaops.io',
       'https://teku.mainnet.ethpandaops.io',
@@ -64,10 +69,26 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
       'https://cloudflare-eth.com',
       'https://eth.drpc.org',
     ],
-    name: 'Mainnet',
+    rpcBatchSizes: {
+      'https://ethereum-rpc.publicnode.com': 200,
+      'https://cloudflare-eth.com': 200,
+      'https://eth.drpc.org': 200,
+    },
+    checkpointUrls: [
+      'https://beaconstate-mainnet.chainsafe.io',
+      'https://beaconstate.ethstaker.cc',
+      'https://mainnet.checkpoint.sigp.io',
+    ],
+    eraFileUrls: [
+      'https://mainnet.era.nimbus.team',
+    ],
+    parquetUrls: [
+      'https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_beacon_block',
+    ],
   },
   11155111: {
     chainId: 11155111,
+    name: 'Sepolia',
     consensusRpcs: [
       'https://lighthouse.sepolia.ethpandaops.io',
       'https://teku.sepolia.ethpandaops.io',
@@ -79,7 +100,22 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
       'https://sepolia.drpc.org',
       'https://rpc.ankr.com/eth_sepolia',
     ],
-    name: 'Sepolia',
+    rpcBatchSizes: {
+      'https://ethereum-sepolia-rpc.publicnode.com': 200,
+      'https://sepolia.drpc.org': 200,
+      'https://rpc.ankr.com/eth_sepolia': 200,
+    },
+    checkpointUrls: [
+      'https://checkpoint-sync.sepolia.ethpandaops.io',
+      'https://beaconstate-sepolia.chainsafe.io',
+      'https://sepolia.beaconstate.info',
+    ],
+    eraFileUrls: [
+      'https://sepolia.era.nimbus.team',
+    ],
+    parquetUrls: [
+      'https://data.ethpandaops.io/xatu/sepolia/databases/default/canonical_beacon_block',
+    ],
   },
 }
 
