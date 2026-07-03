@@ -137,10 +137,42 @@ window.addEventListener('message', async (e) => {
     return
   }
 
+  // eth_accounts returns the connected wallet's addresses, not a chain-state query.
+  if (method === 'eth_accounts') {
+    if (!selectedWalletId) { sendBack([]); return }
+    // fall through to wallet path below
+  } else if (method.startsWith('wallet_') && !FRAME_APPROVAL_METHODS.has(method)) {
+    // wallet_* query methods (e.g. wallet_getPermissions, wallet_getCapabilities) must
+    // go to the wallet — Helios has no concept of wallet state. When disconnected,
+    // wallet_getPermissions returns [] (no permissions), which tells wagmi to request them.
+    if (!selectedWalletId) {
+      if (method === 'wallet_getPermissions') { sendBack([]); return }
+      sendBack(undefined, 'Not connected'); return
+    }
+    // fall through to wallet path below
+  } else if (!FRAME_APPROVAL_METHODS.has(method)) {
+    // All eth_* reads always go through Helios regardless of wallet connection state —
+    // ensures reads are verified against the URL's chain, not the wallet's active network.
+    let resp: { result?: unknown; error?: string } | undefined
+    try {
+      resp = await chrome.runtime.sendMessage({ type: 'eth-rpc', chainId: currentChainId, method, params })
+    } catch (err: any) {
+      console.error('[w3] eth-rpc sendMessage failed', method, err?.message)
+      sendBack(undefined, err?.message ?? 'eth-rpc unavailable')
+      return
+    }
+    if (resp === undefined) {
+      console.error('[w3] eth-rpc no response for', method, params)
+      sendBack(undefined, 'eth-rpc no response')
+      return
+    }
+    console.debug('[w3]', method, resp?.error ? 'ERR:' + resp.error : 'OK', params?.[0])
+    sendBack(resp.result, resp.error)
+    return
+  }
+
   if (!selectedWalletId) {
     if (!CONNECT_METHODS.has(method)) {
-      // Silent fallback for background checks before the user has connected
-      if (method === 'eth_accounts') { sendBack([]); return }
       sendBack(undefined, 'Not connected'); return
     }
     // Dapps auto-retry immediately after a wallet rejection. Suppress the picker
@@ -418,6 +450,8 @@ function applyVerification(msg: VerificationUpdate) {
     verified('verified', `Verified by Helios sync-committee${ensTag}`)
   } else if (msg.beaconVerified && msg.beaconHeliosAnchored) {
     verified('beacon', `Beacon verified — Helios anchor + Merkle proof${ensTag}`, 3000)
+  } else if (msg.beaconVerified && msg.beaconEraVerified) {
+    verified('beacon', `Beacon verified — era Merkle proof${ensTag}`, 3000)
   } else {
     verifyBadge.className = 'failed'
     verifyIcon.textContent = '✗'
@@ -668,7 +702,7 @@ function renderContent(data: Uint8Array, contentType: string, assetMap: Record<s
   }
 
   pageHasScripts = /<script[\s>]/i.test(html)
-  sendToSandbox({ type: 'render', html, assetMap })
+  sendToSandbox({ type: 'render', html, assetMap, chainId: currentChainId })
   setPhase('ok')
 }
 

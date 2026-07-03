@@ -9,6 +9,70 @@ const addChainEl      = document.getElementById('add-chain') as HTMLDivElement
 const newId           = document.getElementById('new-chain-id') as HTMLInputElement
 const newName         = document.getElementById('new-chain-name') as HTMLInputElement
 const defaultChainSel = document.getElementById('default-chain-select') as HTMLSelectElement
+const clearCacheBtn   = document.getElementById('clear-cache-btn') as HTMLButtonElement
+const cacheInfo       = document.getElementById('cache-info') as HTMLSpanElement
+
+async function updateCacheInfo() {
+  const [local, sync, bytesInUse] = await Promise.all([
+    chrome.storage.local.get(['dapp_proof_cache', 'era_bsr_cache']),
+    chrome.storage.sync.get('chains'),
+    chrome.storage.local.getBytesInUse(['dapp_proof_cache', 'era_bsr_cache']),
+  ])
+  const { dapp_proof_cache, era_bsr_cache } = local
+  const chainNames: Record<number, string> = {}
+  for (const c of Object.values(sync.chains ?? {})) {
+    const ch = c as { chainId: number; name: string }
+    chainNames[ch.chainId] = ch.name
+  }
+
+  // Group dapp proofs by chainId
+  const dappsPerChain: Record<number, number> = {}
+  for (const proof of Object.values(dapp_proof_cache ?? {})) {
+    const p = proof as { chainId?: number }
+    const id = p.chainId ?? 0
+    dappsPerChain[id] = (dappsPerChain[id] ?? 0) + 1
+  }
+
+  // Collect all chainIds across both caches
+  const allChainIds = new Set<number>([
+    ...Object.keys(dappsPerChain).map(Number),
+    ...Object.keys(era_bsr_cache ?? {}).map(Number),
+  ])
+
+  const lines: string[] = []
+  for (const chainId of [...allChainIds].sort((a, b) => a - b)) {
+    const name = chainNames[chainId] ?? (chainId === 0 ? 'unknown chain' : `chain ${chainId}`)
+    const parts: string[] = []
+
+    const dapps = dappsPerChain[chainId]
+    if (dapps) parts.push(`${dapps} dapp${dapps === 1 ? '' : 's'}`)
+
+    const bsr = (era_bsr_cache ?? {})[chainId] as { histSummaries?: string; effectiveSlot?: number } | undefined
+    if (bsr?.histSummaries) {
+      const n = Math.floor(bsr.histSummaries.length * 3 / 4 / 64)
+      if (n > 0) {
+        const slot = bsr.effectiveSlot != null ? ` (state slot ${bsr.effectiveSlot})` : ''
+        parts.push(`${n} historical summaries${slot}`)
+      }
+    }
+
+    if (parts.length > 0) lines.push(`${name}: ${parts.join(', ')}`)
+  }
+
+  if (bytesInUse > 0) {
+    const kb = (bytesInUse / 1024).toFixed(1)
+    lines.push(`${kb} KB total`)
+  }
+
+  cacheInfo.textContent = lines.length > 0 ? lines.join('\n') : 'No cache'
+}
+
+clearCacheBtn.addEventListener('click', async () => {
+  await chrome.storage.local.remove(['dapp_proof_cache', 'era_bsr_cache'])
+  updateCacheInfo()
+})
+
+updateCacheInfo()
 
 addToggle.addEventListener('click', () => {
   addChainEl.classList.toggle('hidden')

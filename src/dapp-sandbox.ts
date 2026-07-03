@@ -2,6 +2,7 @@ type RenderMessage = {
   type: 'render'
   html: string
   assetMap?: Record<string, string>
+  chainId?: number
 }
 
 type BridgeMessage = {
@@ -36,7 +37,13 @@ window.addEventListener('message', (event: MessageEvent<BridgeMessage | RenderMe
 // Polyfills injected before any dApp code runs.
 // The iframe intentionally has an opaque sandbox origin so the manifest sandbox
 // can allow inline dapp scripts. Storage APIs are shimmed before app code runs.
-const LS_POLYFILL = '<scr' + 'ipt>(function(){' +
+function makePolyfill(chainId: number): string {
+  const chainIdHex = '0x' + chainId.toString(16)
+  return makePolyfillScript(chainIdHex)
+}
+
+function makePolyfillScript(chainIdHex: string): string {
+return '<scr' + 'ipt>(function(){' +
   'function MS(){var s={};return{' +
     'get length(){return Object.keys(s).length},' +
     'key:function(i){return Object.keys(s)[i]||null},' +
@@ -60,8 +67,8 @@ const LS_POLYFILL = '<scr' + 'ipt>(function(){' +
   'try{window.URL=PU;}catch(e){}' +
   // window.ethereum stub: relays EIP-1193 calls to parent.
   'var _cbs={};' +
-  'window.ethereum={' +
-    'isMetaMask:true,isConnected:function(){return true;},' +
+  'var _eth={' +
+    'isMetaMask:true,chainId:"' + chainIdHex + '",isConnected:function(){return true;},' +
     '_handlers:{},' +
     'request:function(a){' +
       'return new Promise(function(res,rej){' +
@@ -77,6 +84,14 @@ const LS_POLYFILL = '<scr' + 'ipt>(function(){' +
     'removeListener:function(e,fn){var h=this._handlers[e];if(h)this._handlers[e]=h.filter(function(x){return x!==fn;});},' +
     'emit:function(e,d){(this._handlers[e]||[]).forEach(function(fn){fn(d);});}' +
   '};' +
+  'window.ethereum=_eth;' +
+  // EIP-6963: announce provider so wagmi latest uses us as the injected connector.
+  'var _info={uuid:"w3-verum-injected",name:"Verum",icon:"",rdns:"w3.verum"};' +
+  'function _announce(){' +
+    'try{window.dispatchEvent(new CustomEvent("eip6963:announceProvider",{detail:Object.freeze({info:_info,provider:_eth})}));}catch(e){}' +
+  '}' +
+  '_announce();' +
+  'window.addEventListener("eip6963:requestProvider",_announce);' +
   'window.addEventListener("message",function(e){' +
     'if(!e.data)return;' +
     'if(e.data.type==="eth-response"){' +
@@ -105,6 +120,7 @@ const LS_POLYFILL = '<scr' + 'ipt>(function(){' +
     '}catch(ex){}' +
   '},true);' +
 '})();<\/scr' + 'ipt>'
+}
 
 // Asset map polyfill: intercept img.src assignments made by JS and replace
 // https://dapp.w3fs/* URLs with pre-built data: URIs from the bundle.
@@ -137,7 +153,7 @@ window.addEventListener('message', (event: MessageEvent<RenderMessage>) => {
   // servers that do not allowlist chrome-extension:// origins.
   html = html.replace(/\s+crossorigin(?:=["'][^"']*["'])?/gi, '')
 
-  const inject = LS_POLYFILL + assetPolyfill
+  const inject = makePolyfill(event.data.chainId ?? 1) + assetPolyfill
   html = html.indexOf('<head>') !== -1
     ? html.replace('<head>', '<head>' + inject)
     : inject + html

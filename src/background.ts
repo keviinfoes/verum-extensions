@@ -7,6 +7,7 @@ import { parseCalldata, assembleContent, BUNDLE_CONTENT_TYPE, parseBundle, bundl
 import { resolveEns } from './lib/ens-resolver.js'
 import type { TxRef } from './lib/ens-resolver.js'
 import { verifyViaBeacon, isEip2935Error } from './lib/beacon-verifier.js'
+import type { DappProofData, EraBsrCache } from './lib/beacon-verifier.js'
 import { DEFAULT_CHAINS } from './types.js'
 import type { BgMessage, BgResponse, VerificationUpdate, ChainConfig } from './types.js'
 import { listWallets, ethRequest as walletRequest } from './lib/metamask-bridge.js'
@@ -15,6 +16,37 @@ import type { IVerifiedRpc } from './lib/light-client.js'
 
 const rpcCache = new Map<number, Promise<IVerifiedRpc>>()
 const tabVerGen = new Map<number, number>()
+
+// ---------------------------------------------------------------------------
+// Per-dapp proof cache (chrome.storage.local)
+// Key: raw w3:// URL. Value: txHash (for ENS staleness) + 13-hash Merkle proof.
+// Skips era file / parquet / exec-header download on re-visit.
+// ---------------------------------------------------------------------------
+interface StoredProof { txHash: string; merklePath: string; chainId?: number }
+
+async function readProofCache(): Promise<Record<string, StoredProof>> {
+  const { dapp_proof_cache } = await chrome.storage.local.get('dapp_proof_cache')
+  return (dapp_proof_cache as Record<string, StoredProof>) ?? {}
+}
+
+function writeProofCache(cache: Record<string, StoredProof>): void {
+  chrome.storage.local.set({ dapp_proof_cache: cache }).catch(() => {})
+}
+
+// ---------------------------------------------------------------------------
+// Era BSR cache (chrome.storage.local)
+// Key: chainId → EraBsrCache { stateRoot, fieldProof, histSummaries }.
+// Stores all historical_summaries + a 5-6 hash field proof → stateRoot → Helios.
+// Covers all eras; no per-era proof needed. Re-downloaded when Helios can no longer confirm stateRoot.
+// ---------------------------------------------------------------------------
+async function readEraBsrCache(): Promise<Record<number, EraBsrCache>> {
+  const { era_bsr_cache } = await chrome.storage.local.get('era_bsr_cache')
+  return (era_bsr_cache as Record<number, EraBsrCache>) ?? {}
+}
+
+function writeEraBsrCache(cache: Record<number, EraBsrCache>): void {
+  chrome.storage.local.set({ era_bsr_cache: cache }).catch(() => {})
+}
 
 function getOrCreateRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
   if (!rpcCache.has(chain.chainId)) {
@@ -330,6 +362,23 @@ async function twoPhaseResolve(
   const EIP_2935_BUFFER_SECONDS = 8191 * 12
   const blockIsHistorical = (Date.now() / 1000) - phase1BlockTimestamp > EIP_2935_BUFFER_SECONDS
 
+  // Look up per-dapp proof cache (era Merkle proof) and chain-level era BSR cache.
+  const [proofCache, eraBsrCache] = await Promise.all([readProofCache(), readEraBsrCache()])
+  const cachedEntry = proofCache[rawUrl]
+  const cachedProof: DappProofData | undefined = cachedEntry && (
+    parsed.target.type === 'tx' || cachedEntry.txHash.toLowerCase() === txHash.toLowerCase()
+  ) ? cachedEntry : undefined
+  if (cachedProof) console.log('[w3] Dapp proof cache hit — skipping era file download')
+
+  const beaconOptions = {
+    checkpointUrls: chain.checkpointUrls,
+    eraFileUrls: chain.localMode ? [] : chain.eraFileUrls,
+    parquetUrls: chain.localMode ? [] : chain.parquetUrls,
+    rpcBatchSizes: execBatchSizes,
+    cachedProof,
+    eraBsrCache: eraBsrCache[chain.chainId],
+  }
+
   if (blockIsHistorical && chain.consensusRpcs.length > 0) {
     console.log('[w3] Historical block — starting Helios in parallel with beacon verification')
     // Pass Helios promise unawaited — verification runs immediately using fast consensus
@@ -349,9 +398,17 @@ async function twoPhaseResolve(
         chain.consensusRpcs,
         heliosPromise,
         execRpcs,
-        { checkpointUrls: chain.checkpointUrls, eraFileUrls: chain.localMode ? [] : chain.eraFileUrls, parquetUrls: chain.localMode ? [] : chain.parquetUrls, rpcBatchSizes: execBatchSizes },
+        beaconOptions,
       )
       console.log('[w3] Beacon verification succeeded, heliosAnchored:', beacon.heliosAnchored, 'eraVerified:', beacon.eraVerified)
+      if (beacon.proofData) {
+        proofCache[rawUrl] = { txHash, chainId: chain.chainId, ...beacon.proofData }
+        writeProofCache(proofCache)
+      }
+      if (beacon.newBsrCache) {
+        eraBsrCache[chain.chainId] = beacon.newBsrCache
+        writeEraBsrCache(eraBsrCache)
+      }
       let trieVerified = false
       try {
         const { txHash: verifiedTxHash } = await verifyTxInBlock(phase1BlockHash, phase1TxIndex, execRpcs, phase1Block)
@@ -451,12 +508,20 @@ async function twoPhaseResolve(
           chain.consensusRpcs,
           heliosRpc,
           execRpcs,
-          { checkpointUrls: chain.checkpointUrls, eraFileUrls: chain.localMode ? [] : chain.eraFileUrls, parquetUrls: chain.localMode ? [] : chain.parquetUrls, rpcBatchSizes: execBatchSizes },
+          beaconOptions,
         )
         console.log(
           '[w3] Beacon verification succeeded, heliosAnchored:', beacon.heliosAnchored,
           'eraVerified:', beacon.eraVerified,
         )
+        if (beacon.proofData) {
+          proofCache[rawUrl] = { txHash, chainId: chain.chainId, ...beacon.proofData }
+          writeProofCache(proofCache)
+        }
+        if (beacon.newBsrCache) {
+          eraBsrCache[chain.chainId] = beacon.newBsrCache
+          writeEraBsrCache(eraBsrCache)
+        }
         let trieVerified2 = false
         try {
           const { txHash: verifiedTxHash } = await verifyTxInBlock(phase1BlockHash, phase1TxIndex, execRpcs, phase1Block)
@@ -578,7 +643,35 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     listAvailableWallets().then(sendResponse)
     return true
   }
+  if (msg.type === 'eth-rpc') {
+    console.log('[w3] eth-rpc', msg.method, msg.chainId)
+    ethRpcCall(msg.chainId, msg.method, msg.params ?? []).then((r) => {
+      console.log('[w3] eth-rpc result', msg.method, r?.error ? 'ERR:' + r.error : 'OK')
+      sendResponse(r)
+    })
+    return true
+  }
 })
+
+async function ethRpcCall(chainId: number, method: string, params: unknown[]): Promise<{ result?: unknown; error?: string }> {
+  const stored = await chrome.storage.sync.get('chains')
+  const chains: Record<number, ChainConfig> = stored.chains ?? DEFAULT_CHAINS
+  const chain = chains[chainId]
+  if (!chain) return { error: `No chain config for chainId ${chainId}` }
+  try {
+    // Race the (possibly still-syncing) Helios Promise against an immediate RpcClient
+    // fallback so dapp reads aren't blocked if Helios hasn't finished syncing yet.
+    // If Helios is already resolved (started during twoPhaseResolve) it wins instantly.
+    const rpc = await Promise.race([
+      getOrCreateRpc(chain),
+      new Promise<IVerifiedRpc>(res => setTimeout(() => res(new RpcClient(chain.rpcs)), 100)),
+    ])
+    const result = await rpc.request(method, params)
+    return { result }
+  } catch (err: any) {
+    return { error: err.message ?? String(err) }
+  }
+}
 
 async function listAvailableWallets(): Promise<Array<{ name: string; id: string }>> {
   const [direct, frame] = await Promise.all([

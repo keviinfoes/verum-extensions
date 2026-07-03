@@ -68,6 +68,21 @@ function merkleizeExact(chunks: Uint8Array[]): Uint8Array {
   return layer[0] ?? new Uint8Array(32)
 }
 
+/** Returns sibling hashes proving chunks[index] in an exact power-of-2 tree. */
+function merkleProofExact(chunks: Uint8Array[], index: number): Uint8Array[] {
+  let layer = [...chunks]
+  const proof: Uint8Array[] = []
+  let idx = index
+  while (layer.length > 1) {
+    proof.push(layer[idx ^ 1])
+    const next: Uint8Array[] = []
+    for (let i = 0; i < layer.length; i += 2) next.push(h(layer[i], layer[i + 1]))
+    layer = next
+    idx >>= 1
+  }
+  return proof
+}
+
 /** SSZ mix_in_length: sha256(root ++ LE64(length)) */
 function mixLen(root: Uint8Array, length: number): Uint8Array {
   const lc = new Uint8Array(32)
@@ -728,6 +743,10 @@ export interface BeaconStateVerification {
   getBlockSummaryRoot(era: number): string | null
   /** Read block_roots[slot % 8192] from the verified state (0x-hex, 32 bytes). */
   getBlockRootAtSlot(slot: number): string
+  /** Raw historical_summaries bytes (N × 64 bytes) as a base64 string. */
+  getHistoricalSummariesBlob(): string
+  /** Proof from historical_summaries list root → BeaconState root (5-6 sibling hashes, base64). */
+  computeHistoricalSummariesFieldProof(): string
 }
 
 /**
@@ -891,7 +910,48 @@ export function computeBeaconStateRoot(stateSSZ: Uint8Array): BeaconStateVerific
       const idx = slot % 8192
       return hexlify(stateSSZ.slice(176 + idx * 32, 176 + (idx + 1) * 32))
     },
+    getHistoricalSummariesBlob(): string {
+      let s = ''
+      for (let i = 0; i < histSummaries.length; i++) s += String.fromCharCode(histSummaries[i])
+      return btoa(s)
+    },
+    computeHistoricalSummariesFieldProof(): string {
+      const sibs = merkleProofExact(fieldRoots, 27)
+      const buf = new Uint8Array(sibs.length * 32)
+      sibs.forEach((s, i) => buf.set(s, i * 32))
+      return btoa(String.fromCharCode(...buf))
+    },
   }
+}
+
+/**
+ * Verify the historical_summaries field proof produced by computeHistoricalSummariesFieldProof.
+ *
+ * Re-derives hash_tree_root(historical_summaries) from the cached blob, then walks the
+ * 5-6 sibling hashes up to the BeaconState root. Covers all eras in one proof.
+ */
+export function verifyHistoricalSummariesFieldProof(
+  histSummariesBlob: string,  // base64, N × 64 bytes
+  fieldProofB64: string,       // base64, 5-6 × 32 bytes
+  stateRootHex: string,
+): boolean {
+  const raw = Uint8Array.from(atob(histSummariesBlob), c => c.charCodeAt(0))
+  const n = Math.floor(raw.length / 64)
+  if (n === 0) return false
+  // Recompute historical_summaries list root from the cached entries
+  const hs: Uint8Array[] = []
+  for (let i = 0; i < n; i++) hs.push(h(raw.slice(i * 64, i * 64 + 32), raw.slice(i * 64 + 32, i * 64 + 64)))
+  let node = mixLen(merkleizeAtDepth(hs, 24), n)
+  // Walk up the BeaconState field tree from position 27
+  const proof = Uint8Array.from(atob(fieldProofB64), c => c.charCodeAt(0))
+  const fieldDepth = proof.length / 32
+  let idx = 27
+  for (let d = 0; d < fieldDepth; d++) {
+    const sib = proof.slice(d * 32, (d + 1) * 32)
+    node = idx % 2 === 0 ? h(node, sib) : h(sib, node)
+    idx >>= 1
+  }
+  return hexlify(node).toLowerCase() === stateRootHex.toLowerCase()
 }
 
 // ---------------------------------------------------------------------------

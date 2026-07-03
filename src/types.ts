@@ -104,7 +104,6 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
     checkpointUrls: [
       'https://checkpoint-sync.sepolia.ethpandaops.io',
       'https://beaconstate-sepolia.chainsafe.io',
-      'https://sepolia.beaconstate.info',
     ],
     eraFileUrls: [
       'https://sepolia.era.nimbus.team',
