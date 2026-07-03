@@ -144,6 +144,12 @@ async function twoPhaseResolve(
     return
   }
 
+  // Local mode: use only the first exec RPC at batch 1000, skip era/parquet
+  const execRpcs = chain.localMode ? chain.rpcs.slice(0, 1) : chain.rpcs
+  const execBatchSizes = chain.localMode
+    ? (chain.rpcs[0] ? { [chain.rpcs[0]]: 1000 } : undefined)
+    : chain.rpcBatchSizes
+
   // ── Phase 1: fetch via plain RPC, show content immediately ───────────────
   if (tabId) setBadgeLoading(tabId)
 
@@ -160,7 +166,7 @@ async function twoPhaseResolve(
   let ensVerified: boolean | undefined = undefined
 
   try {
-    const fastRpc = new RpcClient(chain.rpcs)
+    const fastRpc = new RpcClient(execRpcs)
     const target = parsed.target
 
     const txRefs: TxRef[] = target.type === 'tx'
@@ -239,9 +245,8 @@ async function twoPhaseResolve(
   // the transactions trie to confirm block body integrity.
   if (chain.portalRpc) {
     console.log('[w3] Trying Portal node:', chain.portalRpc)
-    // Start Helios in parallel for ENS re-verification — Portal is fast so the
-    // combined wait is dominated by Helios (~30s), not Portal (~instant).
-    const portalHeliosPromise = (parsed.target.type === 'ens' && phase1EnsChunks.length > 0 && chain.consensusRpcs.length > 0)
+    // Start Helios in parallel for ENS re-verification — skipped in local mode (no external calls).
+    const portalHeliosPromise = (!chain.localMode && parsed.target.type === 'ens' && phase1EnsChunks.length > 0 && chain.consensusRpcs.length > 0)
       ? Promise.race([
           getOrCreateRpc(chain),
           new Promise<undefined>(r => setTimeout(() => r(undefined), 35_000)),
@@ -291,6 +296,33 @@ async function twoPhaseResolve(
     }
   }
 
+  // ── Local mode: trie-verify via local exec RPC only — no external calls ──
+  if (chain.localMode) {
+    let trieVerified = false
+    try {
+      const { txHash: verifiedTxHash } = await verifyTxInBlock(phase1BlockHash, phase1TxIndex, execRpcs, phase1Block)
+      if (verifiedTxHash.toLowerCase() !== txHash.toLowerCase())
+        throw new Error(`Tx hash mismatch at index ${phase1TxIndex}`)
+      trieVerified = true
+    } catch (trieErr) {
+      console.warn('[w3] Local mode trie verification failed:', (trieErr as Error).message)
+    }
+    const update: VerificationUpdate = {
+      type: 'verification-update',
+      heliosBacked: false,
+      trieVerified,
+      proof: {
+        url: rawUrl, blockNumber: phase1BlockNumber, blockHash: phase1BlockHash, txHash,
+        txIndex: phase1TxIndex, contentType, payloadSize: formatBytes(assembled.length),
+      },
+    }
+    if (isSuperseded()) { port.disconnect(); return }
+    await updateBadge(tabId, update)
+    send(update)
+    port.disconnect()
+    return
+  }
+
   // Historical blocks (> ~27h old) are outside the EIP-2935 ring buffer — Helios
   // would only throw EIP-2935 for them anyway. Skip the expensive multi-combo
   // Helios init (up to 6 min with 12 combinations × 30s timeout) and go straight
@@ -316,13 +348,13 @@ async function twoPhaseResolve(
         chain.chainId,
         chain.consensusRpcs,
         heliosPromise,
-        chain.rpcs,
-        { checkpointUrls: chain.checkpointUrls, eraFileUrls: chain.eraFileUrls, parquetUrls: chain.parquetUrls, rpcBatchSizes: chain.rpcBatchSizes },
+        execRpcs,
+        { checkpointUrls: chain.checkpointUrls, eraFileUrls: chain.localMode ? [] : chain.eraFileUrls, parquetUrls: chain.localMode ? [] : chain.parquetUrls, rpcBatchSizes: execBatchSizes },
       )
       console.log('[w3] Beacon verification succeeded, heliosAnchored:', beacon.heliosAnchored, 'eraVerified:', beacon.eraVerified)
       let trieVerified = false
       try {
-        const { txHash: verifiedTxHash } = await verifyTxInBlock(phase1BlockHash, phase1TxIndex, chain.rpcs, phase1Block)
+        const { txHash: verifiedTxHash } = await verifyTxInBlock(phase1BlockHash, phase1TxIndex, execRpcs, phase1Block)
         if (verifiedTxHash.toLowerCase() !== txHash.toLowerCase())
           throw new Error(`Tx hash mismatch at index ${phase1TxIndex}: block has ${verifiedTxHash}, expected ${txHash}`)
         trieVerified = true
@@ -418,8 +450,8 @@ async function twoPhaseResolve(
           chain.chainId,
           chain.consensusRpcs,
           heliosRpc,
-          chain.rpcs,
-          { checkpointUrls: chain.checkpointUrls, eraFileUrls: chain.eraFileUrls, parquetUrls: chain.parquetUrls, rpcBatchSizes: chain.rpcBatchSizes },
+          execRpcs,
+          { checkpointUrls: chain.checkpointUrls, eraFileUrls: chain.localMode ? [] : chain.eraFileUrls, parquetUrls: chain.localMode ? [] : chain.parquetUrls, rpcBatchSizes: execBatchSizes },
         )
         console.log(
           '[w3] Beacon verification succeeded, heliosAnchored:', beacon.heliosAnchored,
@@ -427,7 +459,7 @@ async function twoPhaseResolve(
         )
         let trieVerified2 = false
         try {
-          const { txHash: verifiedTxHash } = await verifyTxInBlock(phase1BlockHash, phase1TxIndex, chain.rpcs, phase1Block)
+          const { txHash: verifiedTxHash } = await verifyTxInBlock(phase1BlockHash, phase1TxIndex, execRpcs, phase1Block)
           if (verifiedTxHash.toLowerCase() !== txHash.toLowerCase())
             throw new Error(`Tx hash mismatch at index ${phase1TxIndex}: block has ${verifiedTxHash}, expected ${txHash}`)
           trieVerified2 = true

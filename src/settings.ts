@@ -4,9 +4,16 @@ import type { ChainConfig } from './types.js'
 const chainsEl        = document.getElementById('chains') as HTMLDivElement
 const toast           = document.getElementById('saved-toast') as HTMLDivElement
 const addBtn          = document.getElementById('add-chain-btn') as HTMLButtonElement
+const addToggle       = document.getElementById('add-chain-toggle') as HTMLButtonElement
+const addChainEl      = document.getElementById('add-chain') as HTMLDivElement
 const newId           = document.getElementById('new-chain-id') as HTMLInputElement
 const newName         = document.getElementById('new-chain-name') as HTMLInputElement
 const defaultChainSel = document.getElementById('default-chain-select') as HTMLSelectElement
+
+addToggle.addEventListener('click', () => {
+  addChainEl.classList.toggle('hidden')
+  addToggle.textContent = addChainEl.classList.contains('hidden') ? '+' : '×'
+})
 
 let chains: Record<number, ChainConfig> = {}
 
@@ -31,13 +38,14 @@ function renderDefaultChainSelector(selected: number) {
 
 defaultChainSel.addEventListener('change', () => {
   chrome.storage.sync.set({ defaultChain: parseInt(defaultChainSel.value) }).then(showToast)
+  render()
 })
 
 function render() {
   chainsEl.innerHTML = ''
-  for (const chain of Object.values(chains)) {
-    chainsEl.appendChild(buildCard(chain))
-  }
+  const selectedId = parseInt(defaultChainSel.value)
+  const chain = chains[selectedId]
+  if (chain) chainsEl.appendChild(buildCard(chain))
 }
 
 function buildCard(chain: ChainConfig): HTMLElement {
@@ -45,12 +53,22 @@ function buildCard(chain: ChainConfig): HTMLElement {
   card.className = 'chain-card'
 
   const hasDefaults = !!DEFAULT_CHAINS[chain.chainId]
+  if (chain.localMode) card.classList.add('local-mode')
   card.innerHTML = `
     <div class="chain-header">
       <span class="chain-id">chainId ${chain.chainId}</span>
       <span class="chain-name">${chain.name}</span>
       ${hasDefaults ? '<button class="reset-chain" title="Reset RPCs to defaults">↺ Reset</button>' : ''}
-      <button class="delete-chain" title="Remove chain">✕</button>
+      ${!hasDefaults ? '<button class="delete-chain" title="Remove chain">✕</button>' : ''}
+    </div>
+    <div class="local-mode-row">
+      <label class="local-mode-label">
+        <span class="toggle-track">
+          <input type="checkbox" class="local-mode-toggle" ${chain.localMode ? 'checked' : ''} />
+          <span class="toggle-thumb"></span>
+        </span>
+        Local node mode <span class="rpc-hint">(only activate when using trusted local execution and consensus nodes)</span>
+      </label>
     </div>
     <div class="rpc-group">
       <div class="rpc-label">Consensus RPCs (beacon API)</div>
@@ -58,27 +76,27 @@ function buildCard(chain: ChainConfig): HTMLElement {
       <button class="add-rpc" data-type="consensus">+ Add consensus RPC</button>
     </div>
     <div class="rpc-group">
-      <div class="rpc-label">Execution RPCs <span class="rpc-hint">(batch = max requests per POST — leave blank for default 200)</span></div>
+      <div class="rpc-label">Execution RPCs <span class="rpc-hint exec-hint">(default batch size 200)</span><span class="rpc-hint exec-hint-local" style="display:none">(only first RPC used — batch fixed at 1000)</span></div>
       <div class="execution-list"></div>
       <button class="add-rpc" data-type="execution">+ Add execution RPC</button>
     </div>
-    <div class="rpc-group">
-      <div class="rpc-label">Checkpoint sync URLs <span class="rpc-hint">(optional — prepended before built-in defaults for state download)</span></div>
+    <div class="rpc-group checkpoint-group">
+      <div class="rpc-label">Checkpoint sync URLs <span class="rpc-hint">(optional — fast current BeaconState download)</span></div>
       <div class="checkpoint-list"></div>
       <button class="add-rpc" data-type="checkpoint">+ Add checkpoint URL</button>
     </div>
-    <div class="rpc-group">
-      <div class="rpc-label">Era file URLs <span class="rpc-hint">(optional — prepended before built-in defaults for block_roots)</span></div>
+    <div class="rpc-group era-group">
+      <div class="rpc-label">Era file URLs <span class="rpc-hint">(optional — fast historic era BeaconBlockRoots download)</span></div>
       <div class="era-list"></div>
       <button class="add-rpc" data-type="era">+ Add era file URL</button>
     </div>
-    <div class="rpc-group">
-      <div class="rpc-label">Parquet base URLs <span class="rpc-hint">(optional — xatu canonical_beacon_block base URL, prepended before built-in defaults)</span></div>
+    <div class="rpc-group parquet-group">
+      <div class="rpc-label">Parquet base URLs <span class="rpc-hint">(optional — fast historic era BeaconBlockRoots download)</span></div>
       <div class="parquet-list"></div>
       <button class="add-rpc" data-type="parquet">+ Add parquet URL</button>
     </div>
     <div class="rpc-group">
-      <div class="rpc-label">Portal Network node <span class="rpc-hint">(optional — instant verification)</span></div>
+      <div class="rpc-label">Portal Network node <span class="rpc-hint">(optional — local data download)</span></div>
       <input class="portal-rpc" type="url" value="${chain.portalRpc ?? ''}" placeholder="http://localhost:8545" />
     </div>
   `
@@ -92,8 +110,8 @@ function buildCard(chain: ChainConfig): HTMLElement {
   chain.consensusRpcs.forEach((url) => consensusList.appendChild(rpcRow(url)))
   chain.rpcs.forEach((url) => executionList.appendChild(execRpcRow(url, chain.rpcBatchSizes?.[url])))
   ;(chain.checkpointUrls ?? []).forEach((url) => checkpointList.appendChild(rpcRow(url)))
-  ;(chain.eraFileUrls ?? []).forEach((url) => eraList.appendChild(rpcRow(url)))
-  ;(chain.parquetUrls ?? []).forEach((url) => parquetList.appendChild(rpcRow(url)))
+  ;(chain.eraFileUrls ?? DEFAULT_CHAINS[chain.chainId]?.eraFileUrls ?? []).forEach((url) => eraList.appendChild(rpcRow(url)))
+  ;(chain.parquetUrls ?? DEFAULT_CHAINS[chain.chainId]?.parquetUrls ?? []).forEach((url) => parquetList.appendChild(rpcRow(url)))
 
   card.querySelector('.reset-chain')?.addEventListener('click', () => {
     const defaults = DEFAULT_CHAINS[chain.chainId]
@@ -110,7 +128,7 @@ function buildCard(chain: ChainConfig): HTMLElement {
     save()
   })
 
-  card.querySelector('.delete-chain')!.addEventListener('click', () => {
+  card.querySelector('.delete-chain')?.addEventListener('click', () => {
     delete chains[chain.chainId]
     save()
   })
@@ -136,17 +154,34 @@ function buildCard(chain: ChainConfig): HTMLElement {
   })
 
   // Sync changes back to chains on input
-  const portalInput = card.querySelector('.portal-rpc') as HTMLInputElement
+  const portalInput      = card.querySelector('.portal-rpc') as HTMLInputElement
+  const localModeToggle  = card.querySelector('.local-mode-toggle') as HTMLInputElement
+  const execHintNormal   = card.querySelector('.exec-hint') as HTMLElement
+  const execHintLocal    = card.querySelector('.exec-hint-local') as HTMLElement
+
+  function applyLocalMode(local: boolean) {
+    card.classList.toggle('local-mode', local)
+    execHintNormal.style.display = local ? 'none' : ''
+    execHintLocal.style.display  = local ? '' : 'none'
+  }
+  applyLocalMode(!!chain.localMode)
+
+  localModeToggle.addEventListener('change', () => {
+    applyLocalMode(localModeToggle.checked)
+    syncCard()
+  })
 
   function syncCard() {
-    const portalVal = portalInput.value.trim()
-    const execUrls = rpcValues(executionList)
+    const portalVal  = portalInput.value.trim()
+    const local      = localModeToggle.checked
+    const execUrls   = rpcValues(executionList)
     const batchSizes = execBatchSizes(executionList)
     const cpUrls      = rpcValues(checkpointList)
     const eraUrls     = rpcValues(eraList)
     const parquetUrls = rpcValues(parquetList)
     chains[chain.chainId] = {
       ...chain,
+      localMode: local || undefined,
       consensusRpcs: rpcValues(consensusList),
       rpcs: execUrls,
       ...(Object.keys(batchSizes).length > 0 ? { rpcBatchSizes: batchSizes } : { rpcBatchSizes: undefined }),
@@ -179,8 +214,9 @@ function rpcRow(url: string): HTMLElement {
     <button title="Remove">✕</button>
   `
   row.querySelector('button')!.addEventListener('click', () => {
+    const parent = row.parentElement
     row.remove()
-    row.dispatchEvent(new Event('change', { bubbles: true }))
+    parent?.dispatchEvent(new Event('change', { bubbles: true }))
   })
   row.addEventListener('mousedown', (e) => {
     row.draggable = (row.querySelector('.drag-handle') as HTMLElement).contains(e.target as Node)
@@ -198,8 +234,9 @@ function execRpcRow(url: string, batchSize?: number): HTMLElement {
     <button title="Remove">✕</button>
   `
   row.querySelector('button')!.addEventListener('click', () => {
+    const parent = row.parentElement
     row.remove()
-    row.dispatchEvent(new Event('change', { bubbles: true }))
+    parent?.dispatchEvent(new Event('change', { bubbles: true }))
   })
   row.addEventListener('mousedown', (e) => {
     row.draggable = (row.querySelector('.drag-handle') as HTMLElement).contains(e.target as Node)
@@ -266,17 +303,25 @@ addBtn.addEventListener('click', () => {
   const id = parseInt(newId.value)
   const name = newName.value.trim()
   if (!id || !name) return
-  chains[id] = { chainId: id, name, consensusRpcs: [], rpcs: [] }
   newId.value = ''
   newName.value = ''
-  save()
+  addChainEl.classList.add('hidden')
+  addToggle.textContent = '+'
+  if (chains[id]) {
+    defaultChainSel.value = String(id)
+    render()
+    return
+  }
+  chains[id] = { chainId: id, name, consensusRpcs: [], rpcs: [] }
+  save(id)
 })
 
 // Save + re-render — use for structural changes (add/delete chain, reset, drag-reorder)
-function save() {
+function save(selectChainId?: number) {
   chrome.storage.sync.set({ chains }).then(async () => {
     const stored = await chrome.storage.sync.get('defaultChain')
     renderDefaultChainSelector(stored.defaultChain ?? 1)
+    if (selectChainId !== undefined) defaultChainSel.value = String(selectChainId)
     render()
     showToast()
   })

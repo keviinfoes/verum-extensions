@@ -364,13 +364,17 @@ async function getBlockSummaryRoot(
     ? customCheckpointUrls
     : (CHECKPOINT_SYNC_RPCS[chainId] ?? [])
 
-  // Checkpoint providers first (gzip, ~39s mainnet), consensus RPCs as fallback.
-  // Stagger 3s between each start: a fast failure (CORS, 404) triggers the next
-  // almost immediately while a slow download stays solo to avoid parallel bloat.
-  const ordered = [
-    ...checkpointRpcs.map(rpc => () => attempt(rpc, 'finalized')),
-    ...consensusRpcs.map(rpc => () => attempt(rpc, anchorSlot)),
-  ]
+  // Race checkpoint providers and consensus RPCs — interleaved so both types start early.
+  // Stagger 3s between each start: a fast failure triggers the next immediately while
+  // a slow download stays solo to avoid parallel bloat.
+  const cpAttempts = checkpointRpcs.map(rpc => () => attempt(rpc, 'finalized'))
+  const cnAttempts = consensusRpcs.map(rpc => () => attempt(rpc, anchorSlot))
+  const ordered: (() => Promise<StateSummary>)[] = []
+  const len = Math.max(cpAttempts.length, cnAttempts.length)
+  for (let i = 0; i < len; i++) {
+    if (cpAttempts[i]) ordered.push(cpAttempts[i])
+    if (cnAttempts[i]) ordered.push(cnAttempts[i])
+  }
 
   const staggered = ordered.map((fn, i): Promise<StateSummary> => {
     if (i === 0) return fn()
@@ -746,12 +750,14 @@ async function fetchEraBlockRootsFromParquet(
   customParquetUrls?: string[],
 ): Promise<Uint8Array[] | null> {
   const network = XATU_CHAIN[chainId]
+  // undefined → use built-in default; [] → skip parquet entirely
+  if (customParquetUrls !== undefined && customParquetUrls.length === 0) return null
   if (!network && !customParquetUrls?.length) return null
 
   const eraStartSlot = era * 8192
   const eraEndSlot   = eraStartSlot + 8191
   const defaultBase  = network ? `${XATU_BASE}/${network}/databases/default/canonical_beacon_block` : null
-  const bases        = customParquetUrls?.length
+  const bases        = customParquetUrls !== undefined
     ? [...customParquetUrls, ...(defaultBase ? [defaultBase] : [])]
     : (defaultBase ? [defaultBase] : [])
 
@@ -1127,11 +1133,14 @@ export async function verifyViaBeacon(
     console.log(`[w3] Era ${era}: block_roots[${slot % 8192}] from BeaconState — skipping era file ✓`)
     expectedBeaconRoot = blockRootAtSlot
   } else {
+    // undefined = use built-in defaults; [] = explicitly disabled (e.g. local mode)
+    const useEra     = options?.eraFileUrls === undefined || options.eraFileUrls.length > 0
+    const useParquet = options?.parquetUrls === undefined || options.parquetUrls.length > 0
     let eraBlockRoots: Uint8Array[] | null = null
-    if (!needExecHeaders) {
+    if (!needExecHeaders && useEra) {
       eraBlockRoots = await fetchEraBlockRootsFromEraFile(era + 1, chainId, blockSummaryRoot, options?.eraFileUrls)
     }
-    if (!eraBlockRoots && !needExecHeaders) {
+    if (!eraBlockRoots && !needExecHeaders && useParquet) {
       console.log(`[w3] Era ${era}: trying parquet (ethpandaops xatu)`)
       eraBlockRoots = await fetchEraBlockRootsFromParquet(era, chainId, blockSummaryRoot, options?.parquetUrls)
     }

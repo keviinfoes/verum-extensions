@@ -13,11 +13,14 @@ export class RpcClient implements IVerifiedRpc {
   async request<T>(method: string, params: unknown[]): Promise<T> {
     let lastErr: unknown
     for (const url of this.urls) {
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => ctrl.abort(), 10_000)
       try {
         const res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+          signal: ctrl.signal,
         })
         const json = await res.json() as { result: T; error?: { message: string } }
         if (json.error) throw new Error(`RPC ${method}: ${json.error.message}`)
@@ -25,6 +28,8 @@ export class RpcClient implements IVerifiedRpc {
         return json.result
       } catch (err) {
         lastErr = err
+      } finally {
+        clearTimeout(timer)
       }
     }
     throw lastErr ?? new Error(`All RPCs failed for ${method}`)

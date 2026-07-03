@@ -46,6 +46,7 @@ export interface ChainConfig {
   consensusRpcs: string[]  // beacon API endpoints tried in order
   rpcs: string[]           // execution RPC endpoints tried in order
   name: string
+  localMode?: boolean                  // use only rpcs[0] at batch 1000, skip era/parquet
   portalRpc?: string       // optional local Portal Network node (e.g. http://localhost:8545)
   checkpointUrls?: string[]           // checkpoint sync providers (prepended before built-in defaults)
   eraFileUrls?: string[]              // era file base URLs (prepended before built-in defaults)
@@ -58,11 +59,8 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
     chainId: 1,
     name: 'Mainnet',
     consensusRpcs: [
-      'https://lighthouse.mainnet.ethpandaops.io',
-      'https://teku.mainnet.ethpandaops.io',
-      'https://nimbus.mainnet.ethpandaops.io',
+      'https://ethereum-beacon-api.publicnode.com',
       'https://lodestar-mainnet.chainsafe.io',
-      'https://www.lightclientdata.org',
     ],
     rpcs: [
       'https://ethereum-rpc.publicnode.com',
@@ -90,10 +88,8 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
     chainId: 11155111,
     name: 'Sepolia',
     consensusRpcs: [
-      'https://lighthouse.sepolia.ethpandaops.io',
-      'https://teku.sepolia.ethpandaops.io',
+      'https://ethereum-sepolia-beacon-api.publicnode.com',
       'https://lodestar-sepolia.chainsafe.io',
-      'https://nimbus.sepolia.ethpandaops.io',
     ],
     rpcs: [
       'https://ethereum-sepolia-rpc.publicnode.com',
