@@ -14,7 +14,7 @@ import { listWallets, ethRequest as walletRequest } from './lib/wallets/metamask
 import { isFrameAvailable, frameRequest } from './lib/wallets/frame-bridge.js'
 import type { IVerifiedRpc } from './lib/rpc/light-client.js'
 
-const BUILD_ID = 'lib-folder-reorg-2026-07-10T45'
+const BUILD_ID = 'trim-exec-proxy-logs-2026-07-10T51'
 
 console.log(`[w3] background build ${BUILD_ID}`)
 
@@ -390,6 +390,9 @@ async function twoPhaseResolve(
     : chain.rpcBatchSizes
 
   // ── Phase 1: fetch via plain RPC, show content immediately ───────────────
+  // Common to all 4 modes (see VERIFICATION.md) — name resolution, calldata parsing,
+  // and the tx-trie rebuild that binds calldata to the block it's rendered from.
+  console.log('[w3] Phase 1 — content fetch & assembly (plain RPC, not yet trusted)')
   if (tabId) setBadgeLoading(tabId)
 
   let assembled: Uint8Array
@@ -475,7 +478,7 @@ async function twoPhaseResolve(
   // so a successful fetch from the user's own node needs no re-verification —
   // the beacon pipeline below is skipped entirely (portalVerified: true).
   if (chain.portalRpc && !phase1PortalFailed && !isPortalLikelyDown()) {
-    console.log('[w3] Trying Portal node:', chain.portalRpc)
+    console.log('[w3] Mode 3 — Portal-trusted: trying', chain.portalRpc)
     // Start Helios in parallel for ENS re-verification — skipped in local mode (no external calls).
     const portalHeliosPromise = (!chain.localMode && parsed.target.type === 'ens' && phase1EnsChunks.length > 0 && chain.consensusRpcs.length > 0)
       ? Promise.race([
@@ -490,17 +493,17 @@ async function twoPhaseResolve(
         await getCalldataViaPortal(chain.portalRpc, phase1BlockNumber, phase1TxIndex)
       }
       const trieVerified = true  // Portal pre-verifies trie before storing
-      console.log('[w3] Portal verification succeeded, trieVerified:', trieVerified, phase1UsedPortal ? '(Phase 1 used Portal)' : '')
+      console.log('[w3] Mode 3 — Portal-trusted: calldata ∈ tx ∈ block ∈ canonical chain delegated to Portal node', phase1UsedPortal ? '(Phase 1 already used Portal)' : '')
 
       const portalHeliosRpc = await portalHeliosPromise
-      console.log('[w3] Portal ENS: helios rpc ready:', !!portalHeliosRpc, 'heliosBacked:', portalHeliosRpc?.isHeliosBacked())
+      console.log('[w3] Mode 3 — ENS/GNS re-verification: helios rpc ready:', !!portalHeliosRpc, 'heliosBacked:', portalHeliosRpc?.isHeliosBacked())
       if (portalHeliosRpc?.isHeliosBacked() && parsed.target.type === 'ens') {
         try {
           const heliosResolution = await resolveEns(parsed.target.name, portalHeliosRpc)
           ensVerified = compareEnsChunks(heliosResolution.chunks, phase1EnsChunks)
-          console.log('[w3] Portal ENS verified:', ensVerified)
+          console.log('[w3] Mode 3 — ENS/GNS re-verification result:', ensVerified)
         } catch (e) {
-          console.warn('[w3] Portal ENS error:', (e as Error).message)
+          console.warn('[w3] Mode 3 — ENS/GNS re-verification error:', (e as Error).message)
           ensVerified = undefined
         }
       }
@@ -518,19 +521,21 @@ async function twoPhaseResolve(
           chunks: proofChunks,
         },
       }
+      console.log('[w3] Mode 3 — Portal-trusted: done, ensOk:', parsed.target.type !== 'ens' || ensVerified === true)
       if (isSuperseded()) { port.disconnect(); return }
       await updateBadge(tabId, update)
       send(update)
       port.disconnect()
       return
     } catch (err) {
-      console.warn('[w3] Portal node unavailable, falling back:', (err as Error).message)
+      console.warn('[w3] Mode 3 — Portal-trusted: node unavailable, falling back —', (err as Error).message)
       portalLastFailedAt = Date.now()
     }
   }
 
   // ── Local mode: trie-verify via local exec RPC only — no external calls ──
   if (chain.localMode) {
+    console.log('[w3] Mode 4 — Local mode: trusted to local execution RPC, no Helios/beacon/ENS check')
     const update: VerificationUpdate = {
       type: 'verification-update',
       heliosBacked: false,
@@ -581,7 +586,7 @@ async function twoPhaseResolve(
   }
 
   if (blockIsHistorical && chain.consensusRpcs.length > 0) {
-    console.log('[w3] Historical block — starting Helios in parallel with beacon verification')
+    console.log('[w3] Mode 2 — Historical block, beacon-verified: oldest chunk outside Helios\'s EIP-2935 ring, starting Helios in parallel for the anchor')
     // Pass Helios promise unawaited — verification runs immediately using fast consensus
     // anchor. Helios runs in parallel; its result is checked at the very end of
     // verifyViaBeacon to confirm the effective state root (heliosAnchored: true/false).
@@ -600,7 +605,7 @@ async function twoPhaseResolve(
         execRpcs,
         beaconOptions,
       )
-      console.log('[w3] Beacon verification succeeded, heliosAnchored:', beacon.heliosAnchored, 'eraVerified:', beacon.eraVerified)
+      console.log('[w3] Mode 2 — beacon pipeline done: heliosAnchored:', beacon.heliosAnchored, 'eraVerified:', beacon.eraVerified, `(${phase1Results.length} chunk(s))`)
       if (beacon.proofData) {
         proofCache[rawUrl] = { txHash, chainId: chain.chainId, ...beacon.proofData }
         writeProofCache(proofCache)
@@ -619,8 +624,9 @@ async function twoPhaseResolve(
             throw new Error(`Tx hash mismatch at index ${r.txIndex}: block has ${verifiedTxHash}, expected ${r.txHash}`)
         }
         trieVerified = true
+        console.log('[w3] Mode 2 — tx trie → header → blockhash verified for all chunks ✓')
       } catch (trieErr) {
-        console.warn('[w3] Tx inclusion verification failed:', (trieErr as Error).message)
+        console.warn('[w3] Mode 2 — tx inclusion verification failed:', (trieErr as Error).message)
       }
       // heliosPromise is already settled — verifyViaBeacon awaited it internally
       const historicalHeliosRpc = await heliosPromise
@@ -628,6 +634,7 @@ async function twoPhaseResolve(
         try {
           const heliosResolution = await resolveEns(parsed.target.name, historicalHeliosRpc)
           ensVerified = compareEnsChunks(heliosResolution.chunks, phase1EnsChunks)
+          console.log('[w3] Mode 2 — ENS/GNS re-verification result:', ensVerified)
         } catch {
           ensVerified = undefined
         }
@@ -648,7 +655,7 @@ async function twoPhaseResolve(
         },
       }
     } catch (beaconErr) {
-      console.error('[w3] Beacon verification failed:', beaconErr)
+      console.error('[w3] Mode 2 — beacon pipeline failed:', beaconErr)
       update = {
         type: 'verification-update',
         heliosBacked: false, trieVerified: false,
@@ -667,7 +674,7 @@ async function twoPhaseResolve(
     return
   }
 
-  console.log('[w3] phase 2 start — creating Helios RPC for chain', chain.chainId)
+  console.log('[w3] Mode 1 — Recent block, Helios-verified: creating Helios RPC for chain', chain.chainId)
   let update: VerificationUpdate
   // Hoist so the EIP-2935 fallback can pass heliosRpc as an EIP-4788 anchor
   let heliosRpc: Awaited<ReturnType<typeof getOrCreateRpc>> | undefined
@@ -678,7 +685,7 @@ async function twoPhaseResolve(
       new Promise<undefined>(r => setTimeout(() => r(undefined), 35_000)),
     ]).catch(() => undefined)
     if (!heliosRpc) throw new Error('Helios not available (timeout or consensus RPC failure)')
-    console.log('[w3] got RPC, heliosBacked:', heliosRpc.isHeliosBacked())
+    console.log('[w3] Mode 1 — got RPC, heliosBacked:', heliosRpc.isHeliosBacked())
     // Verify EVERY chunk through Helios and bind the phase-1 rendered bytes to the
     // Helios-verified calldata. Without the byte comparison, a fast RPC serving a
     // self-consistent forgery in phase 1 would render forged content while phase 2
@@ -690,12 +697,13 @@ async function twoPhaseResolve(
       if (!bytesEqual(result.calldata, p1.calldata))
         throw new Error(`Rendered calldata mismatch: chunk ${i} (block ${p1.blockNumber}, tx ${p1.txIndex}) does not match Helios-verified calldata`)
     }
-    console.log(`[w3] Helios verified ${phase1Results.length} chunk(s), rendered bytes bound ✓`)
+    console.log(`[w3] Mode 1 — render binding: ${phase1Results.length} chunk(s) verified, rendered bytes match Helios ✓`)
 
     if (parsed.target.type === 'ens' && phase1EnsChunks.length > 0) {
       try {
         const heliosResolution = await resolveEns(parsed.target.name, heliosRpc)
         ensVerified = compareEnsChunks(heliosResolution.chunks, phase1EnsChunks)
+        console.log('[w3] Mode 1 — ENS/GNS re-verification result:', ensVerified)
       } catch {
         ensVerified = undefined
       }
@@ -714,13 +722,14 @@ async function twoPhaseResolve(
         txIndex: result.txIndex,
         contentType,
         payloadSize: formatBytes(assembled.length),
+        chunks: proofChunks,
       },
     }
   } catch (err) {
-    console.warn('[w3] Helios phase 2 failed:', (err as Error).message)
+    console.warn('[w3] Mode 1 — Recent block, Helios-verified: failed —', (err as Error).message)
 
     if (isEip2935Error(err) && chain.consensusRpcs.length > 0) {
-      console.log('[w3] Falling back to beacon chain verification for historical block')
+      console.log('[w3] Mode 1 failed (EIP-2935, block outside Helios\'s ring) — falling back to Mode 2 — Historical block, beacon-verified')
       try {
         const beacon = await verifyViaBeacon(
           phase1Results.map(r => ({ executionHash: r.blockHash, blockTimestamp: r.blockTimestamp })),
@@ -731,7 +740,7 @@ async function twoPhaseResolve(
           beaconOptions,
         )
         console.log(
-          '[w3] Beacon verification succeeded, heliosAnchored:', beacon.heliosAnchored,
+          '[w3] Mode 2 — beacon pipeline done: heliosAnchored:', beacon.heliosAnchored,
           'eraVerified:', beacon.eraVerified,
         )
         if (beacon.proofData) {
@@ -750,14 +759,16 @@ async function twoPhaseResolve(
               throw new Error(`Tx hash mismatch at index ${r.txIndex}: block has ${verifiedTxHash}, expected ${r.txHash}`)
           }
           trieVerified2 = true
+          console.log('[w3] Mode 2 — tx trie → header → blockhash verified for all chunks ✓')
         } catch (trieErr) {
-          console.warn('[w3] Tx inclusion verification failed:', (trieErr as Error).message)
+          console.warn('[w3] Mode 2 — tx inclusion verification failed:', (trieErr as Error).message)
         }
         // heliosRpc synced but threw EIP-2935 on block lookup; ENS uses 'latest' so it works
         if (heliosRpc?.isHeliosBacked() && parsed.target.type === 'ens' && phase1EnsChunks.length > 0) {
           try {
             const heliosResolution = await resolveEns(parsed.target.name, heliosRpc)
             ensVerified = compareEnsChunks(heliosResolution.chunks, phase1EnsChunks)
+            console.log('[w3] Mode 2 — ENS/GNS re-verification result:', ensVerified)
           } catch {
             ensVerified = undefined
           }
@@ -778,7 +789,7 @@ async function twoPhaseResolve(
           },
         }
       } catch (beaconErr) {
-        console.error('[w3] Beacon verification also failed:', beaconErr)
+        console.error('[w3] Mode 2 — beacon pipeline also failed:', beaconErr)
         update = {
           type: 'verification-update',
           heliosBacked: false, trieVerified: false,
@@ -791,6 +802,7 @@ async function twoPhaseResolve(
         }
       }
     } else {
+      console.warn('[w3] Mode 1 failed and no fallback applies (not EIP-2935, or no consensus RPCs configured) — unverified')
       update = {
         type: 'verification-update',
         heliosBacked: false, trieVerified: false,
@@ -829,6 +841,14 @@ async function updateBadge(tabId: number, update: VerificationUpdate) {
   const fullyVerified  = heliosVerified || portalTrusted || beaconTrusted || update.localMode === true
   const color = fullyVerified ? '#3fb950' : '#d29922'
   const text = fullyVerified ? '✓' : '✗'
+  // Final verdict, labeled by which VERIFICATION.md mode actually applies —
+  // badge conditions match that doc's trust-boundary table exactly.
+  const modeLabel = update.localMode ? 'Mode 4 — Local mode'
+    : heliosVerified || update.heliosBacked ? 'Mode 1 — Recent block, Helios-verified'
+    : portalTrusted || update.portalVerified ? 'Mode 3 — Portal-trusted'
+    : update.beaconVerified ? 'Mode 2 — Historical block, beacon-verified'
+    : 'no mode succeeded'
+  console.log(`[w3] Badge verdict: ${modeLabel} → ${fullyVerified ? '✓ verified' : '✗ unverified'} (ensOk=${ensOk})`)
   // Tab may have been closed before verification finished — swallow the rejection.
   await Promise.allSettled([
     chrome.action.setBadgeText({ text, tabId }),
@@ -916,7 +936,6 @@ async function _ethRpcCall(chainId: number, cacheKey: string, method: string, pa
   // mode the badge is shown correctly (otherwise the stale flag suppresses it).
   if (chain.localMode) {
     heliosSyncingSignaled.delete(chain.chainId)
-    console.log('[w3] read via local rpc', method)
     try {
       const result = await new RpcClient(chain.rpcs.slice(0, 1)).request<unknown>(method, params)
       return { result }
@@ -960,7 +979,6 @@ async function _ethRpcCall(chainId: number, cacheKey: string, method: string, pa
     })
   }
   try {
-    console.log('[w3] read via helios', method)
     try {
       const isCacheable = CACHEABLE_METHODS.has(method)
       const release = isCacheable ? null : await acquireEthCallSlot()
@@ -1048,7 +1066,6 @@ async function handleEthRequest(method: string, params: unknown[], walletId: str
     return { error: err.message ?? String(err) }
   }
 }
-
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`

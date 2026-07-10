@@ -257,7 +257,6 @@ window.addEventListener('message', async (e) => {
       sendBack(undefined, 'eth-rpc no response')
       return
     }
-    console.debug('[w3]', method, resp?.error ? 'ERR:' + resp.error : 'OK', params?.[0])
     sendBack(resp.result, resp.error)
     return
   }

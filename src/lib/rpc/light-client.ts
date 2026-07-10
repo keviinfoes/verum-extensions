@@ -75,7 +75,6 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
           const res = await _nativeFetch(rpc.replace(/\/$/, '') + path, fetchInit)
           clearTimeout(timer)
           if (!res.ok) {
-            console.warn(`[w3] exec proxy: ${host} HTTP ${res.status}${attempt < rpcs.length - 1 ? ' — trying next RPC' : ''}`)
             if (attempt < rpcs.length - 1) continue
             return res
           }
@@ -98,7 +97,6 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
           } catch { /* leave undefined — handled below as malformed */ }
           if (json === undefined || json === null || typeof json !== 'object' ||
               (!('result' in json) && !('error' in json))) {
-            console.warn(`[w3] exec proxy: ${host} malformed/invalid JSON-RPC response${attempt < rpcs.length - 1 ? ' — trying next RPC' : ''}`)
             if (attempt < rpcs.length - 1) continue
             throw new Error(`[w3] proxy: ${host} returned a malformed response`)
           }
@@ -123,22 +121,15 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
               // so it's never routed to again for this Helios instance.
               if (!_proxyBlacklist.has(proxyKey)) _proxyBlacklist.set(proxyKey, new Set())
               _proxyBlacklist.get(proxyKey)!.add(rpc)
-              console.warn(`[w3] exec proxy: ${host} blacklisted (unsupported method)`)
               if (attempt < rpcs.length - 1) continue
             } else if (isRateLimit || isExecFail) {
-              console.warn(`[w3] exec proxy: ${host} ${isExecFail ? 'exec fail' : 'rate limit'} (${json.error.code}) "${msg.slice(0, 60)}"${attempt < rpcs.length - 1 ? ' — trying next RPC' : ''}`)
               if (attempt < rpcs.length - 1) continue
-            } else {
-              console.log(`[w3] exec proxy: ${host} JSON-RPC ${json.error.code} "${msg.slice(0, 60)}"`)
             }
           }
           return res
         } catch {
           clearTimeout(timer)
-          if (attempt < rpcs.length - 1) {
-            console.warn(`[w3] exec proxy: ${host} timed out or failed — trying next RPC`)
-            continue
-          }
+          if (attempt < rpcs.length - 1) continue
           throw new Error(`[w3] proxy: all ${rpcs.length} RPCs failed for ${proxyKey}`)
         }
       }

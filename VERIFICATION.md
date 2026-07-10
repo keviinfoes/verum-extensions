@@ -15,7 +15,7 @@ The badge logic at `src/background.ts:786-791` gates green on the *complete* con
 mode; there is no partial-pass green. Anything short — Helios unanchored, trie
 mismatch, ENS unverified — shows ✗.
 
-Name-based URLs (`w3://myapp.eth`, `w3://myapp.gwei`), `ensOk` demand `ensVerified === true` in modes 1–3.
+Name-based URLs (`w3://myapp.eth`, `w3://myapp.gwei`) require `ensOk` thourgh helios `ensVerified === true` in modes 1–3.
 
 ## Common to all modes (phase 1 — content fetch & assembly)
 

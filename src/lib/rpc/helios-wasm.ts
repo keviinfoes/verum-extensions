@@ -128,7 +128,6 @@ export class HeliosWasmClient implements IVerifiedRpc {
     const execHost = executionRpc.includes('.invalid') ? 'proxy' : new URL(executionRpc).hostname
     const tag = `[w3] Helios (exec=${execHost})`
     console.log(`${tag} creating provider (${checkpointLabel})`)
-    const t0 = Date.now()
     // 'memory' is not a documented dbType (only "localstorage" | "config" are) — it
     // was passing an unrecognized string straight into the WASM constructor. Use the
     // real "localstorage" option: Helios's own Rust code already detects when
@@ -139,7 +138,6 @@ export class HeliosWasmClient implements IVerifiedRpc {
       { network, consensusRpc, executionRpc, dbType: 'localstorage', checkpoint },
       'ethereum',
     )
-    console.log(`${tag} provider ready (${Date.now() - t0}ms) — waiting for sync`)
     const t1 = Date.now()
     const ticker = setInterval(
       () => console.log(`${tag} still syncing… (${Math.round((Date.now() - t1) / 1000)}s)`),
@@ -155,7 +153,6 @@ export class HeliosWasmClient implements IVerifiedRpc {
     } finally {
       clearInterval(ticker)
     }
-    console.log(`${tag} synced in ${Date.now() - t1}ms`)
     return provider
   }
 
