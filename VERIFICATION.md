@@ -1,14 +1,72 @@
 # Verification flow — spec step → code location
 
 How Verum verifies that dapp calldata is part of the canonical Ethereum chain, for
-each of the four verification modes. Line numbers refer to the current source; the
-badge logic that gates the green ✓ lives in `src/background.ts` (`updateBadge`).
+each of the four verification modes. Each mode reaches "trustless" (or its own trust boundary) via a different chain of
+custody.
 
-The overall chain of custody:
+| Mode | Trust boundary | Badge condition |
+|---|---|---|
+| 1 — Helios (recent) | Trustless (sync committee) | `heliosBacked && trieVerified && ensOk` |
+| 2 — Beacon (historical) | Trustless (sync committee via EIP-4788 anchor) | `beaconVerified && beaconHeliosBacked && trieVerified && ensOk` |
+| 3 — Portal | Your local Portal node | `portalVerified && ensOk` |
+| 4 — Local | Your local execution RPC | `localMode` |
+
+The badge logic at `src/background.ts:786-791` gates green on the *complete* condition for the active
+mode; there is no partial-pass green. Anything short — Helios unanchored, trie
+mismatch, ENS unverified — shows ✗.
+
+Name-based URLs (`w3://myapp.eth`, `w3://myapp.gwei`), `ensOk` demand `ensVerified === true` in modes 1–3.
+
+## Common to all modes (phase 1 — content fetch & assembly)
+
+| Step | Check | Location |
+|---|---|---|
+| Name → `[[block, txIndex]]` | ENS: `registry.resolver(node)` + `text(node,"w3")`; GNS (.gwei): `text()` directly on NameNFT — via plain RPC at the `finalized` tag. Not yet trusted; re-verified per mode below | `src/lib/w3/name-resolver.ts:107` (registry pick), `:63` (finalized eth_call) |
+| Calldata parsing | W3FS magic, version, chunk index/count, decompression — structural validation, not proof (the content *is* the tx data) | `src/lib/w3/content.ts:58` (`parseCalldata`), `:141` (`assembleContent`) |
+| Calldata ∈ tx ∈ trie | `serializeTx` re-encodes every tx (incl. `tx.input` = the calldata) as trie leaves; recomputed root must equal `block.transactionsRoot`, else throw. Rendered bytes come from the same tx object | `src/lib/verify/tx-verifier.ts:224-227` (leaves + root), `:238` (rendered bytes) |
+
+Phase 1 renders immediately; the badge stays "···" until one of the four phase-2 modes finishes verification.
+
+## Mode 1 — Recent block, Helios-verified
 
 ```
+ENS/GNS url name
+  ▼  coordinates re-verified through Helios (started in parallel)
+verified coordinates
+
++ 
+
 dapp content (W3FS calldata bytes)
-  ▼  calldata is the tx.data field — authenticated if the tx is authentic
+  ▼  calldata is the tx.data field
+transaction, fetched fresh via Helios
+  ▼  MPT trie reconstruction: RLP(tx) is a leaf, root == transactionsRoot, keccak(header) == blockhash
+execution block, served by Helios
+  ▼  Helios only serves blocks it already verified against its sync-committee chain
+trustless anchor (Helios sync committee)
+  ▼  byte-compare Helios-verified calldata against what phase 1 actually rendered
+trustless anchor
+```
+
+Badge green requires `heliosBacked && trieVerified && ensOk` (`src/background.ts:788`).
+
+| Step | Check | Location |
+|---|---|---|
+| Header → canonical chain | Helios serves `eth_getBlockByNumber` only after verifying it against its sync-committee-verified chain (EIP-2935 window, ~last 27h); Helios's own consensus verification is the anchor — **run per chunk, all chunks** | `src/background.ts` (Helios phase-2 loop over `phase1Results`), `src/lib/verify/tx-verifier.ts` (`headerVerified: rpc.isHeliosBacked()`) |
+| Trie rebuild (again, via Helios data) | Same full-trie reconstruction as phase 1, but over the Helios-served block — per chunk | `src/lib/verify/tx-verifier.ts` (`getVerifiedCalldataByLocation`) |
+| **Render binding** | Byte-for-byte comparison of each chunk's Helios-verified calldata against the bytes phase 1 actually rendered — a fast RPC serving a self-consistent forgery in phase 1 fails here (✗) instead of being green-lit by verifying canon at the same coordinates | `src/background.ts` (`bytesEqual` check in the Helios phase-2 loop) |
+| ENS/GNS re-verification | Name re-resolved through a Helios-verified `eth_call` at `finalized`; chunk lists must match phase 1 | `src/background.ts` (`compareEnsChunks`) |
+
+## Mode 2 — Historical block, beacon-verified
+
+```
+ENS/GNS url name
+  ▼  coordinates re-verified through Helios (started in parallel)
+verified coordinates
+
++ 
+
+dapp content (W3FS calldata bytes)
+  ▼  calldata is the tx.data field
 transaction
   ▼  MPT trie reconstruction: RLP(tx) is a leaf, root == transactionsRoot, keccak(header) == blockhash
 execution block hash
@@ -22,44 +80,8 @@ finalized state root
 trustless anchor
 ```
 
-## Common to all modes (phase 1 — content fetch & assembly)
-
-| Step | Check | Location |
-|---|---|---|
-| Name → `[[block, txIndex]]` | ENS: `registry.resolver(node)` + `text(node,"w3")`; GNS (.gwei): `text()` directly on NameNFT — via plain RPC at the `finalized` tag. Not yet trusted; re-verified per mode below | `src/lib/w3/name-resolver.ts:107` (registry pick), `:63` (finalized eth_call) |
-| Calldata parsing | W3FS magic, version, chunk index/count, decompression — structural validation, not proof (the content *is* the tx data) | `src/lib/w3/content.ts:58` (`parseCalldata`), `:141` (`assembleContent`) |
-| Calldata ∈ tx ∈ trie | `serializeTx` re-encodes every tx (incl. `tx.input` = the calldata) as trie leaves; recomputed root must equal `block.transactionsRoot`, else throw. Rendered bytes come from the same tx object | `src/lib/verify/tx-verifier.ts:224-227` (leaves + root), `:238` (rendered bytes) |
-
-Phase 1 renders immediately; the badge stays "···" until one of the four phase-2
-modes below delivers its verdict.
-
-Note: the calldata is bound into the trie by **full reconstruction** — every tx in
-the block is re-serialized (including its `input` field) and the entire trie is
-rebuilt. Tampered calldata produces a different leaf, a different root, and a
-mismatch with the header's `transactionsRoot`. This is strictly stronger than a
-single-branch Merkle proof (it also catches fabricated sibling transactions). The
-`tx.hash` string equality checks between phases are consistency checks, not the
-security boundary — trie inclusion is.
-
-## Mode 1 — Recent block, Helios-verified
-
-Badge green requires `heliosBacked && trieVerified && ensOk` (`src/background.ts:788`).
-
-| Step | Check | Location |
-|---|---|---|
-| Header → canonical chain | Helios serves `eth_getBlockByNumber` only after verifying it against its sync-committee-verified chain (EIP-2935 window, ~last 27h); Helios's own consensus verification is the anchor — **run per chunk, all chunks** | `src/background.ts` (Helios phase-2 loop over `phase1Results`), `src/lib/verify/tx-verifier.ts` (`headerVerified: rpc.isHeliosBacked()`) |
-| Trie rebuild (again, via Helios data) | Same full-trie reconstruction as phase 1, but over the Helios-served block — per chunk | `src/lib/verify/tx-verifier.ts` (`getVerifiedCalldataByLocation`) |
-| **Render binding** | Byte-for-byte comparison of each chunk's Helios-verified calldata against the bytes phase 1 actually rendered — a fast RPC serving a self-consistent forgery in phase 1 fails here (✗) instead of being green-lit by verifying canon at the same coordinates | `src/background.ts` (`bytesEqual` check in the Helios phase-2 loop) |
-| ENS/GNS re-verification | Name re-resolved through a Helios-verified `eth_call` at `finalized`; chunk lists must match phase 1 | `src/background.ts` (`compareEnsChunks`) |
-
-## Mode 2 — Historical block, beacon-verified
-
 Badge green requires `beaconVerified && beaconHeliosAnchored && trieVerified && ensOk`
-(`src/background.ts`, `updateBadge`). Entry points: the historical-block branch
-(oldest chunk > ~27h old) and the EIP-2935 fallback (Helios throws on an old block).
-`verifyViaBeacon` takes one target per chunk and verifies **all of them**, grouped by
-era so era data downloads once per era. Every failure below throws or sets its flag
-false — there is no warn-and-continue path.
+(`src/background.ts`, `updateBadge`). 
 
 | Step | Check | Location |
 |---|---|---|
@@ -71,10 +93,19 @@ false — there is no warn-and-continue path.
 | State root → trustless anchor | EIP-4788 ring read via Helios-verified `eth_call` at `finalized` == `effectiveBeaconRoot` — once per batch | `src/lib/verify/beacon-verifier.ts` (`confirmWithHelios`) |
 | ENS/GNS re-verification | Same Helios re-resolution as Mode 1 | `src/background.ts` (`compareEnsChunks`) |
 
-No tx receipts are needed anywhere: calldata lives in the transaction itself, so the
-transactions-trie proof covers it. Receipts would only matter for proving logs/status.
-
 ## Mode 3 — Portal-trusted
+
+```
+ENS/GNS url name
+  ▼  coordinates re-verified through Helios (started in parallel)
+verified coordinates
+
++ 
+
+dapp content (W3FS calldata bytes)
+  ▼  calldata ∈ tx ∈ block ∈ canonical chain — verified by the Portal node before storing
+trusted anchor: your own Portal node
+```
 
 Badge green requires `portalVerified && ensOk` (`src/background.ts:787`).
 
@@ -83,10 +114,17 @@ Badge green requires `portalVerified && ensOk` (`src/background.ts:787`).
 | calldata ∈ tx ∈ block ∈ canonical chain | **Delegated to the user's local Portal node** — it verified the body against the header chain before storing. No local re-verification, by design; the beacon pipeline is skipped entirely | `src/background.ts:463-515` (branch + early return), fetch `src/lib/rpc/portal.ts:89-113` |
 | ENS/GNS re-verification | Still done through Helios (started in parallel), even in Portal mode | `src/background.ts:489-490` |
 
-Trust boundary: your own machine. The only cryptographic check the extension itself
-performs in this mode is the ENS/GNS cross-check.
+Trust boundary: local portal node. The only cryptographic check the extension itself performs in this mode is the ENS/GNS cross-check.
 
 ## Mode 4 — Local mode
+
+```
+dapp content (W3FS calldata bytes)
+  ▼  calldata is the tx.data field
+transaction, from the local RPC
+  ▼  MPT trie reconstruction: RLP(tx) is a leaf, root == RPC's own claimed transactionsRoot
+trusted anchor: your own execution RPC (no blockhash/canonicality check beyond this)
+```
 
 Badge green unconditionally: `localMode === true` (`src/background.ts:790`).
 
@@ -97,25 +135,3 @@ Badge green unconditionally: `localMode === true` (`src/background.ts:790`).
 
 Trust boundary: whatever node `rpcs[0]` points at — the mode exists for users running
 their own full node, where verification against yourself is meaningless.
-
-## Trust-boundary summary
-
-| Mode | Trust boundary | Badge condition |
-|---|---|---|
-| 1 — Helios (recent) | Trustless (sync committee) | `heliosBacked && trieVerified && ensOk` |
-| 2 — Beacon (historical) | Trustless (sync committee via EIP-4788 anchor) | `beaconVerified && beaconHeliosAnchored && trieVerified && ensOk` |
-| 3 — Portal | Your local Portal node | `portalVerified && ensOk` |
-| 4 — Local | Your local execution RPC | `localMode` |
-
-In modes 1–2, an execution RPC, consensus RPC, era server, parquet host, or checkpoint
-provider that serves tampered data gets caught at the corresponding hash check — none
-of them are trusted for integrity, only for availability. The badge logic at
-`src/background.ts:786-791` gates green on the *complete* condition for the active
-mode; there is no partial-pass green. Anything short — Helios unanchored, trie
-mismatch, ENS unverified — shows ✗.
-
-For name-based URLs (`w3://myapp.eth`, `w3://myapp.gwei`), `ensOk` demands
-`ensVerified === true` in modes 1–3: the name→coordinates mapping resolved via plain
-RPC in phase 1 must be re-confirmed through a Helios-verified read, or the badge
-shows ✗. Direct `w3://block:txIndex` URLs carry their coordinates in the URL itself,
-so no naming trust is involved.
