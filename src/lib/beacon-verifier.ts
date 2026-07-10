@@ -239,102 +239,46 @@ async function getAnchorStateRoot(
   throw new Error('Could not acquire beacon chain anchor from any consensus RPC')
 }
 
-// After all other verification steps complete, confirm the effective state root used
-// during verification against the Helios-proven finalized state root. Helios ran in
-// parallel; by the time we call this it may already be resolved.
+// Confirm the effective beacon root via EIP-4788: scan forward from effectiveSlot+1
+// until we find the first non-missed slot, then verify its parentBeaconBlockRoot equals
+// effectiveBeaconRoot. Missed beacon slots have no execution block so the ring buffer
+// has no entry for their timestamp — the contract reverts, and we skip to the next slot.
+// The first non-missed slot's parentBeaconBlockRoot is always effectiveBeaconRoot because
+// effectiveSlot itself is not missed (we fetched its beacon header to compute it).
 async function confirmWithHelios(
   heliosRpc: IVerifiedRpc,
-  consensusRpcs: string[],
-  effectiveStateRoot: string,
+  effectiveBeaconRoot: string,
   effectiveSlot: number,
+  chainId: number,
 ): Promise<boolean> {
   if (!heliosRpc.isHeliosBacked()) return false
   try {
-    // Get Helios-proven finalized beacon root via EIP-4788 (or parentBeaconBlockRoot)
-    const block = await heliosRpc.request<{ parentBeaconBlockRoot?: string; timestamp?: string }>(
-      'eth_getBlockByNumber', ['finalized', false],
-    )
-    let beaconRoot = block.parentBeaconBlockRoot
-    if (!beaconRoot && block.timestamp) {
-      const ts = parseInt(block.timestamp, 16)
+    for (let probe = effectiveSlot + 1; probe <= effectiveSlot + 64; probe++) {
+      const ts = slotToTimestamp(probe, chainId)
       const calldata = '0x' + ts.toString(16).padStart(64, '0')
+      let result: string
       try {
-        const result = await heliosRpc.request<string>(
+        result = await heliosRpc.request<string>(
           'eth_call', [{ to: EIP4788_CONTRACT, data: calldata }, 'finalized'],
         )
-        if (result && result !== '0x' && result !== '0x' + '0'.repeat(64)) {
-          beaconRoot = result.length === 66 ? result : ('0x' + result.slice(-64))
-          console.log('[w3] EIP-4788 contract beacon root:', beaconRoot)
-        }
-      } catch (e) {
-        console.warn('[w3] EIP-4788 contract call failed:', (e as Error).message)
+      } catch (e: any) {
+        if ((e?.message ?? '').includes('out of sync')) return false  // OOS — not a missed slot
+        continue // execution reverted = missed slot, no ring buffer entry
       }
-    }
-    if (!beaconRoot) return false
-
-    for (const rpc of consensusRpcs) {
-      try {
-        const { root: heliosBlockRoot, stateRoot: heliosStateRoot, msg } = await fetchVerifiedBeaconHeader(rpc, beaconRoot)
-        const heliosSlot = Number(msg.slot)
-        console.log(`[w3] Helios EIP-4788 anchor: slot ${heliosSlot} state_root ${heliosStateRoot}`)
-
-        // Case 1: same slot — direct comparison
-        if (heliosStateRoot.toLowerCase() === effectiveStateRoot.toLowerCase()) {
-          console.log('[w3] Helios confirmed effective state root ✓')
-          return true
-        }
-
-        // Case 2: Helios is N slots behind effective state. Walk backward from effectiveSlot
-        // via parent_root until we reach heliosBlockRoot, verifying state_root at the top.
-        if (heliosSlot < effectiveSlot) {
-          try {
-            const { msg: effMsg } = await fetchVerifiedBeaconHeader(rpc, effectiveSlot)
-            if (effMsg.state_root.toLowerCase() === effectiveStateRoot.toLowerCase()) {
-              let parentRoot = effMsg.parent_root
-              for (let step = 0; step < 200; step++) {
-                if (parentRoot.toLowerCase() === heliosBlockRoot.toLowerCase()) {
-                  console.log(`[w3] Helios confirmed via ${effectiveSlot - heliosSlot}-slot walk (effective→helios) ✓`)
-                  return true
-                }
-                const { root: fr, msg: pm } = await fetchVerifiedBeaconHeader(rpc, parentRoot)
-                if (fr.toLowerCase() !== parentRoot.toLowerCase()) break
-                if (Number(pm.slot) < heliosSlot) break
-                parentRoot = pm.parent_root
-              }
-            }
-          } catch { /* try next RPC */ }
-        }
-
-        // Case 3: Helios is N slots ahead of effective state. Walk backward from heliosSlot
-        // via parent_root until we land on effectiveSlot and confirm its state_root.
-        if (heliosSlot > effectiveSlot) {
-          try {
-            let parentRoot = msg.parent_root
-            for (let step = 0; step < 200; step++) {
-              const { root: fr, msg: pm } = await fetchVerifiedBeaconHeader(rpc, parentRoot)
-              if (fr.toLowerCase() !== parentRoot.toLowerCase()) break
-              const s = Number(pm.slot)
-              if (s === effectiveSlot) {
-                if (pm.state_root.toLowerCase() === effectiveStateRoot.toLowerCase()) {
-                  console.log(`[w3] Helios confirmed via ${heliosSlot - effectiveSlot}-slot walk (helios→effective) ✓`)
-                  return true
-                }
-                break
-              }
-              if (s < effectiveSlot) break
-              parentRoot = pm.parent_root
-            }
-          } catch { /* try next RPC */ }
-        }
-
-        console.warn(`[w3] Helios state root mismatch: helios=${heliosStateRoot} effective=${effectiveStateRoot} (slots: helios=${heliosSlot} effective=${effectiveSlot})`)
+      const rootFromRing = result.length === 66 ? result : '0x' + result.slice(-64)
+      if (rootFromRing.toLowerCase() !== effectiveBeaconRoot.toLowerCase()) {
+        console.warn(`[w3] Helios EIP-4788 mismatch at slot ${probe}: ring=${rootFromRing} expected=${effectiveBeaconRoot}`)
         return false
-      } catch { /* try next RPC */ }
+      }
+      console.log('[w3] Helios confirmed via EIP-4788 ✓')
+      return true
     }
+    console.warn('[w3] Helios EIP-4788: no non-missed slot found within 64 slots')
+    return false
   } catch (err) {
-    console.warn('[w3] Helios confirmation failed:', (err as Error).message)
+    console.warn('[w3] Helios EIP-4788 confirmation failed:', (err as Error).message)
+    return false
   }
-  return false
 }
 
 // ---------------------------------------------------------------------------
@@ -413,12 +357,29 @@ async function getBlockSummaryRoot(
   // Race checkpoint providers and consensus RPCs — interleaved so both types start early.
   // Stagger 3s between each start: a fast failure triggers the next immediately while
   // a slow download stays solo to avoid parallel bloat.
-  // Use the previous epoch boundary (anchorSlot - 32): checkpoint CDNs only index finalized
-  // epoch boundaries (not mid-epoch slots), and EIP-4788[timestamp(anchorSlot-31)] =
-  // root(anchorSlot-32) is immediately in the finalized ring at write time (no +1 wait).
+  // Checkpoint CDNs only retain their current finalized epoch boundary. By the time a 27h
+  // cache expires the chain has advanced several epochs and anchorSlot-32 is gone. Query
+  // each CDN's live finalized slot first and request that - 32 (the epoch boundary they hold).
+  // Consensus RPC nodes serve any recent slot so anchorSlot-32 is fine.
   const dlSlot = anchorSlot - 32
-  const cpAttempts = checkpointRpcs.map(rpc => () => attempt(rpc, dlSlot))
-  const cnAttempts = consensusRpcs.map(rpc => () => attempt(rpc, dlSlot))
+
+  const fetchLiveDlSlot = async (rpc: string): Promise<number> => {
+    try {
+      const hRes = await fetch(`${rpc}/eth/v1/beacon/headers/finalized`, {
+        headers: { Accept: 'application/json' },
+        signal: ctrl.signal,
+      })
+      if (hRes.ok) {
+        const hJson = await hRes.json() as { data: { header: { message: { slot: string } } } }
+        const finSlot = parseInt(hJson.data.header.message.slot, 10)
+        if (finSlot > 0) return finSlot - 32
+      }
+    } catch { /* fall back */ }
+    return dlSlot
+  }
+
+  const cpAttempts = checkpointRpcs.map(rpc => async () => attempt(rpc, await fetchLiveDlSlot(rpc)))
+  const cnAttempts = consensusRpcs.map(rpc => async () => attempt(rpc, await fetchLiveDlSlot(rpc)))
   const ordered: (() => Promise<StateSummary>)[] = []
   const len = Math.max(cpAttempts.length, cnAttempts.length)
   for (let i = 0; i < len; i++) {
@@ -1196,6 +1157,7 @@ export async function verifyViaBeacon(
   let blockSummaryRoot = ''
   let effectiveStateRoot = ''
   let effectiveSlot = 0
+  let effectiveBeaconRoot: string | undefined
   let blockRootAtSlot: string | undefined
   let newBsrCache: EraBsrCache | undefined
   let eraRange: { startNum: number; endNum: number } | undefined
@@ -1247,7 +1209,6 @@ export async function verifyViaBeacon(
 
     // Fetch effectiveBeaconRoot: beacon block root at effectiveSlot, SSZ-verified by
     // requiring header.state_root == effectiveStateRoot (ties root to the verified state).
-    let effectiveBeaconRoot: string | undefined
     for (const rpc of consensusRpcs) {
       try {
         const { root, stateRoot } = await fetchVerifiedBeaconHeader(rpc, effectiveSlot)
@@ -1357,8 +1318,8 @@ export async function verifyViaBeacon(
     console.log('[w3] Helios anchor: ✓ confirmed (EIP-4788 cache hit)')
   } else {
     const resolvedHelios = heliosRpc instanceof Promise ? await heliosRpc : heliosRpc
-    if (resolvedHelios && effectiveStateRoot) {
-      heliosAnchored = await confirmWithHelios(resolvedHelios, consensusRpcs, effectiveStateRoot, effectiveSlot)
+    if (resolvedHelios && effectiveBeaconRoot) {
+      heliosAnchored = await confirmWithHelios(resolvedHelios, effectiveBeaconRoot, effectiveSlot, chainId)
     }
     console.log(`[w3] Helios anchor: ${heliosAnchored ? '✓ confirmed' : 'not confirmed (unanchored result)'}`)
   }

@@ -16,6 +16,7 @@ const warningDismiss  = document.getElementById('warning-dismiss') as HTMLButton
 const verifyBadge     = document.getElementById('verify-badge') as HTMLDivElement
 const verifyIcon      = document.getElementById('verify-icon') as HTMLSpanElement
 const verifyLabel     = document.getElementById('verify-label') as HTMLSpanElement
+const heliosBadge     = document.getElementById('helios-badge') as HTMLDivElement
 
 function showWarning() {
   warningBanner.classList.remove('hidden')
@@ -52,6 +53,7 @@ function setPhase(phase: Phase) {
   dappHost.classList.toggle('dapp-visible', phase === 'ok' && renderMode === 'dapp')
   rawView.classList.toggle('raw-visible', phase === 'ok' && renderMode === 'raw')
   verifyBadge.classList.toggle('hidden', phase !== 'ok')
+  if (phase !== 'ok') heliosBadge.classList.add('hidden')
   if (phase === 'ok') {
     verifyBadge.className = 'syncing'
     verifyIcon.textContent = '⟳'
@@ -92,6 +94,46 @@ const toastWalletLabel   = document.getElementById('toast-wallet-label') as HTML
 frameToastClose.addEventListener('click', () => frameToast.classList.add('hidden'))
 
 
+// Keep-alive port: an open port resets Chrome's 30s SW idle timer natively
+// without burning any RPC credits. Reconnects if the SW is killed and restarts.
+function connectKeepalive() {
+  const port = chrome.runtime.connect({ name: 'helios-keepalive' })
+  // Ping every 20s — resets Chrome's SW idle timer AND gives the background a
+  // chance to health-check Helios (one cheap WASM call, no public RPC needed).
+  const interval = setInterval(() => port.postMessage('ping'), 10_000)
+  port.onDisconnect.addListener(() => { clearInterval(interval); setTimeout(connectKeepalive, 1_000) })
+}
+connectKeepalive()
+
+// Intent-based warmup: signal the SW on user interaction so Helios has time to
+// catch up the execution head before the user actually fires a contract read.
+function warmupHelios() {
+  if (currentChainId) {
+    chrome.runtime.sendMessage({ type: 'warmup-helios', chainId: currentChainId }).catch(() => {})
+  }
+}
+dappHost.addEventListener('mouseenter', warmupHelios)
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') warmupHelios()
+})
+
+// When Helios finishes syncing, trigger a re-fetch in the dapp so data that
+// was served by the plain RpcClient gets replaced with verified Helios reads.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg.type === 'helios-syncing' && msg.chainId === currentChainId && !currentLocalMode) {
+    heliosBadge.classList.remove('hidden')
+  }
+  if (msg.type === 'helios-ready' && msg.chainId === currentChainId) {
+    heliosIsReady = true
+    heliosBadge.classList.add('hidden')
+    dappFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'heliosReady' }, '*')
+  }
+  if (msg.type === 'helios-oos' && msg.chainId === currentChainId && !currentLocalMode) {
+    heliosIsReady = false
+    heliosBadge.classList.remove('hidden')
+  }
+})
+
 // ---------------------------------------------------------------------------
 // Wallet bridge — eth requests from sandbox → background → chosen wallet
 // ---------------------------------------------------------------------------
@@ -101,11 +143,18 @@ let selectedWalletName: string = 'wallet'
 let connectInProgress = false
 let connectSuppressedUntil = 0
 let currentChainId = 1
+let currentLocalMode = false
+let heliosIsReady = false
 // Queued connect requests that arrived while the picker was open.
 // Resolved with the same result as the original to avoid spurious errors.
 let connectWaiters: Array<(result: unknown, error?: string) => void> = []
 
 const CONNECT_METHODS = new Set(['eth_requestAccounts', 'wallet_requestPermissions'])
+
+// Single-flight deduplication for idempotent read calls. When wagmi fires N
+// identical eth_call requests simultaneously (one per React Query hook), only
+// one message reaches the background — the rest attach to the same promise.
+const ethReadInflight = new Map<string, Promise<{ result?: unknown; error?: string }>>()
 
 const FRAME_APPROVAL_METHODS = new Set([
   'eth_sendTransaction', 'eth_sendRawTransaction',
@@ -121,6 +170,38 @@ window.addEventListener('message', async (e) => {
 
   if (e.data.type === 'w3-navigate' && typeof e.data.url === 'string') {
     location.hash = e.data.url
+    return
+  }
+
+  // Polyfill signals it's initialized. Only act if the page has scripts — simple HTML
+  // pages get the polyfill too but won't make eth calls so the badge is irrelevant.
+  if (e.data.type === 'polyfill-ready') {
+    if (!pageHasScripts) return
+    if (heliosIsReady) {
+      dappFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'heliosReady' }, '*')
+    } else {
+      chrome.runtime.sendMessage({ type: 'helios-status', chainId: currentChainId })
+        .then((s: { ready: boolean; syncing: boolean } | undefined) => {
+          if (!s) return
+          if (s.ready) {
+            heliosIsReady = true
+            dappFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'heliosReady' }, '*')
+          }
+        })
+        .catch(() => {})
+    }
+    return
+  }
+
+  // wagmi calls provider.disconnect() when the user disconnects. Clear wallet state
+  // immediately so subsequent eth_accounts checks return [] and wagmi doesn't reconnect.
+  if (e.data.type === 'eth-disconnect') {
+    selectedWalletId = null
+    selectedWalletName = 'wallet'
+    dappFrame.contentWindow?.postMessage(
+      { type: 'wallet-event', method: 'accountsChanged', params: [] },
+      '*',
+    )
     return
   }
 
@@ -153,9 +234,19 @@ window.addEventListener('message', async (e) => {
   } else if (!FRAME_APPROVAL_METHODS.has(method)) {
     // All eth_* reads always go through Helios regardless of wallet connection state —
     // ensures reads are verified against the URL's chain, not the wallet's active network.
+    const inflightKey = `${currentChainId}:${method}:${JSON.stringify(params)}`
+    let p = ethReadInflight.get(inflightKey)
+    if (!p) {
+      p = new Promise<{ result?: unknown; error?: string }>((resolve, reject) => {
+        chrome.runtime.sendMessage({ type: 'eth-rpc', chainId: currentChainId, method, params })
+          .then(resolve, reject)
+      })
+      p.finally(() => ethReadInflight.delete(inflightKey))
+      ethReadInflight.set(inflightKey, p)
+    }
     let resp: { result?: unknown; error?: string } | undefined
     try {
-      resp = await chrome.runtime.sendMessage({ type: 'eth-rpc', chainId: currentChainId, method, params })
+      resp = await p
     } catch (err: any) {
       console.error('[w3] eth-rpc sendMessage failed', method, err?.message)
       sendBack(undefined, err?.message ?? 'eth-rpc unavailable')
@@ -245,6 +336,16 @@ window.addEventListener('message', async (e) => {
     if (CONNECT_METHODS.has(method) && resp.error !== 'Wallet disconnected') {
       connectSuppressedUntil = Date.now() + 1000
     }
+  }
+
+  // wallet_revokePermissions = disconnect. Clear wallet state and notify the dapp.
+  if (!resp?.error && method === 'wallet_revokePermissions') {
+    selectedWalletId = null
+    selectedWalletName = 'wallet'
+    dappFrame.contentWindow?.postMessage(
+      { type: 'wallet-event', method: 'accountsChanged', params: [] },
+      '*',
+    )
   }
 
   // EIP-1193: emit accountsChanged so dapps that rely on the event update their UI.
@@ -350,16 +451,25 @@ window.addEventListener('hashchange', () => {
 // Navigation
 // ---------------------------------------------------------------------------
 
-async function navigate(web3Url: string) {
+async function navigate(web3Url: string, attempt = 0) {
+  // Hide stale dapp content immediately — before any await — so the old dapp
+  // never flashes through while storage is read or content arrives fast (local mode).
+  dappHost.classList.remove('dapp-visible')
+  rawView.classList.remove('raw-visible')
+
   selectedWalletId = null
   selectedWalletName = 'wallet'
   connectInProgress = false
   connectSuppressedUntil = 0
   for (const w of connectWaiters.splice(0)) w(undefined, 'Navigation cancelled')
+
   let parsedUrl: ReturnType<typeof parseWeb3URL>
   try {
-    parsedUrl = parseWeb3URL(web3Url)
+    const stored = await chrome.storage.sync.get(['defaultChain'])
+    const defaultChain: number = stored.defaultChain ?? 1
+    parsedUrl = parseWeb3URL(web3Url, defaultChain)
     currentChainId = parsedUrl.chainId
+    heliosIsReady = false
     document.title = formatWeb3URL(parsedUrl)
   } catch (err) {
     showError(`Invalid URL: ${err}`)
@@ -386,6 +496,7 @@ async function navigate(web3Url: string) {
   setPhase('loading')
   loadingText.textContent = 'Loading…'
 
+  let contentReceived = false
   await new Promise<void>((resolve) => {
     const port = chrome.runtime.connect({ name: 'web3-resolve' })
     port.postMessage({ type: 'resolve', url: web3Url } as BgMessage)
@@ -395,6 +506,7 @@ async function navigate(web3Url: string) {
         showError(msg.message)
         resolve()
       } else if (msg.type === 'content') {
+        contentReceived = true
         if (msg.contentType === 'application/x-w3fs-bundle') {
           const data = new Uint8Array(msg.assembled)
           bundleCache = { key: cacheKey, data }
@@ -411,6 +523,16 @@ async function navigate(web3Url: string) {
 
     port.onDisconnect.addListener(() => resolve())
   })
+
+  // SW was killed mid-flight before sending content — retry up to 2 times.
+  // Chrome restarts the SW on the next connect(), so the first retry usually succeeds.
+  if (!contentReceived) {
+    if (attempt < 2) {
+      navigate(web3Url, attempt + 1)
+    } else {
+      showError('Failed to load — service worker did not respond. Try reloading.')
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -421,8 +543,22 @@ function applyVerification(msg: VerificationUpdate) {
   let isEnsTarget = false
   try { isEnsTarget = parseWeb3URL(msg.proof.url).target.type === 'ens' } catch {}
 
-  // ENS targets require Helios to have confirmed the record — without it the
-  // execution RPC could point to arbitrary calldata.
+  const ensTag = isEnsTarget ? ' · ENS ✓' : ''
+  const verified = (cls: string, label: string, delay = 2000) => {
+    verifyBadge.className = cls
+    verifyIcon.textContent = '✓'
+    verifyLabel.textContent = label
+    setTimeout(() => verifyBadge.classList.add('hidden'), delay)
+    unverifiedGate.classList.add('hidden')
+  }
+  if (msg.localMode) {
+    currentLocalMode = true
+    heliosBadge.classList.add('hidden')
+    verified('verified', 'Local node — RPC trusted')
+    return
+  }
+  currentLocalMode = false
+
   if (isEnsTarget && msg.ensVerified !== true) {
     verifyBadge.className = 'failed'
     verifyIcon.textContent = '✗'
@@ -436,14 +572,6 @@ function applyVerification(msg: VerificationUpdate) {
     return
   }
 
-  const ensTag = isEnsTarget ? ' · ENS ✓' : ''
-  const verified = (cls: string, label: string, delay = 2000) => {
-    verifyBadge.className = cls
-    verifyIcon.textContent = '✓'
-    verifyLabel.textContent = label
-    setTimeout(() => verifyBadge.classList.add('hidden'), delay)
-    unverifiedGate.classList.add('hidden')
-  }
   if (msg.portalVerified) {
     verified('portal', `Portal Network verified${ensTag}`)
   } else if (msg.heliosBacked && msg.trieVerified) {

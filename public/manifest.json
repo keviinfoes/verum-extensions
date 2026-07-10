@@ -10,6 +10,7 @@
     "webNavigation",
     "activeTab"
   ],
+  "optional_host_permissions": ["<all_urls>"],
   "host_permissions": [
     "*://*.infura.io/*",
     "*://*.alchemyapi.io/*",
@@ -53,7 +54,7 @@
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'",
-    "sandbox": "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals; script-src 'self' 'unsafe-inline' data: blob:; style-src 'self' 'unsafe-inline'; default-src 'self' blob: data:"
+    "sandbox": "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals; script-src 'self' 'unsafe-inline' data: blob:; style-src 'self' 'unsafe-inline'; img-src * data: blob:; default-src 'self' blob: data:"
   },
   "sandbox": {
     "pages": ["dapp-sandbox.html"]

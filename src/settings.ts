@@ -1,8 +1,9 @@
 import { DEFAULT_CHAINS } from './types.js'
 import type { ChainConfig } from './types.js'
 
-const chainsEl        = document.getElementById('chains') as HTMLDivElement
-const toast           = document.getElementById('saved-toast') as HTMLDivElement
+const chainsEl           = document.getElementById('chains') as HTMLDivElement
+const toast              = document.getElementById('saved-toast') as HTMLDivElement
+const urlPermBanner      = document.getElementById('url-permission-banner') as HTMLDivElement
 const addBtn          = document.getElementById('add-chain-btn') as HTMLButtonElement
 const addToggle       = document.getElementById('add-chain-toggle') as HTMLButtonElement
 const addChainEl      = document.getElementById('add-chain') as HTMLDivElement
@@ -73,6 +74,66 @@ clearCacheBtn.addEventListener('click', async () => {
 })
 
 updateCacheInfo()
+
+// Per-domain permission banners -----------------------------------------------
+
+function urlToOriginPattern(url: string): string | null {
+  try {
+    const u = new URL(url.trim())
+    if (!u.hostname || u.hostname === 'localhost') return null
+    if (/^[\d.]+$/.test(u.hostname)) return null  // IP address — skip
+    const parts = u.hostname.split('.')
+    if (parts.length < 2) return null
+    return `*://*.${parts.slice(-2).join('.')}/*`
+  } catch { return null }
+}
+
+// Collect every unique origin pattern from all custom chain URLs.
+function allConfiguredPatterns(stored: Record<number, ChainConfig>): Set<string> {
+  const patterns = new Set<string>()
+  for (const chain of Object.values(stored)) {
+    for (const url of [...chain.rpcs, ...chain.consensusRpcs, ...(chain.checkpointRpcs ?? [])]) {
+      const p = urlToOriginPattern(url)
+      if (p) patterns.add(p)
+    }
+  }
+  return patterns
+}
+
+async function updatePermissionBanners() {
+  const stored = await chrome.storage.sync.get('chains')
+  const chains: Record<number, ChainConfig> = stored.chains ?? DEFAULT_CHAINS
+  const patterns = allConfiguredPatterns(chains)
+
+  // Remove banners for patterns that are now gone or already granted.
+  for (const el of [...urlPermBanner.parentElement!.querySelectorAll<HTMLElement>('.domain-perm-banner')]) {
+    const pattern = el.dataset.pattern!
+    if (!patterns.has(pattern) || await chrome.permissions.contains({ origins: [pattern] })) {
+      el.remove()
+    }
+  }
+
+  // Add a banner for each pattern that isn't permitted yet.
+  for (const pattern of patterns) {
+    const granted = await chrome.permissions.contains({ origins: [pattern] })
+    if (granted) continue
+    if (urlPermBanner.parentElement!.querySelector(`[data-pattern="${CSS.escape(pattern)}"]`)) continue
+
+    const domain = pattern.replace('*://*.', '').replace('/*', '')
+    const banner = document.createElement('div')
+    banner.className = 'domain-perm-banner'
+    banner.dataset.pattern = pattern
+    banner.innerHTML = `<span>Custom RPC requires access to <strong>${domain}</strong></span><button>Grant access</button>`
+    banner.querySelector('button')!.addEventListener('click', () => {
+      chrome.permissions.request({ origins: [pattern] }).then(ok => {
+        if (ok) banner.remove()
+      }).catch(() => {})
+    })
+    urlPermBanner.insertAdjacentElement('afterend', banner)
+  }
+}
+
+updatePermissionBanners()
 
 addToggle.addEventListener('click', () => {
   addChainEl.classList.toggle('hidden')
@@ -393,7 +454,7 @@ function save(selectChainId?: number) {
 
 // Save only — use while the user is typing to avoid destroying the focused input
 function saveQuiet() {
-  chrome.storage.sync.set({ chains }).then(showToast)
+  chrome.storage.sync.set({ chains }).then(() => { showToast(); updatePermissionBanners() })
 }
 
 let toastTimer: ReturnType<typeof setTimeout>
@@ -401,6 +462,18 @@ function showToast() {
   toast.classList.remove('hidden')
   clearTimeout(toastTimer)
   toastTimer = setTimeout(() => toast.classList.add('hidden'), 2000)
+}
+
+// Request <all_urls> optional permission so user-added RPC/checkpoint/era URLs
+// are not blocked. Must be called from a user-gesture context (change events,
+// button clicks). Chrome shows the dialog only once; subsequent calls resolve
+// immediately once the permission is granted.
+function requestAllUrlsPermission() {
+  // Must be called synchronously inside a user gesture (click/change handler).
+  // Any await before this call breaks the gesture context and Chrome silently
+  // ignores the request — hence no contains() check first. Chrome shows the
+  // dialog only once; if already granted it resolves immediately as a no-op.
+  chrome.permissions.request({ origins: ['<all_urls>'] }).catch(() => {})
 }
 
 function debounce<T extends (...args: unknown[]) => void>(fn: T, ms: number): T {

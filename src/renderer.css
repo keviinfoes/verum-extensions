@@ -69,6 +69,17 @@ html, body {
 @keyframes spin { to { transform: rotate(360deg); } }
 #verify-badge.syncing #verify-icon { display: inline-block; animation: spin 1s linear infinite; }
 
+/* ---- Helios RPC init badge — bottom-right, disappears once helios-ready ---- */
+#helios-badge {
+  position: fixed; bottom: 14px; right: 14px; z-index: 1000;
+  display: flex; align-items: center; gap: 6px;
+  background: rgba(22,27,34,0.92); backdrop-filter: blur(8px);
+  border: 1px solid var(--border); border-radius: 20px;
+  padding: 5px 14px; font-size: 12px; color: var(--text-muted);
+  pointer-events: none;
+}
+#helios-badge-icon { font-size: 14px; display: inline-block; animation: spin 1s linear infinite; }
+
 /* ---- Unverified warning banner ---- */
 #warning-banner {
   position: fixed; top: 0; left: 0; right: 0; z-index: 2000;

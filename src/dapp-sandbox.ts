@@ -17,12 +17,16 @@ const frame = document.getElementById('frame') as HTMLIFrameElement
 window.addEventListener('message', (event: MessageEvent<BridgeMessage | RenderMessage>) => {
   if (!event.data) return
 
-  if (event.data.type === 'eth-request' && event.source === frame.contentWindow) {
-    window.parent.postMessage(event.data, '*')
+  if (event.data.type === 'eth-request') {
+    if (event.source === frame.contentWindow) window.parent.postMessage(event.data, '*')
   }
 
   if (event.data.type === 'w3-navigate' && event.source === frame.contentWindow) {
     window.parent.postMessage(event.data, '*')
+  }
+
+  if (event.data.type === 'polyfill-ready' && event.source === frame.contentWindow) {
+    window.parent.postMessage({ type: 'polyfill-ready' }, '*')
   }
 
   if (event.data.type === 'eth-response' && event.source === window.parent) {
@@ -71,6 +75,7 @@ return '<scr' + 'ipt>(function(){' +
     'isMetaMask:true,chainId:"' + chainIdHex + '",isConnected:function(){return true;},' +
     '_handlers:{},' +
     'request:function(a){' +
+      'if(a.method==="eth_chainId")return Promise.resolve("' + chainIdHex + '");' +
       'return new Promise(function(res,rej){' +
         'var id=(Math.random()*1e17).toString(36);' +
         '_cbs[id]={res:res,rej:rej};' +
@@ -82,7 +87,8 @@ return '<scr' + 'ipt>(function(){' +
     'sendAsync:function(m,cb){this.request(m).then(function(r){cb(null,{id:m.id,jsonrpc:"2.0",result:r})}).catch(function(e){cb(e,null)});},' +
     'on:function(e,fn){this._handlers[e]=this._handlers[e]||[];this._handlers[e].push(fn);},' +
     'removeListener:function(e,fn){var h=this._handlers[e];if(h)this._handlers[e]=h.filter(function(x){return x!==fn;});},' +
-    'emit:function(e,d){(this._handlers[e]||[]).forEach(function(fn){fn(d);});}' +
+    'emit:function(e,d){(this._handlers[e]||[]).forEach(function(fn){fn(d);});},' +
+    'disconnect:function(){window.parent.postMessage({type:"eth-disconnect"},"*");}' +
   '};' +
   'window.ethereum=_eth;' +
   // EIP-6963: announce provider so wagmi latest uses us as the injected connector.
@@ -101,6 +107,9 @@ return '<scr' + 'ipt>(function(){' +
       'return;' +
     '}' +
     'if(e.data.type==="wallet-event"){' +
+      'if(e.data.method==="heliosReady"){' +
+        'window.dispatchEvent(new Event("focus"));return;' +
+      '}' +
       'var p=e.data.params;' +
       'var d=(Array.isArray(p)&&Array.isArray(p[0]))?p[0]:p;' +
       'window.ethereum.emit(e.data.method,d);' +
@@ -119,6 +128,8 @@ return '<scr' + 'ipt>(function(){' +
       '}' +
     '}catch(ex){}' +
   '},true);' +
+  // Signal to renderer that the polyfill is set up and ready for wallet events.
+  'window.parent.postMessage({type:"polyfill-ready"},"*");' +
 '})();<\/scr' + 'ipt>'
 }
 

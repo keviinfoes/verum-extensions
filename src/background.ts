@@ -14,8 +14,109 @@ import { listWallets, ethRequest as walletRequest } from './lib/metamask-bridge.
 import { isFrameAvailable, frameRequest } from './lib/frame-bridge.js'
 import type { IVerifiedRpc } from './lib/light-client.js'
 
+const BUILD_ID = 'proxy-envelope-validation-2026-07-10T34'
+
+console.log(`[w3] background build ${BUILD_ID}`)
+
+// Purge any execution RPCs from stored chain settings that are no longer in
+// DEFAULT_CHAINS. Stored settings override defaults, so removed providers
+// (e.g. 0xrpc which returns -32601) would otherwise persist across rebuilds.
+;(async () => {
+  const stored = await chrome.storage.sync.get('chains')
+  const saved = stored.chains as Record<number, ChainConfig> | undefined
+  if (!saved) return
+  let dirty = false
+  for (const [id, chain] of Object.entries(saved)) {
+    const def = DEFAULT_CHAINS[Number(id)]
+    if (!def) continue
+    const defUrls = new Set(def.rpcs)
+    const filtered = chain.rpcs.filter(r => defUrls.has(r))
+    const consChanged = chain.consensusRpcs.length !== def.consensusRpcs.length
+      || chain.consensusRpcs.some((u, i) => u !== def.consensusRpcs[i])
+    if (filtered.length !== chain.rpcs.length || consChanged) {
+      const removed = chain.rpcs.filter(r => !defUrls.has(r))
+      if (removed.length) console.log(`[w3] migration: removed RPCs from chainId ${id}:`, removed)
+      if (consChanged) console.log(`[w3] migration: reset consensus RPCs for chainId ${id} to defaults`)
+      saved[Number(id)] = {
+        ...chain,
+        rpcs: filtered,
+        consensusRpcs: def.consensusRpcs,
+        rpcBatchSizes: Object.fromEntries(
+          Object.entries(chain.rpcBatchSizes ?? {}).filter(([k]) => defUrls.has(k))
+        ),
+      }
+      dirty = true
+    }
+  }
+  if (dirty) chrome.storage.sync.set({ chains: saved })
+})()
+
 const rpcCache = new Map<number, Promise<IVerifiedRpc>>()
+
+// Removes a chain's WASM instance from the cache AND shuts it down. Deleting
+// the cache entry alone leaks the instance: its internal polling loops keep
+// running with no JS reference, and accumulated zombies starve the SW event
+// loop (the original cause of chrome.storage hangs / stuck page loads).
+function evictChainRpc(chainId: number) {
+  const old = rpcCache.get(chainId)
+  rpcCache.delete(chainId)
+  old?.then(rpc => (rpc as { shutdown?: () => Promise<void> }).shutdown?.().catch(() => {})).catch(() => {})
+}
+const freshRpcCache = new Map<number, Promise<IVerifiedRpc>>()
+// Stores the already-resolved Helios instance once freshRpcCache settles.
+// ethRpcCall can check this synchronously and skip the 100ms race entirely.
+const freshRpcReady = new Map<number, IVerifiedRpc>()
+// Tracks chains for which we've already sent a helios-syncing signal so we
+// don't broadcast it on every read call while Helios is warming up.
+const heliosSyncingSignaled = new Set<number>()
+// Counts consecutive OOS probe exhaustions per chain. After 2 the WASM
+// instance is considered stuck and rpcCache is cleared to force a full restart.
+const oosExhaustionCount = new Map<number, number>()
+
+// Reads that arrived while Helios wasn't ready. Flushed as a batch once
+// freshRpcReady is set. The probe restarts on OOS exhaustion so reads wait
+// across multiple probe cycles until Helios recovers — no timeout.
+type PendingRead = (rpc: IVerifiedRpc) => void
+const pendingReads = new Map<number, PendingRead[]>()
+
+// In-flight dedup: identical reads (same chainId:method:params) share one promise.
+// Covers both queued reads (Helios not ready) and live reads (Helios ready).
+// Checked synchronously before any async work so there is no race window.
+const heliosInflight = new Map<string, Promise<{ result?: unknown; error?: string }>>()
+
+// Stale-while-revalidate cache for small primitive reads only.
+// eth_call and similar can return megabytes of ABI-encoded data — caching those
+// inflates the SW heap unboundedly under a polling dapp and triggers OOM.
+// Only cache methods whose results are always small (< ~100 bytes).
+const CACHEABLE_METHODS = new Set([
+  'eth_blockNumber', 'eth_getBalance', 'eth_getTransactionCount',
+  'eth_gasPrice', 'eth_maxPriorityFeePerGas', 'eth_feeHistory',
+])
+const heliosReadCache = new Map<string, unknown>()
+const MAX_READ_CACHE = 200
+
+// Concurrency limit for non-cacheable Helios reads (eth_call, eth_getLogs, …).
+// Each concurrent call holds a large ABI-encoded result in memory while the IPC
+// clone travels to the renderer. 20+ simultaneous clones exhaust the renderer
+// heap and Chrome kills the process (error 5). Cap at 4 concurrent slots so at
+// most 4 large results exist in memory at once.
+let ethCallSlots = 0
+const ETH_CALL_MAX_SLOTS = 4
+const ethCallWaiters: Array<() => void> = []
+function acquireEthCallSlot(): Promise<() => void> {
+  const release = () => { ethCallSlots--; ethCallWaiters.shift()?.() }
+  if (ethCallSlots < ETH_CALL_MAX_SLOTS) { ethCallSlots++; return Promise.resolve(release) }
+  return new Promise(resolve => ethCallWaiters.push(() => { ethCallSlots++; resolve(release) }))
+}
 const tabVerGen = new Map<number, number>()
+
+// Track when the portal last failed so subsequent loads don't spend 15s on a
+// TCP-connected-but-silent portal node. Resets when the SW is killed.
+let portalLastFailedAt = 0
+const PORTAL_FAIL_COOLDOWN = 120_000
+function isPortalLikelyDown(): boolean {
+  return portalLastFailedAt > 0 && Date.now() - portalLastFailedAt < PORTAL_FAIL_COOLDOWN
+}
 
 // ---------------------------------------------------------------------------
 // Per-dapp proof cache (chrome.storage.local)
@@ -48,12 +149,99 @@ function writeEraBsrCache(cache: Record<number, EraBsrCache>): void {
   chrome.storage.local.set({ era_bsr_cache: cache }).catch(() => {})
 }
 
+// Base Helios cache — resolves after eth_getBalance warmup (~30-60s total).
+// Used by beacon verification which needs Helios quickly within its 35s timeout.
 function getOrCreateRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
   if (!rpcCache.has(chain.chainId)) {
-    rpcCache.set(chain.chainId, createVerifiedRpc(chain))
+    const p = createVerifiedRpc(chain)
+    p.catch(() => {
+      // Both consensus RPCs failed (likely rate-limited). Wait 60s before
+      // allowing a retry — clearing immediately causes a tight hammering loop
+      // that worsens 429s and keeps the page stuck on loading.
+      setTimeout(() => {
+        rpcCache.delete(chain.chainId)
+        freshRpcCache.delete(chain.chainId)
+        freshRpcReady.delete(chain.chainId)
+      }, 60_000)
+    })
+    rpcCache.set(chain.chainId, p)
+    // Kick off the fresh cache so it starts waiting for a new block in parallel.
+    // Deferred: getOrCreateFreshRpc sets freshRpcCache synchronously before calling
+    // getOrCreateRpc, so a direct call here would be re-entrant and find freshRpcCache
+    // empty — creating a second orphaned probe that runs in parallel with the real one.
+    setTimeout(() => getOrCreateFreshRpc(chain), 0)
   }
   return rpcCache.get(chain.chainId)!
 }
+
+// Fresh Helios cache — resolves after the base is ready AND a new block has
+// been observed, resetting drift to near-zero. Used by ethRpcCall so dapp
+// eth_call reads land on Helios well within the out-of-sync threshold.
+function getOrCreateFreshRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
+  if (!freshRpcCache.has(chain.chainId)) {
+    const p = getOrCreateRpc(chain).then(async rpc => {
+      // Retry eth_blockNumber until execution state is past the out-of-sync guard.
+      // waitSynced() confirms consensus but execution may be briefly behind — once
+      // eth_blockNumber succeeds, the head is within the OOS threshold and Helios
+      // can serve all calls. Fast 500ms retries (vs old 1s new-block wait).
+      const t0 = Date.now()
+      let lastLag = '?'
+      for (let i = 0; i < 120; i++) {
+        try {
+          await rpc.request<string>('eth_blockNumber', [], true)  // quickFail — skip internal 3s retry
+          if (i > 0) console.log(`[w3] Helios OOS probe resolved in ${Math.round((Date.now() - t0) / 1000)}s`)
+          return rpc  // execution head confirmed live
+        } catch (err: any) {
+          if (!(err?.message ?? '').includes('out of sync')) return rpc  // non-OOS error, proceed
+          lastLag = (err.message as string).match(/(\d+) seconds? behind/)?.[1] ?? '?'
+        }
+        if (i > 0 && i % 10 === 0) {
+          console.log(`[w3] Helios OOS probe still waiting (${Math.round((Date.now() - t0) / 1000)}s, ${lastLag}s behind)…`)
+        }
+        await new Promise(r => setTimeout(r, 500))
+      }
+      // Probe exhausted — Helios execution head still stale. Clear self from the
+      // cache so the next ethRpcCall or ping creates a fresh probe rather than
+      // returning this rejected promise. Do NOT set freshRpcReady with an OOS instance.
+      freshRpcCache.delete(chain.chainId)
+      throw new Error('Helios OOS probe exhausted')
+    })
+    p.then(
+      (rpc) => {
+        freshRpcReady.set(chain.chainId, rpc)
+        heliosSyncingSignaled.delete(chain.chainId)
+        oosExhaustionCount.delete(chain.chainId)
+        chrome.runtime.sendMessage({ type: 'helios-ready', chainId: chain.chainId }).catch(() => {})
+        flushPendingReads(chain.chainId, rpc)
+      },
+      (err: any) => {
+        heliosSyncingSignaled.delete(chain.chainId)
+        if ((err?.message ?? '').includes('OOS probe exhausted')) {
+          const n = (oosExhaustionCount.get(chain.chainId) ?? 0) + 1
+          oosExhaustionCount.set(chain.chainId, n)
+          if (n >= 2) {
+            // Execution head stuck across 2 full probe cycles (2 × 60s) —
+            // the WASM instance is not recovering. Clear rpcCache to force a
+            // fresh createVerifiedRpc on the next getOrCreateFreshRpc call.
+            console.warn(`[w3] Helios OOS stuck (${n} exhaustions) — restarting WASM instance`)
+            oosExhaustionCount.set(chain.chainId, 0)
+            evictChainRpc(chain.chainId)
+          }
+          getOrCreateFreshRpc(chain)
+        }
+      },
+    )
+    freshRpcCache.set(chain.chainId, p)
+  }
+  return freshRpcCache.get(chain.chainId)!
+}
+
+function flushPendingReads(chainId: number, rpc: IVerifiedRpc) {
+  const queue = pendingReads.get(chainId) ?? []
+  pendingReads.delete(chainId)
+  for (const fn of queue) fn(rpc)
+}
+
 
 function rendererFor(web3Url: string): string {
   return chrome.runtime.getURL('renderer.html') + '#' + web3Url
@@ -142,6 +330,50 @@ chrome.runtime.onConnect.addListener((port) => {
     return
   }
 
+  if (port.name === 'helios-keepalive') {
+    // Ping arrives every 20s from the renderer. Use it to health-check Helios:
+    // one WASM eth_blockNumber call (no public RPC — Helios serves from its
+    // internal cached head). If OOS, re-probe early before the dapp reads.
+    port.onMessage.addListener(async () => {
+      const stored = await chrome.storage.sync.get('chains')
+      const chains: Record<number, ChainConfig> = stored.chains ?? DEFAULT_CHAINS
+      for (const chain of Object.values(chains)) {
+        if (chain.localMode) continue
+        const rpc = freshRpcReady.get(chain.chainId)
+        if (rpc) {
+          // Health-check the live instance — cheap WASM call, no public RPC.
+          try {
+            await rpc.request<string>('eth_blockNumber', [], true)
+          } catch (err: any) {
+            if ((err?.message ?? '').includes('out of sync')) {
+              if (freshRpcReady.get(chain.chainId) === rpc) {
+                const lagStr = (err.message as string).match(/(\d+) seconds? behind/)?.[1] ?? '?'
+                const lag = Number(lagStr)
+                // If execution head is already far behind when keepalive detects OOS,
+                // the WASM is in internal backoff — re-probing the same instance won't
+                // help since it won't make execution fetch calls during backoff.
+                // Force a full WASM restart so a fresh instance starts immediately.
+                const forceRestart = lag >= 30
+                console.warn(`[w3] Helios keepalive OOS (${lagStr}s behind)${forceRestart ? ' — lag too large, forcing WASM restart' : ' — starting re-probe'}`)
+                freshRpcReady.delete(chain.chainId)
+                freshRpcCache.delete(chain.chainId)
+                heliosSyncingSignaled.delete(chain.chainId)
+                if (forceRestart) evictChainRpc(chain.chainId)
+                getOrCreateFreshRpc(chain)
+                chrome.runtime.sendMessage({ type: 'helios-oos', chainId: chain.chainId }).catch(() => {})
+              }
+            }
+          }
+        } else if (rpcCache.has(chain.chainId) && !freshRpcCache.has(chain.chainId)) {
+          // Probe exhausted and cleared itself — restart it now rather than waiting
+          // for the next ethRpcCall.
+          getOrCreateFreshRpc(chain)
+        }
+      }
+    })
+    return
+  }
+
   if (port.name === 'eth-request') {
     port.onMessage.addListener(async (msg) => {
       const resp = await handleEthRequest(msg.method, msg.params ?? [], msg.walletId)
@@ -156,6 +388,7 @@ async function twoPhaseResolve(
   port: chrome.runtime.Port,
 ) {
   console.clear()
+  console.log(`[w3] background build ${BUILD_ID}`)
   console.log('[w3] twoPhaseResolve start', rawUrl)
   const send = (msg: BgResponse) => { try { port.postMessage(msg) } catch {} }
 
@@ -194,6 +427,7 @@ async function twoPhaseResolve(
   let phase1TxIndex: number = 0
   let phase1Block: RpcBlockFull | undefined
   let phase1UsedPortal = false
+  let phase1PortalFailed = false
   let phase1EnsChunks: TxRef[] = []
   let ensVerified: boolean | undefined = undefined
 
@@ -208,7 +442,7 @@ async function twoPhaseResolve(
     const results = await Promise.all(txRefs.map(async (chunk) => {
       // New format: blockNumber + txIndex, no txHash — use Portal or direct block fetch
       if (chunk.txHash === undefined) {
-        if (chain.portalRpc) {
+        if (chain.portalRpc && !isPortalLikelyDown()) {
           try {
             console.log('[w3] Block-indexed record — fetching from Portal')
             const result = await fetchCalldataFromPortal(chain.portalRpc, chunk, fastRpc)
@@ -216,6 +450,8 @@ async function twoPhaseResolve(
             return result
           } catch (portalErr) {
             console.warn('[w3] Portal unavailable, falling back to RPC:', portalErr)
+            phase1PortalFailed = true
+            portalLastFailedAt = Date.now()
           }
         }
         return await getVerifiedCalldataByLocation(chunk.blockNumber!, chunk.txIndex!, fastRpc)
@@ -224,7 +460,7 @@ async function twoPhaseResolve(
       try {
         return await getVerifiedCalldata(chunk.txHash, fastRpc)
       } catch (rpcErr) {
-        if (chain.portalRpc && chunk.blockNumber !== undefined && chunk.txIndex !== undefined) {
+        if (chain.portalRpc && chunk.blockNumber !== undefined && chunk.txIndex !== undefined && !isPortalLikelyDown()) {
           console.log('[w3] RPC missing tx, falling back to Portal for retrieval')
           const result = await fetchCalldataFromPortal(chain.portalRpc, chunk, fastRpc)
           phase1UsedPortal = true
@@ -275,7 +511,7 @@ async function twoPhaseResolve(
   // Portal nodes verify content against the beacon chain before serving it.
   // We additionally verify keccak256(header) == blockHash and reconstruct
   // the transactions trie to confirm block body integrity.
-  if (chain.portalRpc) {
+  if (chain.portalRpc && !phase1PortalFailed && !isPortalLikelyDown()) {
     console.log('[w3] Trying Portal node:', chain.portalRpc)
     // Start Helios in parallel for ENS re-verification — skipped in local mode (no external calls).
     const portalHeliosPromise = (!chain.localMode && parsed.target.type === 'ens' && phase1EnsChunks.length > 0 && chain.consensusRpcs.length > 0)
@@ -325,24 +561,17 @@ async function twoPhaseResolve(
       return
     } catch (err) {
       console.warn('[w3] Portal node unavailable, falling back:', (err as Error).message)
+      portalLastFailedAt = Date.now()
     }
   }
 
   // ── Local mode: trie-verify via local exec RPC only — no external calls ──
   if (chain.localMode) {
-    let trieVerified = false
-    try {
-      const { txHash: verifiedTxHash } = await verifyTxInBlock(phase1BlockHash, phase1TxIndex, execRpcs, phase1Block)
-      if (verifiedTxHash.toLowerCase() !== txHash.toLowerCase())
-        throw new Error(`Tx hash mismatch at index ${phase1TxIndex}`)
-      trieVerified = true
-    } catch (trieErr) {
-      console.warn('[w3] Local mode trie verification failed:', (trieErr as Error).message)
-    }
     const update: VerificationUpdate = {
       type: 'verification-update',
       heliosBacked: false,
-      trieVerified,
+      trieVerified: false,
+      localMode: true,
       proof: {
         url: rawUrl, blockNumber: phase1BlockNumber, blockHash: phase1BlockHash, txHash,
         txIndex: phase1TxIndex, contentType, payloadSize: formatBytes(assembled.length),
@@ -467,7 +696,11 @@ async function twoPhaseResolve(
   let heliosRpc: Awaited<ReturnType<typeof getOrCreateRpc>> | undefined
 
   try {
-    heliosRpc = await getOrCreateRpc(chain)
+    heliosRpc = await Promise.race([
+      getOrCreateRpc(chain),
+      new Promise<undefined>(r => setTimeout(() => r(undefined), 35_000)),
+    ]).catch(() => undefined)
+    if (!heliosRpc) throw new Error('Helios not available (timeout or consensus RPC failure)')
     console.log('[w3] got RPC, heliosBacked:', heliosRpc.isHeliosBacked())
     const result = await getVerifiedCalldata(txHash, heliosRpc)
 
@@ -602,7 +835,7 @@ async function updateBadge(tabId: number, update: VerificationUpdate) {
   const portalTrusted  = update.portalVerified === true && ensOk
   const heliosVerified = update.heliosBacked && update.trieVerified && ensOk
   const beaconTrusted  = update.beaconVerified && update.beaconHeliosAnchored && (update.trieVerified ?? false) && ensOk
-  const fullyVerified  = heliosVerified || portalTrusted || beaconTrusted
+  const fullyVerified  = heliosVerified || portalTrusted || beaconTrusted || update.localMode === true
   const color = fullyVerified ? '#3fb950' : '#d29922'
   const text = fullyVerified ? '✓' : '✗'
   // Tab may have been closed before verification finished — swallow the rejection.
@@ -615,6 +848,7 @@ async function updateBadge(tabId: number, update: VerificationUpdate) {
     [`proof_${tabId}`]: {
       heliosBacked: ensOk ? update.heliosBacked : false,
       trieVerified: update.trieVerified,
+      localMode: update.localMode ?? false,
       portalVerified: portalTrusted,
       beaconVerified: ensOk ? (update.beaconVerified ?? false) : false,
       beaconHeliosAnchored: ensOk ? (update.beaconHeliosAnchored ?? false) : false,
@@ -644,30 +878,162 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true
   }
   if (msg.type === 'eth-rpc') {
-    console.log('[w3] eth-rpc', msg.method, msg.chainId)
-    ethRpcCall(msg.chainId, msg.method, msg.params ?? []).then((r) => {
-      console.log('[w3] eth-rpc result', msg.method, r?.error ? 'ERR:' + r.error : 'OK')
-      sendResponse(r)
+    ethRpcCall(msg.chainId, msg.method, msg.params ?? []).then(sendResponse)
+    return true
+  }
+  if (msg.type === 'warmup-helios' && msg.chainId) {
+    chrome.storage.sync.get('chains').then(stored => {
+      const chains: Record<number, ChainConfig> = stored.chains ?? DEFAULT_CHAINS
+      const chain = chains[msg.chainId]
+      if (chain && !chain.localMode) getOrCreateFreshRpc(chain)
+    })
+  }
+  if (msg.type === 'helios-status' && msg.chainId) {
+    sendResponse({
+      ready: freshRpcReady.has(msg.chainId),
+      syncing: freshRpcCache.has(msg.chainId) && !freshRpcReady.has(msg.chainId),
     })
     return true
   }
 })
 
-async function ethRpcCall(chainId: number, method: string, params: unknown[]): Promise<{ result?: unknown; error?: string }> {
+// Thin shell: deduplicates identical concurrent reads synchronously (before any
+// await) so that wagmi's parallel hydration calls don't each spawn a separate
+// Helios request. The shared Promise covers both the queued and live-Helios paths.
+function ethRpcCall(chainId: number, method: string, params: unknown[]): Promise<{ result?: unknown; error?: string }> {
+  if (method === 'eth_chainId') return Promise.resolve({ result: '0x' + chainId.toString(16) })
+  if (method === 'net_version') return Promise.resolve({ result: String(chainId) })
+
+  const cacheKey = `${chainId}:${method}:${JSON.stringify(params)}`
+  const existing = heliosInflight.get(cacheKey)
+  if (existing) return existing
+
+  const p = _ethRpcCall(chainId, cacheKey, method, params)
+  heliosInflight.set(cacheKey, p)
+  p.finally(() => heliosInflight.delete(cacheKey))
+  return p
+}
+
+async function _ethRpcCall(chainId: number, cacheKey: string, method: string, params: unknown[]): Promise<{ result?: unknown; error?: string }> {
   const stored = await chrome.storage.sync.get('chains')
   const chains: Record<number, ChainConfig> = stored.chains ?? DEFAULT_CHAINS
   const chain = chains[chainId]
   if (!chain) return { error: `No chain config for chainId ${chainId}` }
+
+  // Local mode: no Helios — forward directly to the user's trusted execution RPC.
+  // Also clear heliosSyncingSignaled so that if the user switches back to non-local
+  // mode the badge is shown correctly (otherwise the stale flag suppresses it).
+  if (chain.localMode) {
+    heliosSyncingSignaled.delete(chain.chainId)
+    console.log('[w3] read via local rpc', method)
+    try {
+      const result = await new RpcClient(chain.rpcs.slice(0, 1)).request<unknown>(method, params)
+      return { result }
+    } catch (err: any) {
+      return { error: (err as Error).message ?? String(err) }
+    }
+  }
+
+  // Ensure Helios sync is in flight so freshRpcReady gets populated eventually.
+  getOrCreateFreshRpc(chain)
+  const rpc = freshRpcReady.get(chain.chainId)
+  if (!rpc) {
+    if (!heliosSyncingSignaled.has(chain.chainId)) {
+      heliosSyncingSignaled.add(chain.chainId)
+      chrome.runtime.sendMessage({ type: 'helios-syncing', chainId: chain.chainId }).catch(() => {})
+    }
+    // Queue this read — flushed as a batch once Helios is ready.
+    // Timeout after 45s so message channels don't stay open indefinitely;
+    // resolve with stale cache or error so the dapp can handle it gracefully.
+    return new Promise<{ result?: unknown; error?: string }>(resolve => {
+      const queue = pendingReads.get(chain.chainId) ?? []
+      if (!pendingReads.has(chain.chainId)) pendingReads.set(chain.chainId, queue)
+      queue.push(async (helios) => {
+        const isCacheableQ = CACHEABLE_METHODS.has(method)
+        const releaseQ = isCacheableQ ? null : await acquireEthCallSlot()
+        try {
+          const result = await helios.request<unknown>(method, params)
+          if (isCacheableQ) {
+            if (heliosReadCache.size >= MAX_READ_CACHE) heliosReadCache.delete(heliosReadCache.keys().next().value!)
+            heliosReadCache.set(cacheKey, result)
+          }
+          resolve({ result })
+        } catch (err: any) {
+          resolve(heliosReadCache.has(cacheKey)
+            ? { result: heliosReadCache.get(cacheKey) }
+            : { error: (err as Error).message ?? String(err) })
+        } finally {
+          releaseQ?.()
+        }
+      })
+    })
+  }
   try {
-    // Race the (possibly still-syncing) Helios Promise against an immediate RpcClient
-    // fallback so dapp reads aren't blocked if Helios hasn't finished syncing yet.
-    // If Helios is already resolved (started during twoPhaseResolve) it wins instantly.
-    const rpc = await Promise.race([
-      getOrCreateRpc(chain),
-      new Promise<IVerifiedRpc>(res => setTimeout(() => res(new RpcClient(chain.rpcs)), 100)),
-    ])
-    const result = await rpc.request(method, params)
-    return { result }
+    console.log('[w3] read via helios', method)
+    try {
+      const isCacheable = CACHEABLE_METHODS.has(method)
+      const release = isCacheable ? null : await acquireEthCallSlot()
+      let result: unknown
+      try {
+        result = await rpc.request<unknown>(method, params)
+      } finally {
+        release?.()
+      }
+      if (isCacheable) {
+        if (heliosReadCache.size >= MAX_READ_CACHE) heliosReadCache.delete(heliosReadCache.keys().next().value!)
+        heliosReadCache.set(cacheKey, result)
+      }
+      return { result }
+    } catch (innerErr: any) {
+      if ((innerErr?.message ?? '').includes('out of sync')) {
+        // Small lag: re-probe the existing instance — Helios usually self-heals and
+        // freshRpcReady gets re-set once eth_blockNumber succeeds. Lag ≥ 30s means
+        // the execution sync loop is in internal backoff and won't recover by probing;
+        // evict (shutdown + delete, never delete alone — a leaked instance's polling
+        // loops starve the SW event loop) so a fresh WASM starts immediately. Only
+        // the first concurrent OOS caller does this (the rest see undefined !== rpc
+        // once freshRpcReady is cleared).
+        if (freshRpcReady.get(chain.chainId) === rpc) {
+          const lagStr = (innerErr.message as string).match(/(\d+) seconds? behind/)?.[1] ?? '?'
+          const lag = Number(lagStr)
+          const forceRestart = lag >= 30
+          console.warn(`[w3] Helios OOS (${lagStr}s behind)${forceRestart ? ' — forcing WASM restart' : ' — starting re-probe'}`)
+          freshRpcReady.delete(chain.chainId)
+          freshRpcCache.delete(chain.chainId)
+          heliosSyncingSignaled.delete(chain.chainId)
+          if (forceRestart) evictChainRpc(chain.chainId)
+          getOrCreateFreshRpc(chain)
+          chrome.runtime.sendMessage({ type: 'helios-oos', chainId: chain.chainId }).catch(() => {})
+        }
+        // Serve stale verified result if available.
+        if (heliosReadCache.has(cacheKey)) return { result: heliosReadCache.get(cacheKey) }
+        // Re-queue only small primitive reads (eth_blockNumber, eth_getBalance, …).
+        // eth_call and similar can return megabytes; accumulating 20+ concurrent
+        // callers on the same promise then flushing them all at once sends 20 copies
+        // of large data to the renderer simultaneously → structured-clone OOM.
+        // For large-result methods, return the OOS error now — wagmi will retry
+        // automatically when helios-ready fires after the probe recovers.
+        if (CACHEABLE_METHODS.has(method)) {
+          return new Promise<{ result?: unknown; error?: string }>(resolve => {
+            const queue = pendingReads.get(chain.chainId) ?? []
+            if (!pendingReads.has(chain.chainId)) pendingReads.set(chain.chainId, queue)
+            queue.push(async (helios) => {
+              try {
+                const result = await helios.request<unknown>(method, params)
+                if (heliosReadCache.size >= MAX_READ_CACHE) heliosReadCache.delete(heliosReadCache.keys().next().value!)
+                heliosReadCache.set(cacheKey, result)
+                resolve({ result })
+              } catch (err: any) {
+                resolve(heliosReadCache.has(cacheKey)
+                  ? { result: heliosReadCache.get(cacheKey) }
+                  : { error: (err as Error).message ?? String(err) })
+              }
+            })
+          })
+        }
+      }
+      throw innerErr
+    }
   } catch (err: any) {
     return { error: err.message ?? String(err) }
   }
@@ -682,16 +1048,10 @@ async function listAvailableWallets(): Promise<Array<{ name: string; id: string 
 }
 
 async function handleEthRequest(method: string, params: unknown[], walletId: string): Promise<unknown> {
-  if (walletId === '__frame__') {
-    try {
-      const result = await frameRequest(method, params)
-      return { result }
-    } catch (err: any) {
-      return { error: err.message ?? String(err) }
-    }
-  }
   try {
-    const result = await walletRequest(walletId, method, params)
+    const result = walletId === '__frame__'
+      ? await frameRequest(method, params)
+      : await walletRequest(walletId, method, params)
     return { result }
   } catch (err: any) {
     return { error: err.message ?? String(err) }

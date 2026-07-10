@@ -59,17 +59,19 @@ function showProof(d: any) {
 
   const pending = d.pending === true
   const beaconTrusted = d.beaconVerified && d.beaconHeliosAnchored
-  const isEns = typeof d.url === 'string' && /portal:\/\/[^/]+\.eth/.test(d.url)
-  const ensBlocked = isEns && d.ensVerified !== true && !pending
-  const cls = ensBlocked ? 'unverified' : d.portalVerified ? 'portal' : d.heliosBacked ? 'verified' : beaconTrusted ? 'beacon' : pending ? 'pending' : 'unverified'
+  const isEns = typeof d.url === 'string' && /(?:w3|portal):\/\/[^/]+\.eth/.test(d.url)
+  const ensBlocked = isEns && d.ensVerified !== true && !pending && !d.localMode
+  const cls = d.localMode ? 'verified' : ensBlocked ? 'unverified' : d.portalVerified ? 'portal' : d.heliosBacked ? 'verified' : beaconTrusted ? 'beacon' : pending ? 'pending' : 'unverified'
   verdict.className = cls
   document.getElementById('verdict-icon')!.textContent =
+    d.localMode       ? '✓' :
     ensBlocked        ? '⚠️' :
     d.portalVerified  ? '⚡' :
     d.heliosBacked    ? '🔒' :
     beaconTrusted     ? '✓' :
     pending           ? '⟳' : '⚠️'
   document.getElementById('verdict-text')!.textContent =
+    d.localMode       ? 'Local node — RPC trusted' :
     ensBlocked && d.ensVerified === false ? 'ENS forged — record differs from Helios' :
     ensBlocked        ? 'Unverified — ENS not confirmed by Helios' :
     d.portalVerified  ? 'Portal Network verified' :
@@ -89,8 +91,8 @@ function showProof(d: any) {
   if (d.txHash) { txHashRow.classList.remove('hidden'); set('pf-tx-hash', d.txHash) }
   else { txHashRow.classList.add('hidden') }
   set('pf-tx-index',   d.txIndex !== undefined && !pending ? String(d.txIndex) : pending ? '…' : '—')
-  set('pf-trie',       d.trieVerified ? 'YES — cryptographically proven' : pending ? 'Verifying…' : 'NO')
-  let headerText = 'NO — trusted RPC only'
+  set('pf-trie',       d.localMode ? 'N/A — local node trusted' : d.trieVerified ? 'YES — cryptographically proven' : pending ? 'Verifying…' : 'NO')
+  let headerText = d.localMode ? 'N/A — local node trusted' : 'NO — trusted RPC only'
   if (d.portalVerified) {
     headerText = 'YES — Portal Network (sync committee BLS, local node)'
   } else if (d.heliosBacked) {
@@ -105,7 +107,7 @@ function showProof(d: any) {
   }
   set('pf-header', headerText)
   const ensRow = document.getElementById('pf-ens-row')!
-  if (isEns) {
+  if (isEns && !d.localMode) {
     ensRow.classList.remove('hidden')
     set('pf-ens',
       d.ensVerified === true  ? 'YES — confirmed by Helios' :

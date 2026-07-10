@@ -116,6 +116,22 @@ main { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; 
   color: #000; padding: 7px 16px; cursor: pointer; font-size: 13px; font-weight: 600;
 }
 
+/* ---- Per-domain permission banners ---- */
+.domain-perm-banner {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 14px; margin-bottom: 8px;
+  background: rgba(210,153,34,0.12); border: 1px solid var(--yellow);
+  border-radius: 8px; font-size: 13px; color: var(--yellow);
+}
+.domain-perm-banner span { flex: 1; }
+.domain-perm-banner strong { color: var(--text); }
+.domain-perm-banner button {
+  background: var(--yellow); color: #000; border: none; border-radius: 6px;
+  padding: 5px 14px; font-size: 12px; font-weight: 600; cursor: pointer;
+  white-space: nowrap;
+}
+.domain-perm-banner button:hover { opacity: 0.85; }
+
 /* ---- Cache section ---- */
 #cache-section {
   display: flex; align-items: center; gap: 12px;

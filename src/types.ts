@@ -59,8 +59,8 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
     chainId: 1,
     name: 'Mainnet',
     consensusRpcs: [
-      'https://ethereum-beacon-api.publicnode.com',
       'https://lodestar-mainnet.chainsafe.io',
+      'https://ethereum-beacon-api.publicnode.com',
     ],
     rpcs: [
       'https://ethereum-rpc.publicnode.com',
@@ -88,18 +88,20 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
     chainId: 11155111,
     name: 'Sepolia',
     consensusRpcs: [
-      'https://ethereum-sepolia-beacon-api.publicnode.com',
       'https://lodestar-sepolia.chainsafe.io',
+      'https://ethereum-sepolia-beacon-api.publicnode.com',
     ],
     rpcs: [
       'https://ethereum-sepolia-rpc.publicnode.com',
       'https://sepolia.drpc.org',
-      'https://rpc.ankr.com/eth_sepolia',
+      'https://gateway.tenderly.co/public/sepolia',
+      'https://rpc.sepolia.ethpandaops.io',
     ],
     rpcBatchSizes: {
       'https://ethereum-sepolia-rpc.publicnode.com': 200,
       'https://sepolia.drpc.org': 200,
-      'https://rpc.ankr.com/eth_sepolia': 200,
+      'https://gateway.tenderly.co/public/sepolia': 200,
+      'https://rpc.sepolia.ethpandaops.io': 200,
     },
     checkpointUrls: [
       'https://checkpoint-sync.sepolia.ethpandaops.io',
@@ -134,6 +136,7 @@ export interface VerificationUpdate {
   type: 'verification-update'
   heliosBacked: boolean
   trieVerified: boolean
+  localMode?: boolean        // local execution RPC, no beacon proof
   portalVerified?: boolean   // verified via local Portal Network node
   beaconVerified?: boolean
   beaconHeliosAnchored?: boolean    // parentBeaconBlockRoot anchor resolved
