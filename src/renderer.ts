@@ -1,5 +1,5 @@
-import { formatWeb3URL, parseWeb3URL } from './lib/url-parser.js'
-import { parseBundle, bundleFileAt } from './lib/content.js'
+import { formatWeb3URL, parseWeb3URL } from './lib/w3/url-parser.js'
+import { parseBundle, bundleFileAt } from './lib/w3/content.js'
 import type { BgMessage, BgResponse, VerificationUpdate } from './types.js'
 
 const splash          = document.getElementById('splash') as HTMLDivElement
@@ -466,7 +466,7 @@ async function navigate(web3Url: string, attempt = 0) {
   let parsedUrl: ReturnType<typeof parseWeb3URL>
   try {
     const stored = await chrome.storage.sync.get(['defaultChain'])
-    const defaultChain: number = stored.defaultChain ?? 1
+    const defaultChain = (stored.defaultChain as number | undefined) ?? 1
     parsedUrl = parseWeb3URL(web3Url, defaultChain)
     currentChainId = parsedUrl.chainId
     heliosIsReady = false
@@ -598,7 +598,7 @@ function applyVerification(msg: VerificationUpdate) {
 // Sandbox is loaded eagerly (src set in HTML). We wait for its load event before
 // posting so dapp-sandbox.ts's message listener is guaranteed to be registered.
 const sandboxReady = new Promise<void>(resolve =>
-  dappFrame.addEventListener('load', resolve, { once: true })
+  dappFrame.addEventListener('load', () => resolve(), { once: true })
 )
 function sendToSandbox(msg: object) {
   sandboxReady.then(() => dappFrame.contentWindow?.postMessage(msg, '*'))
@@ -646,9 +646,7 @@ function renderBundle(data: Uint8Array, web3Url: string) {
     wrap.appendChild(h2)
     const table = document.createElement('table')
     for (const f of files) {
-      const mime = f.mimeType.toLowerCase().split(';')[0].trim()
       // All files get hash navigation links — renderBundle shows download UI for html/js
-      const filename = f.path.split('/').pop() || f.path
       const tr = document.createElement('tr')
       const tdPath = document.createElement('td')
       const a = document.createElement('a')
@@ -681,7 +679,7 @@ function renderBundle(data: Uint8Array, web3Url: string) {
   if (parsed.path && parsed.path !== '/') {
     renderMode = 'raw'
     pageHasScripts = false
-    rawBlobUrl = URL.createObjectURL(new Blob([file.data], { type: file.mimeType }))
+    rawBlobUrl = URL.createObjectURL(new Blob([file.data as Uint8Array<ArrayBuffer>], { type: file.mimeType }))
     const dlName = file.path.split('/').pop() || file.path
     rawView.innerHTML =
       `<div class="raw-download">` +
@@ -792,19 +790,19 @@ function renderContent(data: Uint8Array, contentType: string, assetMap: Record<s
     pageHasScripts = false
 
     if (ct === 'application/pdf') {
-      rawBlobUrl = URL.createObjectURL(new Blob([data], { type: 'application/pdf' }))
+      rawBlobUrl = URL.createObjectURL(new Blob([data as Uint8Array<ArrayBuffer>], { type: 'application/pdf' }))
       // Use a plain <iframe> (no sandbox attr) so Chrome's built-in PDF viewer activates.
       rawView.innerHTML = `<iframe src="${rawBlobUrl}"></iframe>`
     } else if (ct.startsWith('text/')) {
       rawView.innerHTML = `<div class="raw-text"><pre>${esc(new TextDecoder().decode(data))}</pre></div>`
     } else if (ct.startsWith('image/')) {
-      rawBlobUrl = URL.createObjectURL(new Blob([data], { type: ct }))
+      rawBlobUrl = URL.createObjectURL(new Blob([data as Uint8Array<ArrayBuffer>], { type: ct }))
       rawView.innerHTML =
         `<div style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;height:100%">` +
         `<img src="${rawBlobUrl}" style="max-width:100%;max-height:100vh"/>` +
         `</div>`
     } else {
-      rawBlobUrl = URL.createObjectURL(new Blob([data], { type: ct || 'application/octet-stream' }))
+      rawBlobUrl = URL.createObjectURL(new Blob([data as Uint8Array<ArrayBuffer>], { type: ct || 'application/octet-stream' }))
       rawView.innerHTML =
         `<div class="raw-download">` +
         `<p>Content type: <code>${esc(ct || 'unknown')}</code> &nbsp;·&nbsp; ${data.length.toLocaleString()} bytes</p>` +

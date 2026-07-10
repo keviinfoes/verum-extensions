@@ -9,9 +9,9 @@
 // against the sync committee — we use it as the anchor to prove our target
 // transaction's calldata is authentic.
 
-import { keccak256, getBytes, hexlify, encodeRlp, toBeArray } from 'ethers'
-import type { IVerifiedRpc } from './light-client.js'
-import type { VerificationResult } from '../types.js'
+import { keccak256, getBytes, encodeRlp, toBeArray } from 'ethers'
+import type { IVerifiedRpc } from '../rpc/light-client.js'
+import type { VerificationResult } from '../../types.js'
 
 // ---------------------------------------------------------------------------
 // Minimal Merkle Patricia Trie — build-only, no Node.js deps
@@ -40,9 +40,9 @@ function sharedPrefix(a: Nibbles, b: Nibbles): number {
   return i
 }
 
-// ethers RLP.encode returns a hex string — wrap to get Uint8Array
+// ethers encodeRlp returns a hex string — wrap to get Uint8Array
 function rlpEncode(parts: (Uint8Array | Nibbles | string)[]): Uint8Array {
-  return getBytes(encodeRlp(parts as Parameters<typeof RLP.encode>[0]))
+  return getBytes(encodeRlp(parts as Parameters<typeof encodeRlp>[0]))
 }
 
 export interface Item { key: Nibbles; val: Uint8Array }
@@ -77,7 +77,7 @@ function nodeRlp(items: Item[]): Uint8Array {
 
   // Branch: 16 slots by first nibble + optional value slot
   const groups = new Map<number, Item[]>()
-  let branchVal = EMPTY
+  let branchVal: Uint8Array = EMPTY
   for (const it of items) {
     if (it.key.length === 0) {
       branchVal = it.val
@@ -167,19 +167,19 @@ function serializeTx(tx: RpcTx): Uint8Array {
   }
   if (type === 1) {
     const inner = getBytes(
-      encodeRlp([h(tx.chainId), h(tx.nonce), h(tx.gasPrice), h(tx.gas), addr(tx.to), h(tx.value), getBytes(tx.input), accessListRlp(tx.accessList) as Parameters<typeof RLP.encode>[0], yParity, h(tx.r), h(tx.s)]),
+      encodeRlp([h(tx.chainId), h(tx.nonce), h(tx.gasPrice), h(tx.gas), addr(tx.to), h(tx.value), getBytes(tx.input), accessListRlp(tx.accessList) as Parameters<typeof encodeRlp>[0], yParity, h(tx.r), h(tx.s)]),
     )
     return concat([new Uint8Array([0x01]), inner])
   }
   if (type === 2) {
     const inner = getBytes(
-      encodeRlp([h(tx.chainId), h(tx.nonce), h(tx.maxPriorityFeePerGas), h(tx.maxFeePerGas), h(tx.gas), addr(tx.to), h(tx.value), getBytes(tx.input), accessListRlp(tx.accessList) as Parameters<typeof RLP.encode>[0], yParity, h(tx.r), h(tx.s)]),
+      encodeRlp([h(tx.chainId), h(tx.nonce), h(tx.maxPriorityFeePerGas), h(tx.maxFeePerGas), h(tx.gas), addr(tx.to), h(tx.value), getBytes(tx.input), accessListRlp(tx.accessList) as Parameters<typeof encodeRlp>[0], yParity, h(tx.r), h(tx.s)]),
     )
     return concat([new Uint8Array([0x02]), inner])
   }
   if (type === 3) {
     const inner = getBytes(
-      encodeRlp([h(tx.chainId), h(tx.nonce), h(tx.maxPriorityFeePerGas), h(tx.maxFeePerGas), h(tx.gas), addr(tx.to), h(tx.value), getBytes(tx.input), accessListRlp(tx.accessList) as Parameters<typeof RLP.encode>[0], h(tx.maxFeePerBlobGas), (tx.blobVersionedHashes ?? []).map(getBytes), yParity, h(tx.r), h(tx.s)]),
+      encodeRlp([h(tx.chainId), h(tx.nonce), h(tx.maxPriorityFeePerGas), h(tx.maxFeePerGas), h(tx.gas), addr(tx.to), h(tx.value), getBytes(tx.input), accessListRlp(tx.accessList) as Parameters<typeof encodeRlp>[0], h(tx.maxFeePerBlobGas), (tx.blobVersionedHashes ?? []).map(bv => getBytes(bv)), yParity, h(tx.r), h(tx.s)]),
     )
     return concat([new Uint8Array([0x03]), inner])
   }
@@ -208,8 +208,8 @@ export function txKey(index: number): Nibbles {
 // Public API — all RPC calls go through IVerifiedRpc (Helios)
 // ---------------------------------------------------------------------------
 
-// Fetch by block number + tx index directly — used when ENS record has no txHash.
-// Derives the tx hash from the fetched transaction data.
+// Fetch by block number + tx index directly. Derives the tx hash from the
+// fetched transaction data.
 export async function getVerifiedCalldataByLocation(
   blockNumber: number,
   txIndex: number,
@@ -322,49 +322,5 @@ export async function verifyTxInBlock(
   console.log(`[w3] Block ${block.number}: tx[${txIndex}] = ${tx.hash} ✓`)
 
   return { txHash: tx.hash, calldata: getBytes(tx.input) }
-}
-
-export async function getVerifiedCalldata(
-  txHash: string,
-  rpc: IVerifiedRpc,
-): Promise<VerificationResult & { block: RpcBlockFull }> {
-  // 1. Locate the transaction — Helios fetches via its configured endpoints
-  const tx = await rpc.request<RpcTx>('eth_getTransactionByHash', [txHash])
-  const blockNumber = parseInt(tx.blockNumber, 16)
-  const txIndex = parseInt(tx.transactionIndex, 16)
-
-  // 2. Fetch the full block — Helios verifies the header (transactionsRoot)
-  //    against the sync committee before returning it
-  const block = await rpc.request<RpcBlockFull>('eth_getBlockByNumber', [
-    `0x${blockNumber.toString(16)}`, true,
-  ])
-
-  // 3. Reconstruct the transaction trie locally and verify against the
-  //    Helios-verified transactionsRoot — proves calldata is authentic
-  const items: Item[] = block.transactions.map((t, i) => ({
-    key: txKey(i),
-    val: serializeTx(t),
-  }))
-  const computedRoot = computeTrieRoot(items)
-  const trieVerified = computedRoot.toLowerCase() === block.transactionsRoot.toLowerCase()
-
-  if (!trieVerified) {
-    throw new Error(
-      `Transaction trie mismatch!\n  computed:  ${computedRoot}\n  block:     ${block.transactionsRoot}\nData returned by the RPC is inconsistent.`,
-    )
-  }
-
-  return {
-    verified: true,
-    blockNumber,
-    blockHash: block.hash,
-    blockTimestamp: parseInt(block.timestamp, 16),
-    txHash,
-    txIndex,
-    trieVerified,
-    headerVerified: rpc.isHeliosBacked(),
-    calldata: getBytes(tx.input),
-    block,
-  }
 }
 

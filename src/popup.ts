@@ -59,7 +59,8 @@ function showProof(d: any) {
 
   const pending = d.pending === true
   const beaconTrusted = d.beaconVerified && d.beaconHeliosAnchored
-  const isEns = typeof d.url === 'string' && /(?:w3|portal):\/\/[^/]+\.eth/.test(d.url)
+  // Any dotted name target (myapp.eth, myapp.gwei, …) — block:txIndex refs have no dots.
+  const isEns = typeof d.url === 'string' && /(?:w3|portal):\/\/(?:\d+:)?[^/:]*\.[^/:]+/.test(d.url)
   const ensBlocked = isEns && d.ensVerified !== true && !pending && !d.localMode
   const cls = d.localMode ? 'verified' : ensBlocked ? 'unverified' : d.portalVerified ? 'portal' : d.heliosBacked ? 'verified' : beaconTrusted ? 'beacon' : pending ? 'pending' : 'unverified'
   verdict.className = cls
@@ -85,12 +86,30 @@ function showProof(d: any) {
     const el = document.getElementById(id); if (el) el.textContent = val
   }
   set('pf-url',        d.url ?? '—')
-  set('pf-block',      d.blockNumber ? String(d.blockNumber) : pending ? '…' : '—')
-  set('pf-block-hash', d.blockHash || (pending ? '…' : '—'))
-  const txHashRow = document.getElementById('pf-tx-hash-row')!
-  if (d.txHash) { txHashRow.classList.remove('hidden'); set('pf-tx-hash', d.txHash) }
-  else { txHashRow.classList.add('hidden') }
-  set('pf-tx-index',   d.txIndex !== undefined && !pending ? String(d.txIndex) : pending ? '…' : '—')
+  // Multi-chunk dapps: the per-block singular rows are meaningless (they'd show only
+  // the last chunk), so hide them and show the Chunks row listing every verified
+  // block:txIndex. Single-chunk content shows the singular rows and hides Chunks.
+  const chunks = d.chunks as Array<{ blockNumber: number; txIndex: number }> | undefined
+  const multiChunk = !!chunks && chunks.length > 1
+  const showRow = (id: string, show: boolean) =>
+    document.getElementById(id)!.classList.toggle('hidden', !show)
+
+  showRow('pf-chunks-row', multiChunk)
+  showRow('pf-block-row', !multiChunk)
+  showRow('pf-block-hash-row', !multiChunk)
+  showRow('pf-tx-index-row', !multiChunk)
+
+  if (multiChunk) {
+    set('pf-chunks', chunks!.map(c => `${c.blockNumber}:${c.txIndex}`).join(', '))
+    document.getElementById('pf-tx-hash-row')!.classList.add('hidden')
+  } else {
+    set('pf-block',      d.blockNumber ? String(d.blockNumber) : pending ? '…' : '—')
+    set('pf-block-hash', d.blockHash || (pending ? '…' : '—'))
+    set('pf-tx-index',   d.txIndex !== undefined && !pending ? String(d.txIndex) : pending ? '…' : '—')
+    const txHashRow = document.getElementById('pf-tx-hash-row')!
+    if (d.txHash) { txHashRow.classList.remove('hidden'); set('pf-tx-hash', d.txHash) }
+    else { txHashRow.classList.add('hidden') }
+  }
   set('pf-trie',       d.localMode ? 'N/A — local node trusted' : d.trieVerified ? 'YES — cryptographically proven' : pending ? 'Verifying…' : 'NO')
   let headerText = d.localMode ? 'N/A — local node trusted' : 'NO — trusted RPC only'
   if (d.portalVerified) {

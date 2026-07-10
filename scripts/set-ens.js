@@ -4,9 +4,7 @@
 // Usage:
 //   node scripts/set-ens.js <ens-name> <rpc-url> <private-key> <ref> [<ref2> ...]
 //
-// Each <ref> is either:
-//   - A tx hash  "0x..."          — looked up on-chain to get blockNumber + txIndex
-//   - Coordinates "blockNum:idx"  — used directly, no lookup needed
+// Each <ref> is coordinates "blockNum:idx", used directly — no lookup needed.
 //
 // Writes the compact format: [[blockNumber, txIndex], ...]
 //
@@ -40,8 +38,8 @@ let refs
 if (rest.length > 0) {
   refs = rest
   for (const ref of refs) {
-    if (!/^0x[0-9a-fA-F]{64}$/.test(ref) && !/^\d+:\d+$/.test(ref)) {
-      console.error(`Invalid ref (expected 0x<hash> or <block>:<idx>): ${ref}`); process.exit(1)
+    if (!/^\d+:\d+$/.test(ref)) {
+      console.error(`Invalid ref (expected <block>:<idx>): ${ref}`); process.exit(1)
     }
   }
 } else {
@@ -85,17 +83,7 @@ async function main() {
   const wallet = new ethers.Wallet(privateKey, provider)
   const chainId = (await provider.getNetwork()).chainId
 
-  const chunks = await Promise.all(refs.map(async (ref) => {
-    if (/^\d+:\d+$/.test(ref)) {
-      const [blockNumber, txIndex] = ref.split(':').map(Number)
-      return [blockNumber, txIndex]
-    }
-    console.log(`Looking up ${ref.slice(0, 18)}...`)
-    const tx = await provider.getTransaction(ref)
-    if (!tx) throw new Error(`Transaction not found: ${ref}`)
-    console.log(`  → block ${tx.blockNumber}, txIndex ${tx.index}`)
-    return [tx.blockNumber, tx.index]
-  }))
+  const chunks = refs.map((ref) => ref.split(':').map(Number))
 
   const registry = new ethers.Contract(ENS_REGISTRY, REGISTRY_ABI, provider)
   const node = ethers.namehash(ensName)

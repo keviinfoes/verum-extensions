@@ -151,5 +151,8 @@ export interface VerificationUpdate {
     txIndex: number
     contentType: string
     payloadSize: string
+    // One entry per chunk (multi-chunk dapps) — the singular fields above describe
+    // the last chunk; all chunks listed here were verified.
+    chunks?: Array<{ blockNumber: number; txIndex: number; txHash: string }>
   }
 }

@@ -1,6 +1,8 @@
 # web3
 
-Browser extension for browsing `web3://` dapps stored as calldata on Ethereum, verified by Helios light client.
+Browser extension for browsing `w3://` pages stored as calldata on Ethereum, verified by Helios light client.
+
+See [VERIFICATION.md](VERIFICATION.md) for the full verification flow.
 
 ## Setup
 
@@ -23,14 +25,18 @@ npm run dev         # watch mode
 
 ## Usage
 
-In the address bar, type `portal` + Tab, then enter a `portal://` URL or ENS name.
+In the address bar, type `w3` + Tab, then enter a `ENS/GNS` name or `blockNumber:txIndex[+blockNumber:txIndex+...]`.
 
 ## Deploy a website to Ethereum
 
 ```bash
-# Single file
-node scripts/encode-w3fs.js scripts/hello-sepolia.html | PRIVATE_KEY=0x... node scripts/publish.js
+# Deploy — <file> or --dir <directory> -> prints [[blockNumber, txIndex], ...] coordinates.
+PRIVATE_KEY=0x... [RPC_URL=...] node scripts/encode-w3fs.js <file> | node scripts/publish.js
+PRIVATE_KEY=0x... [RPC_URL=...] node scripts/encode-w3fs.js --dir <directory> | node scripts/publish.js
 
-# Set ENS text record after deploy
-node scripts/set-ens.js
+# Point an owned ENS (.eth) name at coordinates
+node scripts/set-ens.js <name.eth> <rpc-url> <private-key> <block:idx> [<block:idx> ...]
+
+# Point an owned GNS (.gwei) name at coordinates
+node scripts/set-gns.js <name.gwei> <rpc-url> <private-key> <block:idx> [<block:idx> ...]
 ```

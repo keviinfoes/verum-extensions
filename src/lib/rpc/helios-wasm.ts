@@ -129,8 +129,14 @@ export class HeliosWasmClient implements IVerifiedRpc {
     const tag = `[w3] Helios (exec=${execHost})`
     console.log(`${tag} creating provider (${checkpointLabel})`)
     const t0 = Date.now()
+    // 'memory' is not a documented dbType (only "localstorage" | "config" are) — it
+    // was passing an unrecognized string straight into the WASM constructor. Use the
+    // real "localstorage" option: Helios's own Rust code already detects when
+    // localStorage is unavailable (true in a service worker) and falls back to
+    // in-memory checkpoint storage on its own, logging "Helios: localStorage
+    // unavailable, falling back to in-memory checkpoint storage".
     const provider = await createHeliosProvider(
-      { network, consensusRpc, executionRpc, dbType: 'memory', checkpoint },
+      { network, consensusRpc, executionRpc, dbType: 'localstorage', checkpoint },
       'ethereum',
     )
     console.log(`${tag} provider ready (${Date.now() - t0}ms) — waiting for sync`)

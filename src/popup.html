@@ -9,7 +9,7 @@
   <div id="nav-bar">
     <span id="nav-scheme">w3://</span>
     <input id="nav-input" type="text" spellcheck="false" autocomplete="off"
-           placeholder="myapp.eth or chainId:myapp.eth" />
+           placeholder="myapp.eth, myapp.gwei" />
     <button id="nav-go">&#9654;</button>
   </div>
 
@@ -24,10 +24,11 @@
     <table id="proof-table">
       <tbody>
         <tr><td>URL</td><td id="pf-url">—</td></tr>
-        <tr><td>Block</td><td id="pf-block">—</td></tr>
-        <tr><td>Block hash</td><td id="pf-block-hash">—</td></tr>
+        <tr id="pf-block-row"><td>Block</td><td id="pf-block">—</td></tr>
+        <tr id="pf-block-hash-row"><td>Block hash</td><td id="pf-block-hash">—</td></tr>
         <tr id="pf-tx-hash-row"><td>Tx hash</td><td id="pf-tx-hash">—</td></tr>
-        <tr><td>Tx index</td><td id="pf-tx-index">—</td></tr>
+        <tr id="pf-tx-index-row"><td>Tx index</td><td id="pf-tx-index">—</td></tr>
+        <tr id="pf-chunks-row" class="hidden"><td>Chunks</td><td id="pf-chunks">—</td></tr>
         <tr><td>Trie verified</td><td id="pf-trie">—</td></tr>
         <tr><td>Header</td><td id="pf-header">—</td></tr>
         <tr id="pf-ens-row" class="hidden"><td>ENS record</td><td id="pf-ens">—</td></tr>

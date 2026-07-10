@@ -6,7 +6,7 @@ type RenderMessage = {
 }
 
 type BridgeMessage = {
-  type: 'eth-request' | 'eth-response'
+  type: 'eth-request' | 'eth-response' | 'w3-navigate' | 'polyfill-ready' | 'wallet-event'
   [key: string]: unknown
 }
 

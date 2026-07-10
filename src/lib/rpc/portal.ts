@@ -8,10 +8,11 @@
 //   - portal_historyGetBlockBody(rlpHeaderHex) → rlpBodyHex (takes full header for verification)
 //
 // The Portal node validates block body against the header's txRoot before storing,
-// so a successful fetch implies the transactions root was already verified.
-// We additionally verify the trie locally if transactionsRoot is available.
+// so a successful fetch implies the transactions root was already verified — calldata
+// is checked to be part of the tx, the tx part of the block, and the block part of the
+// canonical chain. No additional local trie verification is needed on top of that.
 
-import { getBytes, hexlify, decodeRlp, encodeRlp } from 'ethers'
+import { getBytes, hexlify, decodeRlp } from 'ethers'
 
 // ---------------------------------------------------------------------------
 // Portal JSON-RPC
@@ -55,16 +56,6 @@ function blockBodyContentKey(blockNumber: number): string {
 // ---------------------------------------------------------------------------
 
 type RlpItem = string | readonly RlpItem[]
-
-// Convert a decoded RLP transaction item back to raw bytes for trie use
-function rawTxBytes(tx: RlpItem): Uint8Array {
-  if (typeof tx === 'string') {
-    // Typed transaction (EIP-2718 envelope): already raw bytes as hex
-    return getBytes(tx)
-  }
-  // Legacy transaction: re-encode fields back to RLP bytes
-  return getBytes(encodeRlp(tx as Parameters<typeof encodeRlp>[0]))
-}
 
 // Extract input data from a decoded RLP transaction item
 function extractCalldata(tx: RlpItem): Uint8Array {

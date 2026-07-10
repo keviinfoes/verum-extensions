@@ -19,7 +19,9 @@ async function updateCacheInfo() {
     chrome.storage.sync.get('chains'),
     chrome.storage.local.getBytesInUse(['dapp_proof_cache', 'era_bsr_cache']),
   ])
-  const { dapp_proof_cache, era_bsr_cache } = local
+  const dapp_proof_cache = local.dapp_proof_cache as Record<string, unknown> | undefined
+  const era_bsr_cache = local.era_bsr_cache as
+    Record<number, { histSummaries?: string; effectiveSlot?: number }> | undefined
   const chainNames: Record<number, string> = {}
   for (const c of Object.values(sync.chains ?? {})) {
     const ch = c as { chainId: number; name: string }
@@ -48,7 +50,7 @@ async function updateCacheInfo() {
     const dapps = dappsPerChain[chainId]
     if (dapps) parts.push(`${dapps} dapp${dapps === 1 ? '' : 's'}`)
 
-    const bsr = (era_bsr_cache ?? {})[chainId] as { histSummaries?: string; effectiveSlot?: number } | undefined
+    const bsr = era_bsr_cache?.[chainId]
     if (bsr?.histSummaries) {
       const n = Math.floor(bsr.histSummaries.length * 3 / 4 / 64)
       if (n > 0) {
@@ -92,7 +94,7 @@ function urlToOriginPattern(url: string): string | null {
 function allConfiguredPatterns(stored: Record<number, ChainConfig>): Set<string> {
   const patterns = new Set<string>()
   for (const chain of Object.values(stored)) {
-    for (const url of [...chain.rpcs, ...chain.consensusRpcs, ...(chain.checkpointRpcs ?? [])]) {
+    for (const url of [...chain.rpcs, ...chain.consensusRpcs, ...(chain.checkpointUrls ?? [])]) {
       const p = urlToOriginPattern(url)
       if (p) patterns.add(p)
     }
@@ -102,7 +104,7 @@ function allConfiguredPatterns(stored: Record<number, ChainConfig>): Set<string>
 
 async function updatePermissionBanners() {
   const stored = await chrome.storage.sync.get('chains')
-  const chains: Record<number, ChainConfig> = stored.chains ?? DEFAULT_CHAINS
+  const chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
   const patterns = allConfiguredPatterns(chains)
 
   // Remove banners for patterns that are now gone or already granted.
@@ -144,8 +146,8 @@ let chains: Record<number, ChainConfig> = {}
 
 async function load() {
   const stored = await chrome.storage.sync.get(['chains', 'defaultChain'])
-  chains = stored.chains ?? DEFAULT_CHAINS
-  const defaultChain: number = stored.defaultChain ?? 1
+  chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
+  const defaultChain = (stored.defaultChain as number | undefined) ?? 1
   renderDefaultChainSelector(defaultChain)
   render()
 }
@@ -445,7 +447,7 @@ addBtn.addEventListener('click', () => {
 function save(selectChainId?: number) {
   chrome.storage.sync.set({ chains }).then(async () => {
     const stored = await chrome.storage.sync.get('defaultChain')
-    renderDefaultChainSelector(stored.defaultChain ?? 1)
+    renderDefaultChainSelector((stored.defaultChain as number | undefined) ?? 1)
     if (selectChainId !== undefined) defaultChainSel.value = String(selectChainId)
     render()
     showToast()
@@ -462,18 +464,6 @@ function showToast() {
   toast.classList.remove('hidden')
   clearTimeout(toastTimer)
   toastTimer = setTimeout(() => toast.classList.add('hidden'), 2000)
-}
-
-// Request <all_urls> optional permission so user-added RPC/checkpoint/era URLs
-// are not blocked. Must be called from a user-gesture context (change events,
-// button clicks). Chrome shows the dialog only once; subsequent calls resolve
-// immediately once the permission is granted.
-function requestAllUrlsPermission() {
-  // Must be called synchronously inside a user gesture (click/change handler).
-  // Any await before this call breaks the gesture context and Chrome silently
-  // ignores the request — hence no contains() check first. Chrome shows the
-  // dialog only once; if already granted it resolves immediately as a no-op.
-  chrome.permissions.request({ origins: ['<all_urls>'] }).catch(() => {})
 }
 
 function debounce<T extends (...args: unknown[]) => void>(fn: T, ms: number): T {

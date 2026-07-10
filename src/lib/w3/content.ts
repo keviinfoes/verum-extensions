@@ -19,8 +19,8 @@
 //     [4]  data length (uint32 BE)
 //     [D]  raw file bytes
 
-import type { ContentChunk, Compression } from '../types.js'
-import { W3FS_MAGIC } from '../types.js'
+import type { ContentChunk, Compression } from '../../types.js'
+import { W3FS_MAGIC } from '../../types.js'
 
 // ---------------------------------------------------------------------------
 // Bundle support
@@ -53,42 +53,6 @@ export function parseBundle(raw: Uint8Array): BundleFile[] {
 export function bundleFileAt(files: BundleFile[], requestPath: string): BundleFile | null {
   const norm = !requestPath || requestPath === '/' ? '/index.html' : requestPath
   return files.find(f => f.path === norm) ?? files.find(f => f.path === requestPath) ?? null
-}
-
-// Replace relative <link>, <script src>, <img src> references with inline content
-// so the iframe (which has no HTTP server) can render all assets correctly.
-export function rewriteHtmlResources(html: string, files: BundleFile[]): string {
-  const map = new Map(files.map(f => [f.path, f]))
-
-  function resolve(src: string): BundleFile | undefined {
-    if (!src || /^(https?:|data:|blob:)/.test(src)) return undefined
-    return map.get('/' + src.replace(/^\.?\//, ''))
-  }
-
-  // <link href="..."> → <style>
-  html = html.replace(/<link([^>]*?)>/gi, (match, attrs) => {
-    const href = /\shref="([^"]+)"/i.exec(attrs)?.[1]
-    const rel  = /\srel="([^"]+)"/i.exec(attrs)?.[1] ?? 'stylesheet'
-    if (!href || !rel.includes('stylesheet')) return match
-    const f = resolve(href)
-    return f ? `<style>${new TextDecoder().decode(f.data)}</style>` : match
-  })
-
-  // <script src="..."> → inline
-  html = html.replace(/<script([^>]*?)\ssrc="([^"]+)"([^>]*?)>/gi, (match, pre, src, post) => {
-    const f = resolve(src)
-    return f ? `<script${pre}${post}>${new TextDecoder().decode(f.data)}` : match
-  })
-
-  // <img src="..."> → data URI
-  html = html.replace(/(<img[^>]*?\ssrc=")([^"]+)(")/gi, (match, pre, src, post) => {
-    const f = resolve(src)
-    if (!f) return match
-    const b64 = btoa(Array.from(f.data).map(b => String.fromCharCode(b)).join(''))
-    return `${pre}data:${f.mimeType};base64,${b64}${post}`
-  })
-
-  return html
 }
 
 export function parseCalldata(data: Uint8Array): ContentChunk {
@@ -153,7 +117,7 @@ async function runDecompressionStream(
   const writer = ds.writable.getWriter()
   const reader = ds.readable.getReader()
 
-  writer.write(data)
+  writer.write(data as Uint8Array<ArrayBuffer>)
   writer.close()
 
   const chunks: Uint8Array[] = []
@@ -193,7 +157,6 @@ export async function assembleContent(
 
   const contentType = sorted[0].contentType
   const allNone = sorted.every(c => c.compression === 'none')
-  const allSame = sorted.every(c => c.compression === sorted[0].compression)
 
   // Bundle chunks: pre-compressed slices stored as 'none' — concatenate then decompress whole gzip stream
   if (contentType === BUNDLE_CONTENT_TYPE && allNone) {

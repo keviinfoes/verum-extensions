@@ -1,9 +1,10 @@
 import { ensNormalize } from 'ethers'
-import type { Web3URL } from '../types.js'
+import type { Web3URL } from '../../types.js'
 
 // Supported formats:
 //   w3://myapp.eth                       ENS name (resolved at fetch time)
-//   w3://<chainId>:myapp.eth             ENS on specific chain
+//   w3://myapp.gwei                      GNS name (resolved at fetch time)
+//   w3://<chainId>:myapp.eth             ENS/GNS on specific chain
 //   w3://<blockNumber>:<txIndex>         Direct tx reference (uses default chain)
 //   w3://<chainId>:<blockNumber>:<txIndex>  Tx reference on specific chain
 //   ...with optional /path suffix
@@ -57,18 +58,18 @@ export function parseWeb3URL(raw: string, defaultChainId = 1): Web3URL {
     return { raw, chainId, target: { type: 'tx', refs }, path }
   }
 
-  // ENS name — anything with a dot
+  // ENS or GNS name — anything with a dot (resolveEns picks the registry by TLD)
   if (rest.includes('.')) {
     let name: string
     try {
       name = ensNormalize(rest)
     } catch {
-      throw new Error(`Invalid ENS name: "${rest}"`)
+      throw new Error(`Invalid ENS/GNS name: "${rest}"`)
     }
     return { raw, chainId, target: { type: 'ens', name }, path }
   }
 
-  throw new Error(`Invalid w3 URL: expected an ENS name (e.g. myapp.eth) or block:txIndex`)
+  throw new Error(`Invalid w3 URL: expected an ENS/GNS name (e.g. myapp.eth or myapp.gwei) or block:txIndex`)
 }
 
 export function formatWeb3URL(parsed: Web3URL): string {

@@ -1,55 +1,22 @@
-import { parseWeb3URL } from './lib/url-parser.js'
-import { RpcClient, createVerifiedRpc } from './lib/light-client.js'
-import { getVerifiedCalldata, getVerifiedCalldataByLocation, verifyTxInBlock } from './lib/tx-verifier.js'
-import type { RpcBlockFull } from './lib/tx-verifier.js'
-import { getCalldataViaPortal } from './lib/portal.js'
-import { parseCalldata, assembleContent, BUNDLE_CONTENT_TYPE, parseBundle, bundleFileAt, rewriteHtmlResources } from './lib/content.js'
-import { resolveEns } from './lib/ens-resolver.js'
-import type { TxRef } from './lib/ens-resolver.js'
-import { verifyViaBeacon, isEip2935Error } from './lib/beacon-verifier.js'
-import type { DappProofData, EraBsrCache } from './lib/beacon-verifier.js'
+import { parseWeb3URL } from './lib/w3/url-parser.js'
+import { RpcClient, createVerifiedRpc } from './lib/rpc/light-client.js'
+import { getVerifiedCalldataByLocation, verifyTxInBlock } from './lib/verify/tx-verifier.js'
+import type { RpcBlockFull } from './lib/verify/tx-verifier.js'
+import { getCalldataViaPortal } from './lib/rpc/portal.js'
+import { parseCalldata, assembleContent } from './lib/w3/content.js'
+import { resolveEns } from './lib/w3/name-resolver.js'
+import type { TxRef } from './lib/w3/name-resolver.js'
+import { verifyViaBeacon, isEip2935Error } from './lib/verify/beacon-verifier.js'
+import type { DappProofData, EraBsrCache } from './lib/verify/beacon-verifier.js'
 import { DEFAULT_CHAINS } from './types.js'
-import type { BgMessage, BgResponse, VerificationUpdate, ChainConfig } from './types.js'
-import { listWallets, ethRequest as walletRequest } from './lib/metamask-bridge.js'
-import { isFrameAvailable, frameRequest } from './lib/frame-bridge.js'
-import type { IVerifiedRpc } from './lib/light-client.js'
+import type { BgMessage, BgResponse, VerificationUpdate, ChainConfig, VerificationResult } from './types.js'
+import { listWallets, ethRequest as walletRequest } from './lib/wallets/metamask-bridge.js'
+import { isFrameAvailable, frameRequest } from './lib/wallets/frame-bridge.js'
+import type { IVerifiedRpc } from './lib/rpc/light-client.js'
 
-const BUILD_ID = 'proxy-envelope-validation-2026-07-10T34'
+const BUILD_ID = 'lib-folder-reorg-2026-07-10T45'
 
 console.log(`[w3] background build ${BUILD_ID}`)
-
-// Purge any execution RPCs from stored chain settings that are no longer in
-// DEFAULT_CHAINS. Stored settings override defaults, so removed providers
-// (e.g. 0xrpc which returns -32601) would otherwise persist across rebuilds.
-;(async () => {
-  const stored = await chrome.storage.sync.get('chains')
-  const saved = stored.chains as Record<number, ChainConfig> | undefined
-  if (!saved) return
-  let dirty = false
-  for (const [id, chain] of Object.entries(saved)) {
-    const def = DEFAULT_CHAINS[Number(id)]
-    if (!def) continue
-    const defUrls = new Set(def.rpcs)
-    const filtered = chain.rpcs.filter(r => defUrls.has(r))
-    const consChanged = chain.consensusRpcs.length !== def.consensusRpcs.length
-      || chain.consensusRpcs.some((u, i) => u !== def.consensusRpcs[i])
-    if (filtered.length !== chain.rpcs.length || consChanged) {
-      const removed = chain.rpcs.filter(r => !defUrls.has(r))
-      if (removed.length) console.log(`[w3] migration: removed RPCs from chainId ${id}:`, removed)
-      if (consChanged) console.log(`[w3] migration: reset consensus RPCs for chainId ${id} to defaults`)
-      saved[Number(id)] = {
-        ...chain,
-        rpcs: filtered,
-        consensusRpcs: def.consensusRpcs,
-        rpcBatchSizes: Object.fromEntries(
-          Object.entries(chain.rpcBatchSizes ?? {}).filter(([k]) => defUrls.has(k))
-        ),
-      }
-      dirty = true
-    }
-  }
-  if (dirty) chrome.storage.sync.set({ chains: saved })
-})()
 
 const rpcCache = new Map<number, Promise<IVerifiedRpc>>()
 
@@ -123,7 +90,7 @@ function isPortalLikelyDown(): boolean {
 // Key: raw w3:// URL. Value: txHash (for ENS staleness) + 13-hash Merkle proof.
 // Skips era file / parquet / exec-header download on re-visit.
 // ---------------------------------------------------------------------------
-interface StoredProof { txHash: string; merklePath: string; chainId?: number }
+interface StoredProof { txHash: string; merklePaths: (string | null)[]; chainId?: number }
 
 async function readProofCache(): Promise<Record<string, StoredProof>> {
   const { dapp_proof_cache } = await chrome.storage.local.get('dapp_proof_cache')
@@ -247,6 +214,12 @@ function rendererFor(web3Url: string): string {
   return chrome.runtime.getURL('renderer.html') + '#' + web3Url
 }
 
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  return true
+}
+
 // Returns true if Helios confirms the same chunks as phase 1, false if it resolves
 // to definitively different non-empty chunks (forged), undefined if Helios couldn't
 // resolve (error or empty result — unverified, not forged).
@@ -255,7 +228,7 @@ function compareEnsChunks(heliosChunks: TxRef[], phase1Chunks: TxRef[]): boolean
   return heliosChunks.length === phase1Chunks.length
     && heliosChunks.every((c, i) => {
       const p = phase1Chunks[i]
-      return c.txHash === p.txHash && c.blockNumber === p.blockNumber && c.txIndex === p.txIndex
+      return c.blockNumber === p.blockNumber && c.txIndex === p.txIndex
     })
 }
 
@@ -266,19 +239,20 @@ async function fetchCalldataFromPortal(
   chunk: TxRef,
   rpc: IVerifiedRpc,
 ) {
-  const { calldata } = await getCalldataViaPortal(portalRpc, chunk.blockNumber!, chunk.txIndex!)
-  // Block headers are available on pruned nodes even when tx data is gone
-  interface RpcBlock { hash: string; timestamp: string }
+  const { calldata } = await getCalldataViaPortal(portalRpc, chunk.blockNumber, chunk.txIndex)
+  // Block headers are available on pruned nodes even when tx data is gone.
+  // transactions is a hash-string array since we request with fullTx=false.
+  interface RpcBlock { hash: string; timestamp: string; transactions: string[] }
   const block = await rpc.request<RpcBlock>('eth_getBlockByNumber', [
-    `0x${chunk.blockNumber!.toString(16)}`, false,
+    `0x${chunk.blockNumber.toString(16)}`, false,
   ])
   return {
     verified: true,
-    blockNumber: chunk.blockNumber!,
+    blockNumber: chunk.blockNumber,
     blockHash: block.hash,
     blockTimestamp: parseInt(block.timestamp, 16),
-    txHash: chunk.txHash,
-    txIndex: chunk.txIndex!,
+    txHash: block.transactions[chunk.txIndex],
+    txIndex: chunk.txIndex,
     trieVerified: true,
     headerVerified: false,
     calldata,
@@ -311,7 +285,7 @@ chrome.omnibox.onInputEntered.addListener((text, disposition) => {
 })
 
 chrome.omnibox.onInputChanged.addListener((_text, suggest) => {
-  suggest([{ content: 'w3://', description: 'Enter an ENS name (e.g. myapp.eth) or block:txIndex' }])
+  suggest([{ content: 'w3://', description: 'Enter an ENS/GNS name (e.g. myapp.eth or myapp.gwei) or block:txIndex' }])
 })
 
 // ---------------------------------------------------------------------------
@@ -336,7 +310,7 @@ chrome.runtime.onConnect.addListener((port) => {
     // internal cached head). If OOS, re-probe early before the dapp reads.
     port.onMessage.addListener(async () => {
       const stored = await chrome.storage.sync.get('chains')
-      const chains: Record<number, ChainConfig> = stored.chains ?? DEFAULT_CHAINS
+      const chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
       for (const chain of Object.values(chains)) {
         if (chain.localMode) continue
         const rpc = freshRpcReady.get(chain.chainId)
@@ -398,8 +372,8 @@ async function twoPhaseResolve(
   if (tabId !== undefined) tabVerGen.set(tabId, gen)
   const isSuperseded = () => tabId !== undefined && tabVerGen.get(tabId) !== gen
   const stored = await chrome.storage.sync.get(['chains', 'defaultChain'])
-  const chains: Record<number, ChainConfig> = stored.chains ?? DEFAULT_CHAINS
-  const defaultChain: number = stored.defaultChain ?? 1
+  const chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
+  const defaultChain = (stored.defaultChain as number | undefined) ?? 1
   const parsed = parseWeb3URL(rawUrl, defaultChain)
   console.log('[w3] parsed chainId:', parsed.chainId, 'target:', parsed.target)
   let chain = chains[parsed.chainId]
@@ -422,10 +396,10 @@ async function twoPhaseResolve(
   let contentType: string
   let txHash: string
   let phase1BlockHash: string
-  let phase1BlockTimestamp: number
   let phase1BlockNumber: number = 0
   let phase1TxIndex: number = 0
-  let phase1Block: RpcBlockFull | undefined
+  // All chunk results — phase 2 verifies and binds every chunk, not just the last.
+  let phase1Results: Array<VerificationResult & { block?: RpcBlockFull }> = []
   let phase1UsedPortal = false
   let phase1PortalFailed = false
   let phase1EnsChunks: TxRef[] = []
@@ -440,42 +414,27 @@ async function twoPhaseResolve(
       : (await resolveEns(target.name, fastRpc)).chunks
     phase1EnsChunks = txRefs
     const results = await Promise.all(txRefs.map(async (chunk) => {
-      // New format: blockNumber + txIndex, no txHash — use Portal or direct block fetch
-      if (chunk.txHash === undefined) {
-        if (chain.portalRpc && !isPortalLikelyDown()) {
-          try {
-            console.log('[w3] Block-indexed record — fetching from Portal')
-            const result = await fetchCalldataFromPortal(chain.portalRpc, chunk, fastRpc)
-            phase1UsedPortal = true
-            return result
-          } catch (portalErr) {
-            console.warn('[w3] Portal unavailable, falling back to RPC:', portalErr)
-            phase1PortalFailed = true
-            portalLastFailedAt = Date.now()
-          }
-        }
-        return await getVerifiedCalldataByLocation(chunk.blockNumber!, chunk.txIndex!, fastRpc)
-      }
-      // Legacy format: txHash — try RPC, fall back to Portal on failure
-      try {
-        return await getVerifiedCalldata(chunk.txHash, fastRpc)
-      } catch (rpcErr) {
-        if (chain.portalRpc && chunk.blockNumber !== undefined && chunk.txIndex !== undefined && !isPortalLikelyDown()) {
-          console.log('[w3] RPC missing tx, falling back to Portal for retrieval')
+      // Block-indexed record — use Portal or direct block fetch
+      if (chain.portalRpc && !isPortalLikelyDown()) {
+        try {
+          console.log('[w3] Block-indexed record — fetching from Portal')
           const result = await fetchCalldataFromPortal(chain.portalRpc, chunk, fastRpc)
           phase1UsedPortal = true
           return result
+        } catch (portalErr) {
+          console.warn('[w3] Portal unavailable, falling back to RPC:', portalErr)
+          phase1PortalFailed = true
+          portalLastFailedAt = Date.now()
         }
-        throw rpcErr
       }
+      return await getVerifiedCalldataByLocation(chunk.blockNumber, chunk.txIndex, fastRpc)
     }))
+    phase1Results = results
     const last = results[results.length - 1]
     txHash = last.txHash
     phase1BlockHash = last.blockHash
-    phase1BlockTimestamp = last.blockTimestamp
     phase1BlockNumber = last.blockNumber
     phase1TxIndex = last.txIndex
-    phase1Block = (last as { block?: RpcBlockFull }).block
     const chunks = results.map((r) => parseCalldata(r.calldata))
     ;({ data: assembled, contentType } = await assembleContent(chunks))
 
@@ -491,6 +450,10 @@ async function twoPhaseResolve(
   // Send content to renderer — page shows NOW
   send({ type: 'content', assembled: Array.from(assembled), contentType })
 
+  // Per-chunk refs for the proof panel — the singular proof fields describe the
+  // last chunk; this lists every chunk that phase 2 verifies.
+  const proofChunks = phase1Results.map(r => ({ blockNumber: r.blockNumber, txIndex: r.txIndex, txHash: r.txHash }))
+
   // Store partial proof immediately so popup has something during phase 2
   if (tabId) {
     chrome.storage.session.set({
@@ -499,6 +462,7 @@ async function twoPhaseResolve(
         payloadSize: formatBytes(assembled.length),
         heliosBacked: false, trieVerified: false, pending: true,
         blockNumber: phase1BlockNumber, blockHash: phase1BlockHash, txIndex: phase1TxIndex,
+        chunks: proofChunks,
       },
     })
   }
@@ -507,10 +471,9 @@ async function twoPhaseResolve(
   if (!tabId) return
 
   // ── Portal path: if a local Portal node is configured, use it first ───────
-  // Fetches block header + body from the Portal History Network by blockHash.
-  // Portal nodes verify content against the beacon chain before serving it.
-  // We additionally verify keccak256(header) == blockHash and reconstruct
-  // the transactions trie to confirm block body integrity.
+  // Portal nodes verify calldata ∈ tx ∈ block ∈ canonical chain before storing,
+  // so a successful fetch from the user's own node needs no re-verification —
+  // the beacon pipeline below is skipped entirely (portalVerified: true).
   if (chain.portalRpc && !phase1PortalFailed && !isPortalLikelyDown()) {
     console.log('[w3] Trying Portal node:', chain.portalRpc)
     // Start Helios in parallel for ENS re-verification — skipped in local mode (no external calls).
@@ -552,6 +515,7 @@ async function twoPhaseResolve(
           url: rawUrl, blockNumber: phase1BlockNumber, blockHash: phase1BlockHash,
           txHash, txIndex: phase1TxIndex,
           contentType, payloadSize: formatBytes(assembled.length),
+          chunks: proofChunks,
         },
       }
       if (isSuperseded()) { port.disconnect(); return }
@@ -575,6 +539,7 @@ async function twoPhaseResolve(
       proof: {
         url: rawUrl, blockNumber: phase1BlockNumber, blockHash: phase1BlockHash, txHash,
         txIndex: phase1TxIndex, contentType, payloadSize: formatBytes(assembled.length),
+        chunks: proofChunks,
       },
     }
     if (isSuperseded()) { port.disconnect(); return }
@@ -589,14 +554,21 @@ async function twoPhaseResolve(
   // Helios init (up to 6 min with 12 combinations × 30s timeout) and go straight
   // to beacon verification.
   const EIP_2935_BUFFER_SECONDS = 8191 * 12
-  const blockIsHistorical = (Date.now() / 1000) - phase1BlockTimestamp > EIP_2935_BUFFER_SECONDS
+  // Gate on the OLDEST chunk: if any chunk is outside the ring, Helios would throw
+  // EIP-2935 for it — go straight to beacon verification, which covers recent chunks
+  // too (via the BeaconState rolling window).
+  const oldestTimestamp = Math.min(...phase1Results.map(r => r.blockTimestamp))
+  const blockIsHistorical = (Date.now() / 1000) - oldestTimestamp > EIP_2935_BUFFER_SECONDS
 
-  // Look up per-dapp proof cache (era Merkle proof) and chain-level era BSR cache.
+  // Look up per-dapp proof cache (era Merkle proofs, one per chunk) and chain-level
+  // era BSR cache. Old single-merklePath entries lack merklePaths — treated as a miss.
   const [proofCache, eraBsrCache] = await Promise.all([readProofCache(), readEraBsrCache()])
   const cachedEntry = proofCache[rawUrl]
-  const cachedProof: DappProofData | undefined = cachedEntry && (
-    parsed.target.type === 'tx' || cachedEntry.txHash.toLowerCase() === txHash.toLowerCase()
-  ) ? cachedEntry : undefined
+  const cachedProof: DappProofData | undefined = cachedEntry
+    && Array.isArray(cachedEntry.merklePaths)
+    && cachedEntry.merklePaths.length === phase1Results.length
+    && (parsed.target.type === 'tx' || cachedEntry.txHash.toLowerCase() === txHash.toLowerCase())
+    ? { merklePaths: cachedEntry.merklePaths } : undefined
   if (cachedProof) console.log('[w3] Dapp proof cache hit — skipping era file download')
 
   const beaconOptions = {
@@ -621,8 +593,7 @@ async function twoPhaseResolve(
     let update: VerificationUpdate
     try {
       const beacon = await verifyViaBeacon(
-        phase1BlockHash,
-        phase1BlockTimestamp,
+        phase1Results.map(r => ({ executionHash: r.blockHash, blockTimestamp: r.blockTimestamp })),
         chain.chainId,
         chain.consensusRpcs,
         heliosPromise,
@@ -638,11 +609,15 @@ async function twoPhaseResolve(
         eraBsrCache[chain.chainId] = beacon.newBsrCache
         writeEraBsrCache(eraBsrCache)
       }
+      // Every chunk's block object (the one whose calldata was rendered) is verified
+      // end-to-end: trie root, header keccak → blockhash (beacon-pinned above), tx hash.
       let trieVerified = false
       try {
-        const { txHash: verifiedTxHash } = await verifyTxInBlock(phase1BlockHash, phase1TxIndex, execRpcs, phase1Block)
-        if (verifiedTxHash.toLowerCase() !== txHash.toLowerCase())
-          throw new Error(`Tx hash mismatch at index ${phase1TxIndex}: block has ${verifiedTxHash}, expected ${txHash}`)
+        for (const r of phase1Results) {
+          const { txHash: verifiedTxHash } = await verifyTxInBlock(r.blockHash, r.txIndex, execRpcs, r.block)
+          if (verifiedTxHash.toLowerCase() !== r.txHash.toLowerCase())
+            throw new Error(`Tx hash mismatch at index ${r.txIndex}: block has ${verifiedTxHash}, expected ${r.txHash}`)
+        }
         trieVerified = true
       } catch (trieErr) {
         console.warn('[w3] Tx inclusion verification failed:', (trieErr as Error).message)
@@ -669,6 +644,7 @@ async function twoPhaseResolve(
         proof: {
           url: rawUrl, blockNumber: phase1BlockNumber, blockHash: phase1BlockHash, txHash,
           txIndex: phase1TxIndex, contentType, payloadSize: formatBytes(assembled.length),
+          chunks: proofChunks,
         },
       }
     } catch (beaconErr) {
@@ -680,6 +656,7 @@ async function twoPhaseResolve(
         proof: {
           url: rawUrl, blockNumber: phase1BlockNumber, blockHash: phase1BlockHash, txHash,
           txIndex: phase1TxIndex, contentType, payloadSize: formatBytes(assembled.length),
+          chunks: proofChunks,
         },
       }
     }
@@ -702,7 +679,18 @@ async function twoPhaseResolve(
     ]).catch(() => undefined)
     if (!heliosRpc) throw new Error('Helios not available (timeout or consensus RPC failure)')
     console.log('[w3] got RPC, heliosBacked:', heliosRpc.isHeliosBacked())
-    const result = await getVerifiedCalldata(txHash, heliosRpc)
+    // Verify EVERY chunk through Helios and bind the phase-1 rendered bytes to the
+    // Helios-verified calldata. Without the byte comparison, a fast RPC serving a
+    // self-consistent forgery in phase 1 would render forged content while phase 2
+    // green-lights the canonical tx at the same coordinates.
+    let result!: Awaited<ReturnType<typeof getVerifiedCalldataByLocation>>
+    for (let i = 0; i < phase1Results.length; i++) {
+      const p1 = phase1Results[i]
+      result = await getVerifiedCalldataByLocation(p1.blockNumber, p1.txIndex, heliosRpc)
+      if (!bytesEqual(result.calldata, p1.calldata))
+        throw new Error(`Rendered calldata mismatch: chunk ${i} (block ${p1.blockNumber}, tx ${p1.txIndex}) does not match Helios-verified calldata`)
+    }
+    console.log(`[w3] Helios verified ${phase1Results.length} chunk(s), rendered bytes bound ✓`)
 
     if (parsed.target.type === 'ens' && phase1EnsChunks.length > 0) {
       try {
@@ -735,8 +723,7 @@ async function twoPhaseResolve(
       console.log('[w3] Falling back to beacon chain verification for historical block')
       try {
         const beacon = await verifyViaBeacon(
-          phase1BlockHash,
-          phase1BlockTimestamp,
+          phase1Results.map(r => ({ executionHash: r.blockHash, blockTimestamp: r.blockTimestamp })),
           chain.chainId,
           chain.consensusRpcs,
           heliosRpc,
@@ -757,9 +744,11 @@ async function twoPhaseResolve(
         }
         let trieVerified2 = false
         try {
-          const { txHash: verifiedTxHash } = await verifyTxInBlock(phase1BlockHash, phase1TxIndex, execRpcs, phase1Block)
-          if (verifiedTxHash.toLowerCase() !== txHash.toLowerCase())
-            throw new Error(`Tx hash mismatch at index ${phase1TxIndex}: block has ${verifiedTxHash}, expected ${txHash}`)
+          for (const r of phase1Results) {
+            const { txHash: verifiedTxHash } = await verifyTxInBlock(r.blockHash, r.txIndex, execRpcs, r.block)
+            if (verifiedTxHash.toLowerCase() !== r.txHash.toLowerCase())
+              throw new Error(`Tx hash mismatch at index ${r.txIndex}: block has ${verifiedTxHash}, expected ${r.txHash}`)
+          }
           trieVerified2 = true
         } catch (trieErr) {
           console.warn('[w3] Tx inclusion verification failed:', (trieErr as Error).message)
@@ -778,7 +767,6 @@ async function twoPhaseResolve(
           heliosBacked: false,
           trieVerified: trieVerified2,
           beaconVerified: true,
-          beaconRpcs: beacon.agreedRpcs,
           beaconHeliosAnchored: beacon.heliosAnchored,
           beaconEraVerified: beacon.eraVerified,
           beaconStateHashVerified: beacon.stateHashVerified,
@@ -786,6 +774,7 @@ async function twoPhaseResolve(
           proof: {
             url: rawUrl, blockNumber: phase1BlockNumber, blockHash: phase1BlockHash, txHash,
             txIndex: phase1TxIndex, contentType, payloadSize: formatBytes(assembled.length),
+            chunks: proofChunks,
           },
         }
       } catch (beaconErr) {
@@ -797,6 +786,7 @@ async function twoPhaseResolve(
           proof: {
             url: rawUrl, blockNumber: phase1BlockNumber, blockHash: phase1BlockHash, txHash,
             txIndex: phase1TxIndex, contentType, payloadSize: formatBytes(assembled.length),
+            chunks: proofChunks,
           },
         }
       }
@@ -808,6 +798,7 @@ async function twoPhaseResolve(
         proof: {
           url: rawUrl, blockNumber: phase1BlockNumber, blockHash: phase1BlockHash, txHash,
           txIndex: phase1TxIndex, contentType, payloadSize: formatBytes(assembled.length),
+          chunks: proofChunks,
         },
       }
     }
@@ -883,7 +874,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
   if (msg.type === 'warmup-helios' && msg.chainId) {
     chrome.storage.sync.get('chains').then(stored => {
-      const chains: Record<number, ChainConfig> = stored.chains ?? DEFAULT_CHAINS
+      const chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
       const chain = chains[msg.chainId]
       if (chain && !chain.localMode) getOrCreateFreshRpc(chain)
     })
@@ -916,7 +907,7 @@ function ethRpcCall(chainId: number, method: string, params: unknown[]): Promise
 
 async function _ethRpcCall(chainId: number, cacheKey: string, method: string, params: unknown[]): Promise<{ result?: unknown; error?: string }> {
   const stored = await chrome.storage.sync.get('chains')
-  const chains: Record<number, ChainConfig> = stored.chains ?? DEFAULT_CHAINS
+  const chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
   const chain = chains[chainId]
   if (!chain) return { error: `No chain config for chainId ${chainId}` }
 

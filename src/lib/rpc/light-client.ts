@@ -1,5 +1,5 @@
 import { HeliosWasmClient } from './helios-wasm.js'
-import type { ChainConfig } from '../types.js'
+import type { ChainConfig } from '../../types.js'
 
 export interface IVerifiedRpc {
   request<T>(method: string, params: unknown[], quickFail?: boolean): Promise<T>
