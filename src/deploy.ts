@@ -57,11 +57,6 @@ const walletModalTitle = $('wallet-modal-title')
 
 folderInput.webkitdirectory = true
 
-$('open-settings').addEventListener('click', (e) => {
-  e.preventDefault()
-  chrome.tabs.create({ url: chrome.runtime.getURL('settings.html') })
-})
-
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -803,10 +798,57 @@ function startVerification() {
   })
   stepVerify.classList.remove('hidden')
   stepVerify.scrollIntoView({ behavior: 'smooth', block: 'start' })
-  runVerification()
+  verifyWhenReady()
 }
 
-retryVerify.addEventListener('click', () => runVerification())
+retryVerify.addEventListener('click', () => verifyWhenReady())
+
+// Helios's head trails the chain tip by roughly one block plus its poll interval
+// (measured: ~18-28s). We deploy and then verify after a single confirmation, so
+// the block we just landed in does not exist yet as far as Helios is concerned:
+// Mode 1 cannot fetch it and Mode 2's anchor is 'finalized' (~13 min back), so
+// every mode fails and the user is told to "retry shortly" for a race they cannot
+// see. Wait for Helios's verified head to actually reach the block first.
+async function waitForHeliosHead(target: number): Promise<boolean> {
+  const deadline = Date.now() + 4 * 60_000
+  let last = 0
+  while (Date.now() < deadline) {
+    let head = 0
+    try {
+      const resp = await chrome.runtime.sendMessage({
+        type: 'eth-rpc', chainId: chain!.chainId, method: 'eth_blockNumber', params: [],
+      }) as { result?: string; error?: string } | undefined
+      if (typeof resp?.result === 'string') head = parseInt(resp.result, 16)
+    } catch { /* service worker restarting — try again */ }
+
+    if (head >= target) return true
+
+    if (head && head !== last) {
+      last = head
+      const behind = target - head
+      setVerifyStatus('', `Waiting for the light client to reach block ${target} — ` +
+        `Helios is at ${head} (${behind} block${behind === 1 ? '' : 's'} behind)…`, true)
+    } else if (!head) {
+      setVerifyStatus('', 'Waiting for the Helios light client to finish syncing…', true)
+    }
+    await new Promise(r => setTimeout(r, 4_000))
+  }
+  return false
+}
+
+async function verifyWhenReady() {
+  retryVerify.classList.add('hidden')
+  verifyDetail.classList.add('hidden')
+  const target = Math.max(...coords.map(c => c.blockNumber))
+  setVerifyStatus('', `Waiting for the light client to reach block ${target}…`, true)
+
+  const caughtUp = await waitForHeliosHead(target)
+  if (!caughtUp) {
+    verifyFailed(`The light client did not reach block ${target} within 4 minutes.`)
+    return
+  }
+  runVerification()
+}
 
 function setVerifyStatus(cls: '' | 'ok' | 'warn' | 'fail', html: string, spin = false) {
   verifyStatus.className = cls
@@ -1010,6 +1052,15 @@ linkNameBtn.addEventListener('click', async () => {
     const connected = await ensureWallet(msg => setNameStatus('fail', msg))
     if (!connected) { setNameStatus('fail', 'A connected wallet is required to write the record.'); return }
   }
+
+  // Every call below (resolver lookup, ownerOf, setText) goes through the wallet,
+  // so it lands on whatever chain the WALLET is on — not the chain we deployed to.
+  // ensureChain only runs inside ensureWallet, which is skipped when an account is
+  // already connected from the deploy step, so a wallet sitting on mainnet would
+  // silently read mainnet ENS and write the record there while the coordinates
+  // point at Sepolia. Force the deploy chain before touching the registry.
+  if (!await ensureChain(msg => setNameStatus('fail', msg))) return
+
   let name: string
   try {
     name = ensNormalize(nameInput.value.trim())

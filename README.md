@@ -29,7 +29,7 @@ In the address bar, type `w3` + Tab, then enter a `ENS/GNS` name or `blockNumber
 
 ## Deploy a website to Ethereum
 
-**From the extension:** click **⬆ Deploy** in the popup — deployment flow and with a live preview.
+**From the extension:** click **⬆ Deploy** in the popup, follow deployment flow with a live preview.
 
 **From the CLI:**
 

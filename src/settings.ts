@@ -13,6 +13,13 @@ const defaultChainSel = document.getElementById('default-chain-select') as HTMLS
 const clearCacheBtn   = document.getElementById('clear-cache-btn') as HTMLButtonElement
 const cacheInfo       = document.getElementById('cache-info') as HTMLSpanElement
 
+// The FAQ is deployed as calldata under verum.gwei. Open it through the renderer
+// so it goes through the normal verified w3:// path, not an HTTP mirror.
+document.getElementById('faq-link')!.addEventListener('click', (e) => {
+  e.preventDefault()
+  chrome.tabs.create({ url: chrome.runtime.getURL('renderer.html') + '#w3://1:verum.gwei' })
+})
+
 async function updateCacheInfo() {
   const [local, sync, bytesInUse] = await Promise.all([
     chrome.storage.local.get(['dapp_proof_cache', 'era_bsr_cache']),

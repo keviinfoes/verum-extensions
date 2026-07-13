@@ -59,58 +59,28 @@
 <main>
   <header>
     <h1>Verum</h1>
-    <p>Websites stored as Ethereum calldata, verified by a light client in your browser.</p>
+    <p>Data and websites stored as Ethereum calldata, verified by a light client in your browser.</p>
   </header>
-
   <h2>Why calldata?</h2>
   <p>
-    Because it is the cheapest place to put bytes on Ethereum that the chain still commits to,
-    and because it is <strong>provable without trusting anyone</strong>.
+    Calldata is the cheapest data source on the Ethereum blockchain. It also allows submitting
+    large amounts of data per txt (up to txt gas limit). It is periodically pruned by non 
+    archive node, is only processed during transaction execution and is not persisted in the 
+    network's "state". Submitting large amounts of data to the network therefore incurs a 
+    significantly lower permanent storage burden. 
   </p>
   <p>
-    Every transaction is a leaf in its block's transaction trie, and the root of that trie is in
-    the block header. So a page's bytes can be proven to belong to a specific transaction, in a
-    specific block, on the canonical chain — by rebuilding the trie locally and checking the root
-    against a header that a light client verified against the beacon chain's sync committee.
-    No indexer, no gateway, no server is trusted at any point.
+    Calldata can be retrieved from local or external archive execution nodes and cryptographically 
+    verified against the Ethereum blockchain. The dependencie on archive nodes (or the portal network) 
+    indirectly incentivises users to run their own archive node for availability guarantees. 
+    Potentially strengthening the Ethereum network.
   </p>
-  <p>
-    Contract storage would also give you that, but you pay for a feature you do not need: storage
-    is readable <em>by other contracts</em>. A website is never read by the EVM. Calldata is data
-    the chain agrees on but the EVM never has to keep around — which is exactly what a static site is.
-  </p>
-
-  <h2>Why not ERC-4804 / web3:// ?</h2>
+  <h2>Why not ERC-4804?</h2>
   <p>
     <code>web3://</code> (ERC-4804, refined in ERC-6860) defines URLs that resolve to a
-    <strong>smart-contract call</strong>. The bytes usually live in contract <em>bytecode</em>
-    (the SSTORE2 / EthFS pattern: deploy data as a contract, read it back with
-    <code>EXTCODECOPY</code>). It is a good standard and solves a broader problem — Verum makes a
-    narrower trade.
+    <strong>smart-contract call</strong>. Since the data is stored as calldata ERC-4804 does not 
+    support it.
   </p>
-  <ul>
-    <li>
-      <strong>Cost.</strong> Bytecode costs an extra 200 gas per byte on top of the calldata you
-      already paid to submit it — ~5.4&times; more expensive than calldata today, and still
-      ~3.4&times; after Glamsterdam (see below).
-    </li>
-    <li>
-      <strong>Verification.</strong> Reading a <code>web3://</code> URL means an
-      <code>eth_call</code> — you need verified <em>state</em>, not just a verified transaction.
-      Most <code>web3://</code> access today goes through a gateway, and a gateway is a trusted
-      server. Verum verifies transaction inclusion, which needs only block headers.
-    </li>
-    <li>
-      <strong>Size limits.</strong> A contract caps at 24 KB (EIP-170), so anything larger is
-      split across many contracts. Verum splits across transactions instead, which is the same
-      idea without the deployment overhead.
-    </li>
-  </ul>
-  <p>
-    The honest trade: contract-stored data is readable <em>on-chain</em>. Calldata is not. If your
-    content must be consumed by another contract, use the ERC. If it is a website, it never will be.
-  </p>
-
   <h2>Why not IPFS?</h2>
   <p>
     IPFS gives you content addressing — a CID proves the bytes are the bytes. What it does not give
@@ -119,31 +89,17 @@
   <ul>
     <li>
       <strong>Availability is somebody's job.</strong> A CID resolves only while someone pins it.
-      Ethereum replicates your bytes across every node that keeps history, as a side effect of
-      consensus — nobody has to volunteer.
+      Ethereum replicates your bytes across every node that keeps history — nobody has to volunteer.
     </li>
     <li>
-      <strong>Most IPFS is really a gateway.</strong> In practice content is fetched through
-      <code>ipfs.io</code> or Cloudflare, and then you are trusting an HTTPS server again — the
-      exact thing the CID was supposed to remove.
-    </li>
-    <li>
-      <strong>Naming still lands on-chain.</strong> The usual setup is an ENS record pointing at a
-      CID — so you already depend on Ethereum for the pointer. Verum drops the second system and
+      <strong>Naming still lands on-chain.</strong> When using an ENS record pointing at a
+      CID you already depend on Ethereum for the pointer. Verum drops the second system and
       points at the data directly.
     </li>
   </ul>
-  <div class="note">
-    Verum is not "better than IPFS" — it is a different bet. IPFS optimises for large content and
-    cheap distribution. Verum optimises for small content that must be verifiable and permanent
-    without asking anyone to keep hosting it.
-  </div>
-
   <h2>What data?</h2>
   <p>
-    A transaction to a burn address (<code>0x…57334653</code> — "W3FS" in ASCII, no known private
-    key), carrying zero ETH, whose calldata is the file. The payload is gzipped and prefixed with a
-    small header:
+    Any data can be deployed. The payload is gzipped and prefixed with a small header:
   </p>
   <ul>
     <li>magic <code>W3FS</code>, version, content-type, compression</li>
@@ -151,82 +107,67 @@
     <li>the compressed bytes</li>
   </ul>
   <p>
-    A whole site (HTML, CSS, JS, images) is packed into a single bundle, gzipped, then split into
-    ~125 KB chunks — one transaction each. The URL is just the coordinates:
-    <code>w3://&lt;block&gt;:&lt;txIndex&gt;</code>. A name (<code>.eth</code> or
-    <code>.gwei</code>) is optional sugar: a <code>w3</code> text record holding
-    <code>[[block, txIndex], …]</code>.
+   Verum loads websites (including Dapps) in the browsers. Known file types are also loaded in 
+   the browser. Unknown file types are provided with a download link.
   </p>
-  <p>
-    Nothing is written to contract storage. Nothing is registered anywhere. Deployment is one
-    transaction that stores nothing and calls nothing.
-  </p>
-
   <h2>What does it cost to deploy?</h2>
   <p>
-    Gas per byte of gzipped data. Calldata is getting more expensive: Pectra (EIP-7623) introduced a
-    <em>floor</em> price for transactions that carry data but do no work, taking calldata from 16 to
-    40 gas per byte. <strong>Glamsterdam</strong> raises that floor again — EIP-7976 sets it to
-    <strong>64 gas per calldata byte</strong>, zero and non-zero alike, to cap worst-case block size
-    and push bulk data toward blobs.
+    Execution and data have different gas rates. A deployment is a transaction that only carries data. 
   </p>
   <table>
     <thead>
-      <tr><th>Storage</th><th>Now (post-Pectra)</th><th>After Glamsterdam</th></tr>
+      <tr><th></th><th>zero byte</th><th>non-zero byte</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Standard (execution)</td><td>4</td><td>16</td></tr>
+      <tr><td>EIP-7623 floor (data-only)</td><td class="win">10</td><td class="win">40</td></tr>
+      <tr><td>EIP-7976 floor</td><td>64</td><td>64</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Compressed data is almost entirely non-zero, deployment effectively pays the
+    non-zero column.
+  </p>
+  <table>
+    <thead>
+      <tr><th>Storage</th><th>Current</th><th>EIP-7976</th></tr>
     </thead>
     <tbody>
       <tr><td>Calldata (Verum)</td><td class="win">40 gas/byte</td><td class="win">64 gas/byte</td></tr>
-      <tr><td>Contract bytecode (EthFS)</td><td>216 gas/byte</td><td>216 gas/byte</td></tr>
+      <tr><td>Contract bytecode</td><td>216 gas/byte</td><td>216 gas/byte</td></tr>
       <tr><td><em>ratio</em></td><td>5.4&times;</td><td>3.4&times;</td></tr>
     </tbody>
   </table>
   <p>
-    Calldata gets <strong>60% dearer</strong>; bytecode is untouched, because at 200 gas per byte of
-    code deposit its <em>standard</em> cost already exceeds any floor. So the gap narrows from 5.4&times;
-    to 3.4&times;. Calldata stays the cheaper option — Glamsterdam just costs it some of its lead,
-    exactly as Pectra did.
+    A full interactive website — <em>300 KB compressed</em> — deployed once:
   </p>
-  <p>One transaction, at 5 gwei:</p>
   <table>
     <thead>
-      <tr><th>Content</th><th>Calldata now</th><th>Calldata after</th><th>Bytecode</th></tr>
+      <tr><th>Gas price</th><th>Calldata now</th><th>Calldata EIP-7976</th><th>Bytecode</th></tr>
     </thead>
     <tbody>
-      <tr><td>This page (3.9 KB gz)</td><td class="win">0.0009 ETH</td><td class="win">0.0014 ETH</td><td>0.0044 ETH</td></tr>
-      <tr><td>20 KB page (7 KB gz)</td><td class="win">0.0015 ETH</td><td class="win">0.0023 ETH</td><td>0.0077 ETH</td></tr>
-      <tr><td>200 KB site (60 KB gz)</td><td class="win">0.0121 ETH</td><td class="win">0.0193 ETH</td><td>0.0649 ETH</td></tr>
+      <tr><td>0.1 gwei</td><td class="win">0.0012 ETH</td><td class="win">0.0019 ETH</td><td>0.0065 ETH</td></tr>
+      <tr><td>1 gwei</td><td class="win">0.0121 ETH</td><td class="win">0.0193 ETH</td><td>0.0649 ETH</td></tr>
+      <tr><td>10 gwei</td><td class="win">0.1206 ETH</td><td class="win">0.1926 ETH</td><td>0.6486 ETH</td></tr>
     </tbody>
   </table>
   <p>
-    Paid once. There is no rent, no renewal, and no pinning bill.
+    These cost are paid once. There is no rent, no renewal, and no pinning bill. With the low gasprice from Ethereum scaling
+    a full website deployment can cost as less as ~1 dollar (@0.1 gwei).
   </p>
-  <div class="note">
-    EIP-7976 is still in peer review and its number has already moved once (15/60 before 64/64), so
-    treat the Glamsterdam column as the current proposal rather than a settled fact. The direction of
-    travel is not in doubt: calldata keeps getting pricier, and every such repricing narrows —
-    without closing — the gap to contract storage.
-  </div>
-
-  <h2>What is the catch?</h2>
+  <h2>Effect of history expiry (EIP-4444)?</h2>
   <p>
-    Two, stated plainly.
+    Nodes are expected to stop serving old history as part of <strong>History expiry (EIP-4444)</strong>.
+    Calldata is not lost. It is in era files, archives and the Portal Network. Fetching a
+    years-old page may mean going to those, not to an RPC. Verum already supports: era files,
+    the Portal Network, and a local archive node.
   </p>
-  <ul>
-    <li>
-      <strong>History expiry (EIP-4444).</strong> Nodes are expected to stop serving old history.
-      Calldata is not lost — it is in era files, archives and the Portal Network — but fetching a
-      years-old page may mean going to those, not to an RPC. Verum already does this: era files,
-      the Portal Network, and a beacon-chain Merkle proof back to a light-client-verified anchor.
-    </li>
-    <li>
-      <strong>Contracts cannot read it.</strong> Calldata is invisible to the EVM. This is precisely
-      why it is cheap, and precisely why the ERC exists. For a website it costs you nothing.
-    </li>
-  </ul>
-
   <footer>
     Verum is a Chrome extension. It verifies every byte it renders against Ethereum consensus
-    using a Helios light client — no RPC, gateway, or indexer is trusted.
+    using a Helios light client — no RPC, gateway, or indexer is trusted. When running a 
+    portal network node or local archive node in addition to verified the data is guaranteed 
+    available to the user.
+
     This page is itself stored as calldata on Ethereum mainnet.
   </footer>
 </main>

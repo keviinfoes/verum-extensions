@@ -24,6 +24,11 @@ dist/
 scripts/dapp_multi_file/
 scripts/test-bundle/
 
+# Strawmap: the builder and everything it exports from the Google Drawing
+scripts/build-strawmap.js
+scripts/strawmap/
+scripts/.strawmap-tmp/
+
 # Logs
 *.log
 npm-debug.log*

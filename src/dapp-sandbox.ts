@@ -116,15 +116,23 @@ return '<scr' + 'ipt>(function(){' +
     '}' +
   '});' +
   // External link interceptor: open http/https links in a new tab; route w3:// links through the extension.
+  // On an SVG <a>, .href is an SVGAnimatedString (not a string) — reading it directly
+  // made new URL() throw, so links inside inline SVG fell through to default navigation
+  // and replaced the dapp frame. Take the string form for both HTML and SVG anchors.
   'document.addEventListener("click",function(e){' +
-    'var a=e.target.closest("a");if(!a||!a.href)return;' +
-    'try{var u=new URL(a.href);' +
+    'var t=e.target;' +
+    'var a=t.closest?t.closest("a"):null;' +
+    'if(!a&&t.parentNode){a=t.parentNode.closest?t.parentNode.closest("a"):null;}' +
+    'if(!a)return;' +
+    'var h=(typeof a.href==="string")?a.href:(a.href&&a.href.baseVal)||a.getAttribute("xlink:href")||a.getAttribute("href");' +
+    'if(!h)return;' +
+    'try{var u=new URL(h,"https://dapp.w3fs/");' +
       'if(u.hostname==="dapp.w3fs")return;' +
       'if(u.protocol==="w3:"){' +
-        'e.preventDefault();window.parent.postMessage({type:"w3-navigate",url:a.href},"*");return;' +
+        'e.preventDefault();window.parent.postMessage({type:"w3-navigate",url:h},"*");return;' +
       '}' +
       'if(u.protocol==="http:"||u.protocol==="https:"){' +
-        'e.preventDefault();window.open(a.href,"_blank");' +
+        'e.preventDefault();window.open(u.href,"_blank");' +
       '}' +
     '}catch(ex){}' +
   '},true);' +

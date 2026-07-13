@@ -16,6 +16,14 @@ body {
 header { max-width: 720px; margin: 0 auto 32px; }
 header h1 { font-size: 20px; color: var(--accent); margin-bottom: 6px; }
 header p  { color: var(--text-muted); font-size: 13px; }
+.header-links { margin-top: 4px; }
+.header-links a { color: var(--accent); text-decoration: none; }
+.header-links a:hover { text-decoration: underline; }
+.header-links code {
+  font-family: monospace; font-size: 12px; color: var(--text);
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 4px; padding: 1px 5px;
+}
 
 main { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
 
