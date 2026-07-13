@@ -24,6 +24,72 @@ const _proxyRpcs       = new Map<string, string[]>()  // sentinel key → rpcs
 const _proxyIdx        = new Map<string, number>()    // sentinel key → round-robin counter
 const _proxyBlacklist  = new Map<string, Set<string>>() // sentinel key → permanently broken RPCs
 
+const SLOTS_PER_PERIOD = 32 * 256  // 8192 — one sync-committee period
+
+// ---------------------------------------------------------------------------
+// light_client/updates repair
+//
+// Helios walks sync-committee periods in order: it applies the update for its
+// store period, then period+1, and so on. It requires the response to
+// /eth/v1/beacon/light_client/updates?start_period=P&count=N to be exactly the
+// updates for [P, P+N), ascending.
+//
+// Some providers (ethereum-beacon-api.publicnode.com today — and it is currently
+// the only reachable mainnet beacon endpoint) ignore both query parameters and
+// return a large, unordered dump instead: e.g. asking for start_period=1801&count=2
+// yields 211 updates whose periods run [1801, 1582, 1583, …, 1791]. Helios applies
+// 1801, sees 1582 next, and aborts the whole sync with "invalid sync committee
+// period" — Helios never initialises, so every verification mode fails.
+//
+// Rather than trust the provider, select the updates we asked for, deduplicate by
+// period, and return them in ascending order. A conformant provider is unaffected:
+// its response already satisfies the filter.
+// ---------------------------------------------------------------------------
+async function repairLightClientUpdates(res: Response, path: string): Promise<Response | null> {
+  let updates: unknown
+  try {
+    updates = await res.clone().json()
+  } catch {
+    return res  // SSZ or non-JSON body — pass through untouched
+  }
+  if (!Array.isArray(updates)) return res
+
+  const query = new URLSearchParams(path.split('?')[1] ?? '')
+  const start = Number(query.get('start_period'))
+  const count = Number(query.get('count'))
+  if (!Number.isFinite(start) || !Number.isFinite(count) || count <= 0) return res
+
+  const periodOf = (u: unknown): number => {
+    const d = (u as { data?: { signature_slot?: string }; signature_slot?: string })
+    const slot = Number(d?.data?.signature_slot ?? d?.signature_slot)
+    return Number.isFinite(slot) ? Math.floor(slot / SLOTS_PER_PERIOD) : NaN
+  }
+
+  const byPeriod = new Map<number, unknown>()
+  for (const u of updates) {
+    const p = periodOf(u)
+    if (!Number.isFinite(p) || p < start || p >= start + count) continue
+    if (!byPeriod.has(p)) byPeriod.set(p, u)
+  }
+
+  const selected = [...byPeriod.entries()].sort((a, b) => a[0] - b[0]).map(([, u]) => u)
+  if (selected.length === 0) return null  // nothing for the requested range — fail over
+
+  if (selected.length !== updates.length) {
+    console.log(`[w3] Helios consensus: light_client/updates returned ${updates.length} update(s) ` +
+      `for start_period=${start}&count=${count} — using the ${selected.length} in range, in order`)
+  }
+
+  const out = new Response(JSON.stringify(selected), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  })
+  // A constructed Response has url === "", and Helios's Rust side parses
+  // response.url() — an empty string aborts the sync with "url parse".
+  Object.defineProperty(out, 'url', { value: res.url })
+  return out
+}
+
 const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
 ;(globalThis as unknown as { fetch: typeof fetch }).fetch = async (
   input: RequestInfo | URL,
@@ -78,8 +144,17 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
             if (attempt < rpcs.length - 1) continue
             return res
           }
-          // Consensus REST responses are not JSON-RPC — no error body to inspect.
-          if (isCons) return res
+          // Consensus REST responses are not JSON-RPC — no error body to inspect,
+          // but the light-client updates endpoint needs repairing on some providers.
+          if (isCons) {
+            if (path.startsWith('/eth/v1/beacon/light_client/updates')) {
+              const repaired = await repairLightClientUpdates(res, path)
+              if (repaired) return repaired
+              // Provider returned nothing usable for the requested periods.
+              if (attempt < rpcs.length - 1) continue
+            }
+            return res
+          }
           // Peek at JSON-RPC envelope validity + errors in 200 responses.
           // Malformed/non-JSON bodies and responses missing both result and error
           // (some CDN edges and rate-limiters return HTML or truncated bodies with
@@ -103,28 +178,26 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
           if (json.error) {
             const msg = json.error.message ?? ''
             const isUnsupported = json.error.code === -32601
-            const isRateLimit =
-              json.error.code === -32005 || json.error.code === -32029 ||
-              json.error.code === -32050 || json.error.code === -32097 ||
-              /rate.?limit|request.?limit|too.?many.?request|quota.?exceed/i.test(msg)
-            // Any -32000 error from Helios's internal calls (eth_getProof, eth_call
-            // for block verification, etc.) triggers its ~60s execution backoff.
-            // Fail over on all of them — legitimate -32000 application errors from
-            // user-initiated eth_call reverts use code 3, not -32000.
-            // Code 3 "intrinsic gas too high" is Tenderly's quirk: it wraps
-            // validation failures in code 3 and Helios applies the same backoff.
-            const isExecFail = json.error.code === -32000 ||
-              (json.error.code === 3 &&
-              /intrinsic gas too high/i.test(msg))
+            // A genuine contract revert is a real answer — the provider did its
+            // job and Helios must see it. Geth-family nodes report reverts as
+            // code 3. Everything else (rate limits, -32000 exec failures, -32603
+            // internal errors, -32046 "cannot fulfill request" from the retired
+            // Cloudflare gateway, and any code we haven't seen yet) means THIS
+            // provider could not serve the request — so try the next one.
+            //
+            // Enumerating broken codes was the wrong default: an unlisted code
+            // fell through to Helios, which reads any execution error as "RPC
+            // broken" and enters a ~60s backoff, stalling sync entirely.
+            // Tenderly's code 3 "intrinsic gas too high" is a validation failure
+            // dressed up as a revert, so it's excluded from the revert case.
+            const isRevert = json.error.code === 3 && !/intrinsic gas too high/i.test(msg)
             if (isUnsupported) {
               // Provider permanently doesn't support this method — blacklist it
               // so it's never routed to again for this Helios instance.
               if (!_proxyBlacklist.has(proxyKey)) _proxyBlacklist.set(proxyKey, new Set())
               _proxyBlacklist.get(proxyKey)!.add(rpc)
-              if (attempt < rpcs.length - 1) continue
-            } else if (isRateLimit || isExecFail) {
-              if (attempt < rpcs.length - 1) continue
             }
+            if (!isRevert && attempt < rpcs.length - 1) continue
           }
           return res
         } catch {

@@ -132,6 +132,16 @@ interface RpcTx {
   blobVersionedHashes?: string[]
   chainId?: string
   yParity?: string
+  // EIP-7702 (type 4): each entry delegates an EOA's code to `address`.
+  authorizationList?: {
+    chainId: string
+    address: string
+    nonce: string
+    yParity?: string
+    v?: string
+    r: string
+    s: string
+  }[]
 }
 
 // Strip leading zeros from a hex number for RLP (keeps 0x → empty, 0x0 → empty)
@@ -153,6 +163,20 @@ function accessListRlp(list: RpcTx['accessList'] = []): unknown[] {
   return list.map((item) => [
     getBytes(item.address),
     item.storageKeys.map((k) => getBytes(k)),
+  ])
+}
+
+// EIP-7702 authorization tuple: [chain_id, address, nonce, y_parity, r, s].
+// chain_id 0 is legal (the authorization is valid on any chain) and RLP-encodes
+// as empty bytes, which h() already produces.
+function authorizationListRlp(list: RpcTx['authorizationList'] = []): unknown[] {
+  return list.map((a) => [
+    h(a.chainId),
+    getBytes(a.address),
+    h(a.nonce),
+    h(a.yParity ?? a.v),
+    h(a.r),
+    h(a.s),
   ])
 }
 
@@ -182,6 +206,15 @@ function serializeTx(tx: RpcTx): Uint8Array {
       encodeRlp([h(tx.chainId), h(tx.nonce), h(tx.maxPriorityFeePerGas), h(tx.maxFeePerGas), h(tx.gas), addr(tx.to), h(tx.value), getBytes(tx.input), accessListRlp(tx.accessList) as Parameters<typeof encodeRlp>[0], h(tx.maxFeePerBlobGas), (tx.blobVersionedHashes ?? []).map(bv => getBytes(bv)), yParity, h(tx.r), h(tx.s)]),
     )
     return concat([new Uint8Array([0x03]), inner])
+  }
+  // EIP-7702 set-code transaction (Pectra). MetaMask's smart accounts send these,
+  // and one anywhere in a block breaks the whole trie rebuild if unhandled.
+  // Same fields as type 2 plus authorization_list before the signature.
+  if (type === 4) {
+    const inner = getBytes(
+      encodeRlp([h(tx.chainId), h(tx.nonce), h(tx.maxPriorityFeePerGas), h(tx.maxFeePerGas), h(tx.gas), addr(tx.to), h(tx.value), getBytes(tx.input), accessListRlp(tx.accessList) as Parameters<typeof encodeRlp>[0], authorizationListRlp(tx.authorizationList) as Parameters<typeof encodeRlp>[0], yParity, h(tx.r), h(tx.s)]),
+    )
+    return concat([new Uint8Array([0x04]), inner])
   }
   throw new Error(`Unsupported tx type: ${type}`)
 }

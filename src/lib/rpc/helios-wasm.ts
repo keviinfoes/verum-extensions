@@ -107,12 +107,50 @@ export class HeliosWasmClient implements IVerifiedRpc {
       hint ? 'live finalized root' : 'no checkpoint hint')
   }
 
+  // Slots per epoch — light-client bootstrap data is indexed per epoch boundary.
+  private static readonly SLOTS_PER_EPOCH = 32
+
+  // Returns a finalized checkpoint root that light_client/bootstrap will actually
+  // serve.
+  //
+  // /headers/finalized returns the finalized checkpoint, whose root is the last
+  // block at *or before* the epoch-boundary slot. When that boundary slot is
+  // empty (a skipped proposal), the root belongs to a block at a non-boundary
+  // slot — and beacon nodes only index bootstrap data for blocks sitting exactly
+  // on a boundary. Bootstrapping from it fails with:
+  //   404 NOT_FOUND: Sync committee branch for block root 0x… not found. This
+  //   typically occurs when the block is not a finalized checkpoint.
+  // which kills Helios init outright (and with it the whole verification path).
+  // It's intermittent: it only bites when the boundary proposal was skipped.
+  //
+  // So when the finalized root isn't on a boundary, walk back over earlier
+  // boundary slots until one has a block. An older finalized checkpoint is still
+  // a valid, still-finalized starting point — Helios syncs forward from it.
   static async fetchFinalizedRoot(consensusRpc: string): Promise<string | undefined> {
     try {
       const res = await fetch(`${consensusRpc}/eth/v1/beacon/headers/finalized`)
       if (!res.ok) return undefined
-      const json = await res.json() as { data: { root: string } }
-      return json.data?.root
+      const json = await res.json() as {
+        data?: { root?: string; header?: { message?: { slot?: string } } }
+      }
+      const root = json.data?.root
+      const slot = Number(json.data?.header?.message?.slot)
+      if (!root) return undefined
+      if (!Number.isFinite(slot) || slot % HeliosWasmClient.SLOTS_PER_EPOCH === 0) return root
+
+      // Boundary slot was skipped — find the most recent boundary that has a block.
+      let boundary = slot - (slot % HeliosWasmClient.SLOTS_PER_EPOCH)
+      for (let i = 0; i < 8 && boundary > 0; i++, boundary -= HeliosWasmClient.SLOTS_PER_EPOCH) {
+        const r = await fetch(`${consensusRpc}/eth/v1/beacon/headers/${boundary}`)
+        if (!r.ok) continue  // no block at this boundary either — step back an epoch
+        const j = await r.json() as { data?: { root?: string } }
+        if (j.data?.root) {
+          console.log(`[w3] Helios: finalized checkpoint at slot ${slot} is off-boundary ` +
+            `(skipped proposal) — bootstrapping from boundary slot ${boundary} instead`)
+          return j.data.root
+        }
+      }
+      return root  // give up; trySync's fallbacks still get a chance
     } catch {
       return undefined
     }
@@ -128,14 +166,20 @@ export class HeliosWasmClient implements IVerifiedRpc {
     const execHost = executionRpc.includes('.invalid') ? 'proxy' : new URL(executionRpc).hostname
     const tag = `[w3] Helios (exec=${execHost})`
     console.log(`${tag} creating provider (${checkpointLabel})`)
-    // 'memory' is not a documented dbType (only "localstorage" | "config" are) — it
-    // was passing an unrecognized string straight into the WASM constructor. Use the
-    // real "localstorage" option: Helios's own Rust code already detects when
-    // localStorage is unavailable (true in a service worker) and falls back to
-    // in-memory checkpoint storage on its own, logging "Helios: localStorage
-    // unavailable, falling back to in-memory checkpoint storage".
+    // dbType is how Helios persists its own checkpoint between runs. Only
+    // "localstorage" and "config" exist. localStorage does not exist in a service
+    // worker, so "localstorage" made Helios log
+    //   "Helios: localStorage unavailable, falling back to in-memory checkpoint storage"
+    // and fall back to a store that dies with the worker — i.e. it never persisted
+    // anything anyway.
+    //
+    // "config" is the honest description of what we actually do: we persist the
+    // checkpoint ourselves in chrome.storage.session (see saveCheckpoint /
+    // fetchFinalizedRoot) and hand it in via `checkpoint` on every start. Helios
+    // then reads the checkpoint from config and stops pretending it has a DB.
+    // Same behaviour, minus the misleading warning.
     const provider = await createHeliosProvider(
-      { network, consensusRpc, executionRpc, dbType: 'localstorage', checkpoint },
+      { network, consensusRpc, executionRpc, dbType: 'config', checkpoint },
       'ethereum',
     )
     const t1 = Date.now()

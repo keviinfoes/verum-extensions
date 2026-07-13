@@ -1,5 +1,5 @@
-import { DEFAULT_CHAINS } from './types.js'
-import type { ChainConfig } from './types.js'
+import { DEFAULT_CHAINS, DEFAULT_DEV_SETTINGS } from './types.js'
+import type { ChainConfig, EraSource, StateSource, ForceMode } from './types.js'
 
 const chainsEl           = document.getElementById('chains') as HTMLDivElement
 const toast              = document.getElementById('saved-toast') as HTMLDivElement
@@ -76,6 +76,43 @@ clearCacheBtn.addEventListener('click', async () => {
 })
 
 updateCacheInfo()
+
+// Developer mode ---------------------------------------------------------------
+// Pins the Mode 2 sources. Stored in sync alongside chains/defaultChain; the
+// background reads them per resolve, so changes apply to the next navigation
+// without reloading the extension.
+
+const devModeCb   = document.getElementById('dev-mode') as HTMLInputElement
+const devOptions  = document.getElementById('dev-options') as HTMLDivElement
+const forceModeEl = document.getElementById('force-mode') as HTMLSelectElement
+const eraSourceEl = document.getElementById('era-source') as HTMLSelectElement
+const stateSrcEl  = document.getElementById('state-source') as HTMLSelectElement
+
+async function loadDevSettings() {
+  const s = await chrome.storage.sync.get(['devMode', 'forceMode', 'eraSource', 'stateSource'])
+  devModeCb.checked  = (s.devMode as boolean | undefined) ?? DEFAULT_DEV_SETTINGS.devMode
+  forceModeEl.value  = (s.forceMode as string | undefined) ?? DEFAULT_DEV_SETTINGS.forceMode
+  eraSourceEl.value  = (s.eraSource as string | undefined) ?? DEFAULT_DEV_SETTINGS.eraSource
+  stateSrcEl.value   = (s.stateSource as string | undefined) ?? DEFAULT_DEV_SETTINGS.stateSource
+  devOptions.classList.toggle('hidden', !devModeCb.checked)
+}
+
+function saveDevSettings() {
+  devOptions.classList.toggle('hidden', !devModeCb.checked)
+  chrome.storage.sync.set({
+    devMode: devModeCb.checked,
+    forceMode: forceModeEl.value as ForceMode,
+    eraSource: eraSourceEl.value as EraSource,
+    stateSource: stateSrcEl.value as StateSource,
+  }).then(showToast)
+}
+
+devModeCb.addEventListener('change', saveDevSettings)
+forceModeEl.addEventListener('change', saveDevSettings)
+eraSourceEl.addEventListener('change', saveDevSettings)
+stateSrcEl.addEventListener('change', saveDevSettings)
+
+loadDevSettings()
 
 // Per-domain permission banners -----------------------------------------------
 

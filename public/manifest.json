@@ -6,9 +6,7 @@
   "description": "Browse w3:// dapps stored as calldata on Ethereum, verified by Helios light client",
   "permissions": [
     "tabs",
-    "storage",
-    "webNavigation",
-    "activeTab"
+    "storage"
   ],
   "optional_host_permissions": ["<all_urls>"],
   "host_permissions": [
@@ -21,7 +19,9 @@
     "*://*.lightclientdata.org/*",
     "*://*.drpc.org/*",
     "*://*.ankr.com/*",
-    "*://cloudflare-eth.com/*",
+    "*://*.mevblocker.io/*",
+    "*://*.blastapi.io/*",
+    "*://*.tenderly.co/*",
     "*://*.ethpandaops.io/*",
     "*://*.ethstaker.cc/*",
     "*://*.sigp.io/*",

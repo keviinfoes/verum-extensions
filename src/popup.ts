@@ -22,6 +22,10 @@ document.getElementById('settings-btn')!.addEventListener('click', () => {
   chrome.tabs.create({ url: chrome.runtime.getURL('settings.html') })
 })
 
+document.getElementById('deploy-btn')!.addEventListener('click', () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL('deploy.html') })
+})
+
 // Re-render when background updates the proof (e.g. Helios finishes verifying)
 chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
   if (!tab?.id) return

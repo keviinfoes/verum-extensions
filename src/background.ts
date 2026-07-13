@@ -8,15 +8,31 @@ import { resolveEns } from './lib/w3/name-resolver.js'
 import type { TxRef } from './lib/w3/name-resolver.js'
 import { verifyViaBeacon, isEip2935Error } from './lib/verify/beacon-verifier.js'
 import type { DappProofData, EraBsrCache } from './lib/verify/beacon-verifier.js'
-import { DEFAULT_CHAINS } from './types.js'
-import type { BgMessage, BgResponse, VerificationUpdate, ChainConfig, VerificationResult } from './types.js'
+import { DEFAULT_CHAINS, DEFAULT_DEV_SETTINGS } from './types.js'
+import type { BgMessage, BgResponse, VerificationUpdate, ChainConfig, VerificationResult, DevSettings, EraSource, StateSource, ForceMode } from './types.js'
 import { listWallets, ethRequest as walletRequest } from './lib/wallets/metamask-bridge.js'
 import { isFrameAvailable, frameRequest } from './lib/wallets/frame-bridge.js'
 import type { IVerifiedRpc } from './lib/rpc/light-client.js'
 
-const BUILD_ID = 'trim-exec-proxy-logs-2026-07-10T51'
+const BUILD_ID = 'helios-dbtype-config-2026-07-13T67'
 
 console.log(`[w3] background build ${BUILD_ID}`)
+
+// Lag (seconds behind) at which an OOS instance is considered unrecoverable and
+// the WASM is torn down and re-synced, rather than re-probed in place.
+//
+// This was 30s, which is *inside* normal drift: Helios's head age is the time
+// since the last block's timestamp, so it climbs between blocks and resets when
+// one lands. Measured steady-state peaks are ~28s on mainnet and ~49s on Sepolia
+// (which has skipped slots) — both perfectly healthy. Helios itself only reports
+// OOS past 60s. So a lag of 30-60s at the moment OOS fires is a transient blip
+// that the next optimistic update (~12s away) heals on its own; evicting there
+// threw away a healthy instance, and the replacement started behind and tripped
+// OOS again — a restart loop that looked like "Helios OOS immediately".
+// Only a lag far outside that envelope indicates the WASM is genuinely wedged in
+// internal backoff. Persistent-but-smaller lag is still caught by the
+// oosExhaustionCount path, which restarts after 2 full failed probe cycles.
+const OOS_RESTART_LAG_SECONDS = 150
 
 const rpcCache = new Map<number, Promise<IVerifiedRpc>>()
 
@@ -112,6 +128,18 @@ async function readEraBsrCache(): Promise<Record<number, EraBsrCache>> {
   return (era_bsr_cache as Record<number, EraBsrCache>) ?? {}
 }
 
+// Dev settings (settings page). Absent keys fall back to the shipped defaults,
+// which are all 'auto' — i.e. exactly the normal behaviour.
+async function readDevSettings(): Promise<DevSettings> {
+  const stored = await chrome.storage.sync.get(['devMode', 'forceMode', 'eraSource', 'stateSource'])
+  return {
+    devMode:     (stored.devMode as boolean | undefined) ?? DEFAULT_DEV_SETTINGS.devMode,
+    forceMode:   (stored.forceMode as ForceMode | undefined) ?? DEFAULT_DEV_SETTINGS.forceMode,
+    eraSource:   (stored.eraSource as EraSource | undefined) ?? DEFAULT_DEV_SETTINGS.eraSource,
+    stateSource: (stored.stateSource as StateSource | undefined) ?? DEFAULT_DEV_SETTINGS.stateSource,
+  }
+}
+
 function writeEraBsrCache(cache: Record<number, EraBsrCache>): void {
   chrome.storage.local.set({ era_bsr_cache: cache }).catch(() => {})
 }
@@ -132,11 +160,13 @@ function getOrCreateRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
       }, 60_000)
     })
     rpcCache.set(chain.chainId, p)
-    // Kick off the fresh cache so it starts waiting for a new block in parallel.
-    // Deferred: getOrCreateFreshRpc sets freshRpcCache synchronously before calling
-    // getOrCreateRpc, so a direct call here would be re-entrant and find freshRpcCache
-    // empty — creating a second orphaned probe that runs in parallel with the real one.
-    setTimeout(() => getOrCreateFreshRpc(chain), 0)
+    // The fresh instance (OOS probe + keepalive restarts) exists only to serve dapp
+    // eth_call reads. It is NOT spawned here: a static page needs Helios once, to
+    // verify its calldata, and then nothing more — spawning the fresh probe for it
+    // meant a permanent OOS/restart loop for a page that never makes a call.
+    // It is created on demand instead: by ethRpcCall, or by the renderer's
+    // warmup-helios / keepalive messages, both of which only fire for pages with
+    // scripts. See getOrCreateFreshRpc callers.
   }
   return rpcCache.get(chain.chainId)!
 }
@@ -305,10 +335,17 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 
   if (port.name === 'helios-keepalive') {
-    // Ping arrives every 20s from the renderer. Use it to health-check Helios:
+    // Ping arrives every 10s from the renderer. Use it to health-check Helios:
     // one WASM eth_blockNumber call (no public RPC — Helios serves from its
     // internal cached head). If OOS, re-probe early before the dapp reads.
-    port.onMessage.addListener(async () => {
+    //
+    // The port itself is what keeps the service worker alive, so it stays open for
+    // every page. But the health-check/restart work below is skipped unless the
+    // page actually has scripts that can make eth calls (needsEth) — a plain HTML
+    // page has nothing to serve, and probing for it kept a Helios instance in a
+    // permanent OOS/restart cycle for no reason.
+    port.onMessage.addListener(async (msg) => {
+      if (!(msg as { needsEth?: boolean } | undefined)?.needsEth) return
       const stored = await chrome.storage.sync.get('chains')
       const chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
       for (const chain of Object.values(chains)) {
@@ -323,11 +360,10 @@ chrome.runtime.onConnect.addListener((port) => {
               if (freshRpcReady.get(chain.chainId) === rpc) {
                 const lagStr = (err.message as string).match(/(\d+) seconds? behind/)?.[1] ?? '?'
                 const lag = Number(lagStr)
-                // If execution head is already far behind when keepalive detects OOS,
-                // the WASM is in internal backoff — re-probing the same instance won't
-                // help since it won't make execution fetch calls during backoff.
-                // Force a full WASM restart so a fresh instance starts immediately.
-                const forceRestart = lag >= 30
+                // Only a lag far outside normal drift means the WASM is wedged in
+                // internal backoff (see OOS_RESTART_LAG_SECONDS). Anything smaller
+                // gets a cheap re-probe — Helios self-heals on the next update.
+                const forceRestart = lag >= OOS_RESTART_LAG_SECONDS
                 console.warn(`[w3] Helios keepalive OOS (${lagStr}s behind)${forceRestart ? ' — lag too large, forcing WASM restart' : ' — starting re-probe'}`)
                 freshRpcReady.delete(chain.chainId)
                 freshRpcCache.delete(chain.chainId)
@@ -576,17 +612,46 @@ async function twoPhaseResolve(
     ? { merklePaths: cachedEntry.merklePaths } : undefined
   if (cachedProof) console.log('[w3] Dapp proof cache hit — skipping era file download')
 
+  // Dev mode: pin the era block_roots source and/or the BeaconState source.
+  // Off (or 'auto') leaves the normal fallback/race behaviour untouched.
+  const dev = await readDevSettings()
+  if (dev.devMode && (dev.forceMode !== 'auto' || dev.eraSource !== 'auto' || dev.stateSource !== 'auto')) {
+    console.log(`[w3] Dev mode — mode: ${dev.forceMode}, era source: ${dev.eraSource}, BeaconState source: ${dev.stateSource}`)
+    if (dev.forceMode !== 'beacon' && (dev.eraSource !== 'auto' || dev.stateSource !== 'auto') && !blockIsHistorical) {
+      console.warn('[w3] Dev mode — target is a recent block, so Mode 1 (Helios) will handle it and the ' +
+        'era / BeaconState sources will NOT be used. Set mode to "beacon" to force Mode 2.')
+    }
+  }
+
+  // A cached proof or BSR skips the download the dev is trying to exercise, so a
+  // pinned source also bypasses both caches — otherwise selecting e.g. parquet
+  // would silently verify from cache and never touch parquet at all.
+  const pinned = dev.devMode && (dev.eraSource !== 'auto' || dev.stateSource !== 'auto')
+  if (pinned && (cachedProof || eraBsrCache[chain.chainId])) {
+    console.log('[w3] Dev mode — bypassing proof/BSR cache so the pinned source actually runs')
+  }
+
   const beaconOptions = {
     checkpointUrls: chain.checkpointUrls,
     eraFileUrls: chain.localMode ? [] : chain.eraFileUrls,
     parquetUrls: chain.localMode ? [] : chain.parquetUrls,
     rpcBatchSizes: execBatchSizes,
-    cachedProof,
-    eraBsrCache: eraBsrCache[chain.chainId],
+    cachedProof: pinned ? undefined : cachedProof,
+    eraBsrCache: pinned ? undefined : eraBsrCache[chain.chainId],
+    eraSource: dev.devMode ? dev.eraSource : 'auto' as const,
+    stateSource: dev.devMode ? dev.stateSource : 'auto' as const,
   }
 
-  if (blockIsHistorical && chain.consensusRpcs.length > 0) {
-    console.log('[w3] Mode 2 — Historical block, beacon-verified: oldest chunk outside Helios\'s EIP-2935 ring, starting Helios in parallel for the anchor')
+  // Dev mode can override the block-age gate. Without this, a recent target always
+  // takes Mode 1 and the era / BeaconState source pins below are unreachable.
+  const forceBeacon = dev.devMode && dev.forceMode === 'beacon'
+  const forceHelios = dev.devMode && dev.forceMode === 'helios'
+  const useBeacon = (blockIsHistorical || forceBeacon) && !forceHelios
+
+  if (useBeacon && chain.consensusRpcs.length > 0) {
+    console.log(forceBeacon && !blockIsHistorical
+      ? '[w3] Mode 2 — Historical block, beacon-verified: FORCED by dev mode (block is recent enough for Mode 1)'
+      : '[w3] Mode 2 — Historical block, beacon-verified: oldest chunk outside Helios\'s EIP-2935 ring, starting Helios in parallel for the anchor')
     // Pass Helios promise unawaited — verification runs immediately using fast consensus
     // anchor. Helios runs in parallel; its result is checked at the very end of
     // verifyViaBeacon to confirm the effective state root (heliosAnchored: true/false).
@@ -680,11 +745,22 @@ async function twoPhaseResolve(
   let heliosRpc: Awaited<ReturnType<typeof getOrCreateRpc>> | undefined
 
   try {
+    // Keep the rejection reason — swallowing it left "Helios not available" as
+    // the only clue for genuinely different failures (bootstrap 404, dead exec
+    // RPC, rate limit), which is not enough to act on.
+    let heliosInitErr: string | undefined
     heliosRpc = await Promise.race([
-      getOrCreateRpc(chain),
+      getOrCreateRpc(chain).catch((e: unknown) => {
+        heliosInitErr = (e as Error).message
+        return undefined
+      }),
       new Promise<undefined>(r => setTimeout(() => r(undefined), 35_000)),
-    ]).catch(() => undefined)
-    if (!heliosRpc) throw new Error('Helios not available (timeout or consensus RPC failure)')
+    ])
+    if (!heliosRpc) {
+      throw new Error(heliosInitErr
+        ? `Helios init failed — ${heliosInitErr}`
+        : 'Helios not available (35s timeout — still syncing or consensus RPC unreachable)')
+    }
     console.log('[w3] Mode 1 — got RPC, heliosBacked:', heliosRpc.isHeliosBacked())
     // Verify EVERY chunk through Helios and bind the phase-1 rendered bytes to the
     // Helios-verified calldata. Without the byte comparison, a fast RPC serving a
@@ -995,17 +1071,18 @@ async function _ethRpcCall(chainId: number, cacheKey: string, method: string, pa
       return { result }
     } catch (innerErr: any) {
       if ((innerErr?.message ?? '').includes('out of sync')) {
-        // Small lag: re-probe the existing instance — Helios usually self-heals and
-        // freshRpcReady gets re-set once eth_blockNumber succeeds. Lag ≥ 30s means
-        // the execution sync loop is in internal backoff and won't recover by probing;
-        // evict (shutdown + delete, never delete alone — a leaked instance's polling
-        // loops starve the SW event loop) so a fresh WASM starts immediately. Only
-        // the first concurrent OOS caller does this (the rest see undefined !== rpc
+        // Normal lag: re-probe the existing instance — Helios self-heals on the next
+        // optimistic update and freshRpcReady gets re-set once eth_blockNumber
+        // succeeds. Only a lag beyond OOS_RESTART_LAG_SECONDS means the execution
+        // sync loop is wedged in internal backoff and won't recover by probing;
+        // evict then (shutdown + delete, never delete alone — a leaked instance's
+        // polling loops starve the SW event loop) so a fresh WASM starts immediately.
+        // Only the first concurrent OOS caller does this (the rest see undefined !== rpc
         // once freshRpcReady is cleared).
         if (freshRpcReady.get(chain.chainId) === rpc) {
           const lagStr = (innerErr.message as string).match(/(\d+) seconds? behind/)?.[1] ?? '?'
           const lag = Number(lagStr)
-          const forceRestart = lag >= 30
+          const forceRestart = lag >= OOS_RESTART_LAG_SECONDS
           console.warn(`[w3] Helios OOS (${lagStr}s behind)${forceRestart ? ' — forcing WASM restart' : ' — starting re-probe'}`)
           freshRpcReady.delete(chain.chainId)
           freshRpcCache.delete(chain.chainId)

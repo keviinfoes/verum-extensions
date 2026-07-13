@@ -31,6 +31,46 @@
       <span id="cache-info"></span>
     </div>
 
+    <div id="dev-section">
+      <label class="dev-toggle">
+        <input type="checkbox" id="dev-mode" />
+        <span>Developer mode</span>
+      </label>
+      <div id="dev-options" class="hidden">
+        <div class="dev-row">
+          <label for="force-mode">Verification mode</label>
+          <select id="force-mode">
+            <option value="auto">Auto — Mode 1 if recent (&lt;27h), Mode 2 if older</option>
+            <option value="helios">Force Mode 1 — Helios only</option>
+            <option value="beacon">Force Mode 2 — beacon, even for recent blocks</option>
+          </select>
+          <p class="dev-hint">The sources below only run in Mode 2. A recent target takes Mode 1
+             unless you force Mode 2 here.</p>
+        </div>
+        <div class="dev-row">
+          <label for="era-source">Era <code>block_roots</code> source</label>
+          <select id="era-source">
+            <option value="auto">Auto — era file → parquet → exec headers</option>
+            <option value="era-file">Era file (nimbus era archives)</option>
+            <option value="parquet">Parquet (ethpandaops xatu)</option>
+            <option value="exec-headers">Exec headers (execution RPC)</option>
+          </select>
+        </div>
+        <div class="dev-row">
+          <label for="state-source">BeaconState source</label>
+          <select id="state-source">
+            <option value="auto">Auto — race consensus RPCs + checkpoint providers</option>
+            <option value="consensus-rpc">Consensus RPC only</option>
+            <option value="checkpoint">Checkpoint providers only</option>
+          </select>
+        </div>
+        <p class="dev-hint">The era source is only consulted for targets older than the BeaconState's
+           rolling <code>block_roots</code> window (8192 slots, ~27h) — newer slots are read straight
+           from the state. Era files and parquet also only exist for <em>completed</em> eras, so
+           pinning either on a block in the current era fails by design; use exec headers there.</p>
+      </div>
+    </div>
+
     <div id="saved-toast" class="hidden">Saved ✓</div>
   </main>
 

@@ -9,6 +9,7 @@
 
 import { sha256, getBytes, hexlify } from 'ethers'
 import type { IVerifiedRpc } from '../rpc/light-client.js'
+import type { EraSource, StateSource } from '../../types.js'
 import { computeBeaconBlockBodyRoot, verifyHistoricalSummariesFieldProof } from './ssz-state-verifier.js'
 import { timestampToSlot, slotToTimestamp, sszMerkleize, readU32LE, fetchWithTimeout } from './beacon-primitives.js'
 import { getBlockSummaryRoot } from './downloader/beacon-state.js'
@@ -248,6 +249,9 @@ export interface BeaconVerifyOptions {
   rpcBatchSizes?: Record<string, number>
   cachedProof?: DappProofData
   eraBsrCache?: EraBsrCache
+  // Dev mode: pin one source instead of the automatic fallback chain.
+  eraSource?: EraSource
+  stateSource?: StateSource
 }
 
 export interface BeaconVerification {
@@ -349,7 +353,7 @@ export async function verifyViaBeacon(
   if (!eraBsrHit) {
     const primaryHsIndex = historicalSummariesIndex(primary.era, chainId)
     const [stateSummary, primaryRange] = await Promise.all([
-      getBlockSummaryRoot(consensusRpcs, anchor.slot, anchor.stateRoot, primaryHsIndex, primary.era, chainId, slots.map(s => s.slot), options?.checkpointUrls),
+      getBlockSummaryRoot(consensusRpcs, anchor.slot, anchor.stateRoot, primaryHsIndex, primary.era, chainId, slots.map(s => s.slot), options?.checkpointUrls, options?.stateSource),
       findEraBlockRange(execRpcs, primary.era * 8192, chainId),
     ])
     if (stateSummary.blockSummaryRoot) bsrByEra.set(primary.era, stateSummary.blockSummaryRoot)
@@ -410,7 +414,33 @@ export async function verifyViaBeacon(
     const needExecHeaders = e + 1 >= currentEra
     const useEra     = options?.eraFileUrls === undefined || options.eraFileUrls.length > 0
     const useParquet = options?.parquetUrls === undefined || options.parquetUrls.length > 0
+    const forced = options?.eraSource && options.eraSource !== 'auto' ? options.eraSource : null
     let eraBlockRoots: Uint8Array[] | null = null
+
+    if (forced) {
+      // Dev mode: run exactly the requested source and let it fail if it can't
+      // serve this era — falling back would hide the thing being tested.
+      console.log(`[w3] Era ${e}: dev mode — forcing ${forced}`)
+      if (forced !== 'exec-headers' && needExecHeaders) {
+        throw new Error(
+          `Dev mode: era ${e} is too recent for ${forced} — era files and parquet are only ` +
+          `published once an era is complete (current era ${currentEra}). Use exec-headers, or auto.`,
+        )
+      }
+      if (forced === 'era-file') {
+        eraBlockRoots = await fetchEraBlockRootsFromEraFile(e + 1, chainId, bsr, options?.eraFileUrls)
+      } else if (forced === 'parquet') {
+        eraBlockRoots = await fetchEraBlockRootsFromParquet(e, chainId, bsr, options?.parquetUrls)
+      } else {
+        eraBlockRoots = await fetchEraBlockRootsFromExecHeaders(
+          execRpcs, e, chainId, bsr, range.startNum, range.endNum, options?.rpcBatchSizes,
+        )
+      }
+      if (!eraBlockRoots) throw new Error(`Dev mode: ${forced} could not supply block_roots for era ${e}`)
+      eraRootsByEra.set(e, eraBlockRoots)
+      continue
+    }
+
     if (!needExecHeaders && useEra) {
       eraBlockRoots = await fetchEraBlockRootsFromEraFile(e + 1, chainId, bsr, options?.eraFileUrls)
     }

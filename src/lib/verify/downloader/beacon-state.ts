@@ -5,6 +5,7 @@
 
 import { computeBeaconStateRoot } from '../ssz-state-verifier.js'
 import { readU32LE } from '../beacon-primitives.js'
+import type { StateSource } from '../../../types.js'
 
 // Checkpoint sync providers serve gzip-compressed BeaconState via the same debug endpoint.
 // Mainnet: ~136 MB compressed (vs ~313 MB uncompressed), ~39 s on a typical connection.
@@ -39,6 +40,7 @@ export async function getBlockSummaryRoot(
   chainId: number,
   targetSlots: number[],
   customCheckpointUrls?: string[],
+  stateSource: StateSource = 'auto',
 ): Promise<StateSummary> {
   const ctrl = new AbortController()
 
@@ -112,8 +114,25 @@ export async function getBlockSummaryRoot(
     return dlSlot
   }
 
-  const cpAttempts = checkpointRpcs.map(rpc => async () => attempt(rpc, await fetchLiveDlSlot(rpc)))
-  const cnAttempts = consensusRpcs.map(rpc => async () => attempt(rpc, await fetchLiveDlSlot(rpc)))
+  // Dev mode pins one side of the race so a failure there is visible instead of
+  // being masked by the other side winning.
+  const useCheckpoints = stateSource !== 'consensus-rpc'
+  const useConsensus   = stateSource !== 'checkpoint'
+  if (stateSource !== 'auto') {
+    console.log(`[w3] BeaconState: dev mode — forcing ${stateSource === 'checkpoint'
+      ? 'checkpoint providers' : 'consensus RPCs'} only`)
+  }
+
+  const cpAttempts = (useCheckpoints ? checkpointRpcs : [])
+    .map(rpc => async () => attempt(rpc, await fetchLiveDlSlot(rpc)))
+  const cnAttempts = (useConsensus ? consensusRpcs : [])
+    .map(rpc => async () => attempt(rpc, await fetchLiveDlSlot(rpc)))
+  if (cpAttempts.length === 0 && cnAttempts.length === 0) {
+    throw new Error(stateSource === 'auto'
+      ? 'No consensus RPC or checkpoint provider configured'
+      : `Dev mode: no ${stateSource === 'checkpoint' ? 'checkpoint provider' : 'consensus RPC'} configured for this chain`)
+  }
+
   const ordered: (() => Promise<StateSummary>)[] = []
   const len = Math.max(cpAttempts.length, cnAttempts.length)
   for (let i = 0; i < len; i++) {
@@ -148,6 +167,9 @@ export async function getBlockSummaryRoot(
     ctrl.abort()
     return result
   } catch {
-    throw new Error('Could not fetch and verify finalized state from any consensus RPC or checkpoint provider')
+    throw new Error(stateSource === 'auto'
+      ? 'Could not fetch and verify finalized state from any consensus RPC or checkpoint provider'
+      : `Dev mode: could not fetch and verify finalized state from any ${
+          stateSource === 'checkpoint' ? 'checkpoint provider' : 'consensus RPC'} (source pinned)`)
   }
 }

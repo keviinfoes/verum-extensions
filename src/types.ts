@@ -59,18 +59,28 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
     chainId: 1,
     name: 'Mainnet',
     consensusRpcs: [
-      'https://lodestar-mainnet.chainsafe.io',
       'https://ethereum-beacon-api.publicnode.com',
+      'https://lodestar-mainnet.chainsafe.io',
     ],
+    // Every entry is verified to serve what Helios needs: eth_call and
+    // eth_getProof at recent (finalized) blocks, plus JSON-RPC batching. Many
+    // public RPCs answer eth_call fine but reject eth_getProof outside the last
+    // ~128 blocks (-32602), which breaks Helios silently — so they are excluded.
+    // cloudflare-eth.com was removed entirely: the public gateway is retired and
+    // now answers every call with -32046 "Cannot fulfill request".
     rpcs: [
       'https://ethereum-rpc.publicnode.com',
-      'https://cloudflare-eth.com',
       'https://eth.drpc.org',
+      'https://rpc.mevblocker.io',
+      'https://eth-mainnet.public.blastapi.io',
+      'https://gateway.tenderly.co/public/mainnet',
     ],
     rpcBatchSizes: {
       'https://ethereum-rpc.publicnode.com': 200,
-      'https://cloudflare-eth.com': 200,
       'https://eth.drpc.org': 200,
+      'https://rpc.mevblocker.io': 200,
+      'https://eth-mainnet.public.blastapi.io': 200,
+      'https://gateway.tenderly.co/public/mainnet': 200,
     },
     checkpointUrls: [
       'https://beaconstate-mainnet.chainsafe.io',
@@ -114,6 +124,40 @@ export const DEFAULT_CHAINS: Record<number, ChainConfig> = {
       'https://data.ethpandaops.io/xatu/sepolia/databases/default/canonical_beacon_block',
     ],
   },
+}
+
+// ---------------------------------------------------------------------------
+// Developer mode — force a single source instead of the automatic strategy.
+// Normal operation ('auto') races/falls back across sources; forcing one makes
+// a strategy fail loudly instead of silently falling through to the next, which
+// is what you want when testing that strategy specifically.
+// Stored in chrome.storage.sync alongside `chains` / `defaultChain`.
+// ---------------------------------------------------------------------------
+
+// Where an era's 8192 block_roots come from (Mode 2, historical blocks).
+export type EraSource = 'auto' | 'era-file' | 'parquet' | 'exec-headers'
+
+// Where the finalized BeaconState is downloaded from (Mode 2).
+export type StateSource = 'auto' | 'consensus-rpc' | 'checkpoint'
+
+// Which verification mode runs. 'auto' picks by block age: blocks inside Helios's
+// EIP-2935 window (~27h) go to Mode 1, older ones to Mode 2. Forcing 'beacon' is
+// what makes the era / BeaconState sources above reachable for a recent block —
+// otherwise Mode 1 handles it and neither source is ever touched.
+export type ForceMode = 'auto' | 'helios' | 'beacon'
+
+export interface DevSettings {
+  devMode: boolean
+  forceMode: ForceMode
+  eraSource: EraSource
+  stateSource: StateSource
+}
+
+export const DEFAULT_DEV_SETTINGS: DevSettings = {
+  devMode: false,
+  forceMode: 'auto',
+  eraSource: 'auto',
+  stateSource: 'auto',
 }
 
 export interface WalletInfo {

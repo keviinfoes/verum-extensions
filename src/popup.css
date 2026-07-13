@@ -70,10 +70,10 @@ body {
 #footer {
   border-top: 1px solid var(--border); padding: 8px 12px; text-align: right;
 }
-#settings-btn {
+#settings-btn, #deploy-btn {
   background: transparent; border: none; color: var(--text-muted);
   cursor: pointer; font-size: 11px; padding: 2px 6px;
 }
-#settings-btn:hover { color: var(--accent); }
+#settings-btn:hover, #deploy-btn:hover { color: var(--accent); }
 
 .hidden { display: none !important; }

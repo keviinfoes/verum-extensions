@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Deploy — Verum</title>
+  <link rel="stylesheet" href="./deploy.css" />
+</head>
+<body>
+  <header>
+    <h1>Deploy to Ethereum</h1>
+    <p>Publish a file or website as calldata on Ethereum, pay with your wallet,
+       verify it, then link a name.
+       <span id="chain-hint">RPCs for each chain are configured in
+       <a href="#" id="open-settings">settings</a>.</span></p>
+    <div class="chain-selector-row">
+      <select id="default-chain-select"></select>
+      <span id="chain-locked" class="hidden">locked — deployment in progress</span>
+    </div>
+    <p class="header-aside">Already deployed?
+       <a href="#" id="link-existing">Link a name to existing coordinates</a> —
+       no re-deployment needed.</p>
+  </header>
+
+  <main>
+    <!-- Step 1: select content -->
+    <section class="step" id="step-select">
+      <div class="step-head"><span class="step-num">1</span><h2>Select content</h2></div>
+      <div class="step-body">
+        <div id="drop-zone">
+          <p>Pick a single file or an entire site/dapp folder (the folder needs an <code>index.html</code> to render as a page).</p>
+          <div class="pick-buttons">
+            <button id="pick-file" class="primary">Choose file</button>
+            <button id="pick-folder" class="primary">Choose folder</button>
+          </div>
+          <input type="file" id="file-input" hidden />
+          <input type="file" id="folder-input" hidden />
+        </div>
+      </div>
+    </section>
+
+    <!-- Step 2: preview -->
+    <section class="step hidden" id="step-preview">
+      <div class="step-head"><span class="step-num">2</span><h2>Preview</h2></div>
+      <div class="step-body">
+        <table id="summary">
+          <tbody>
+            <tr><td>Content</td><td id="sum-content">—</td></tr>
+            <tr id="sum-files-row"><td>Files</td><td id="sum-files">—</td></tr>
+            <tr><td>Raw size</td><td id="sum-raw">—</td></tr>
+            <tr><td>On-chain size</td><td id="sum-onchain">—</td></tr>
+            <tr><td>Transactions</td><td id="sum-txs">—</td></tr>
+            <tr><td>Estimated cost</td><td id="sum-cost">…</td></tr>
+          </tbody>
+        </table>
+
+        <div id="preview-host">
+          <iframe id="preview-frame" src="dapp-sandbox.html"></iframe>
+          <div id="preview-raw" class="hidden"></div>
+        </div>
+        <p class="note">Rendered through the same sandbox as the real w3:// renderer — what you
+          see here is what visitors will get after deployment.</p>
+
+        <div class="actions">
+          <button id="change-selection" class="secondary">Change selection</button>
+          <button id="start-deploy" class="primary">Deploy →</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Step 3: deploy -->
+    <section class="step hidden" id="step-deploy">
+      <div class="step-head"><span class="step-num">3</span><h2>Deploy</h2></div>
+      <div class="step-body">
+        <div id="wallet-connect">
+          <p id="wallet-prompt">Connect the wallet that pays for the transactions:</p>
+          <div id="wallet-list"></div>
+        </div>
+        <p id="account-line" class="hidden">
+          Connected: <code id="account-addr"></code>
+          <button id="switch-account" class="linkish">switch account</button>
+        </p>
+        <ol id="tx-list"></ol>
+        <p id="deploy-error" class="error hidden"></p>
+        <div class="actions">
+          <button id="retry-deploy" class="secondary hidden">Retry</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Step 4: verify -->
+    <section class="step hidden" id="step-verify">
+      <div class="step-head"><span class="step-num">4</span><h2>Verify</h2></div>
+      <div class="step-body">
+        <p id="verify-status"><span class="spinner"></span> Waiting for deployment…</p>
+        <p id="verify-detail" class="note hidden"></p>
+        <div class="actions">
+          <a id="open-link" class="button-link hidden" target="_blank">Open w3:// page</a>
+          <button id="retry-verify" class="secondary hidden">Retry verification</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Step 5: link a name -->
+    <section class="step hidden" id="step-name">
+      <div class="step-head"><span class="step-num">5</span><h2>Link a name <span class="optional">optional</span></h2></div>
+      <div class="step-body">
+        <p>Point an ENS (<code>.eth</code>) or GNS (<code>.gwei</code>) name you own at this
+           deployment. This writes the <code>w3</code> text record with your wallet.</p>
+
+        <!-- Shown only when linking a name to an already-deployed set of coordinates -->
+        <div id="coords-block" class="hidden">
+          <label for="coords-input">Deployment coordinates</label>
+          <input id="coords-input" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="9012345:12  or  9012345:12+9012346:3  or  [[9012345,12]]" />
+          <p class="note">One <code>block:txIndex</code> pair per chunk, in order. Accepts the
+             <code>w3://</code> URL, the <code>+</code> form, or publish.js's JSON output.</p>
+        </div>
+
+        <p id="name-account-line" class="hidden">
+          Signing with <code id="name-account-addr"></code>
+          <button id="name-switch-account" class="linkish">switch account</button>
+          — must own the name.
+        </p>
+
+        <div class="name-row">
+          <input id="name-input" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="myapp.eth or myapp.gwei" />
+          <button id="link-name" class="primary">Link name</button>
+        </div>
+        <p id="name-status" class="hidden"></p>
+        <div id="name-done" class="hidden">
+          <p>✓ Name linked.</p>
+          <p class="note">Can take up to 13 minutes to resolve the updated name.
+             The deployment itself is already live at <code id="name-coords-url"></code>.</p>
+          <a id="name-link" class="button-link" target="_blank"></a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Wallet picker — used by the preview and the name step when no wallet is connected yet -->
+  <div id="wallet-modal" class="hidden">
+    <div id="wallet-modal-backdrop"></div>
+    <div id="wallet-modal-box">
+      <h3 id="wallet-modal-title">Select wallet</h3>
+      <div id="wallet-modal-list"></div>
+    </div>
+  </div>
+
+  <script type="module" src="./deploy.ts"></script>
+</body>
+</html>
