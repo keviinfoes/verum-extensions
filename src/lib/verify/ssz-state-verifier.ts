@@ -1059,3 +1059,142 @@ export function computeBeaconBlockBodyRoot(bodySSZ: Uint8Array): BeaconBlockBody
 
   return { computedRoot: hexlify(merkleizeExact(leaves)), executionBlockHash }
 }
+
+// ---------------------------------------------------------------------------
+// Blinded BeaconBlockBody hash_tree_root — from JSON
+//
+// A blinded block replaces execution_payload with execution_payload_header. By
+// SSZ construction hash_tree_root(body) is identical either way — the header's
+// transactions_root/withdrawals_root ARE hash_tree_root of the omitted lists —
+// so a blinded block yields the same body_root while being ~30x smaller and
+// carrying block_hash directly. This lets us verify a historical block's
+// execution hash from the JSON blinded block that gateways like publicnode will
+// serve, without needing raw SSZ (which they refuse) and without the transaction
+// list (the bulk of the bytes and the fiddliest encoding).
+//
+// We serialize each JSON body field back to its canonical SSZ bytes and feed the
+// existing (tested) hash_tree_root helpers, then merkleize the 13 field roots.
+// Verified against the beacon header's body_root, so any serialization bug fails
+// closed (mismatch → rejection), never a false accept.
+// ---------------------------------------------------------------------------
+
+interface JsonObj { [k: string]: any }
+
+const hx = (s: string): Uint8Array => getBytes(s)
+
+// uint(n) → little-endian, `bytes` wide. Values arrive as decimal strings.
+function uintLE(dec: string | number | bigint, bytes: number): Uint8Array {
+  let v = BigInt(dec)
+  const out = new Uint8Array(bytes)
+  for (let i = 0; i < bytes; i++) { out[i] = Number(v & 0xffn); v >>= 8n }
+  return out
+}
+
+function cat(...arrs: Uint8Array[]): Uint8Array {
+  let total = 0
+  for (const a of arrs) total += a.length
+  const out = new Uint8Array(total)
+  let p = 0
+  for (const a of arrs) { out.set(a, p); p += a.length }
+  return out
+}
+
+// SSZ variable-length list wire format: uint32-LE offset table + concatenated
+// element bytes. Empty list → empty bytes (helpers treat that as the zero root).
+function serVarList(elems: Uint8Array[]): Uint8Array {
+  if (elems.length === 0) return new Uint8Array(0)
+  const head = elems.length * 4
+  const parts: Uint8Array[] = []
+  let cur = head
+  for (const e of elems) { parts.push(uintLE(cur, 4)); cur += e.length }
+  return cat(...parts, ...elems)
+}
+// Fixed-size element list: just concatenate.
+const serFixedList = (elems: Uint8Array[]): Uint8Array => cat(...elems)
+
+// --- element serializers (JSON → SSZ) ---
+
+const serBBH = (j: JsonObj): Uint8Array =>            // BeaconBlockHeader, 112
+  cat(uintLE(j.slot, 8), uintLE(j.proposer_index, 8), hx(j.parent_root), hx(j.state_root), hx(j.body_root))
+const serSignedBBH = (j: JsonObj): Uint8Array =>      // 208
+  cat(serBBH(j.message), hx(j.signature))
+const serProposerSlashing = (j: JsonObj): Uint8Array => // 416
+  cat(serSignedBBH(j.signed_header_1), serSignedBBH(j.signed_header_2))
+
+const serAttData = (j: JsonObj): Uint8Array =>        // AttestationData, 128
+  cat(uintLE(j.slot, 8), uintLE(j.index, 8), hx(j.beacon_block_root),
+      uintLE(j.source.epoch, 8), hx(j.source.root), uintLE(j.target.epoch, 8), hx(j.target.root))
+
+// Electra Attestation (variable): [agg_bits_off(4)][data(128)][sig(96)][committee_bits(8)] + agg_bits
+const serAttestationElectra = (j: JsonObj): Uint8Array =>
+  cat(uintLE(236, 4), serAttData(j.data), hx(j.signature), hx(j.committee_bits), hx(j.aggregation_bits))
+
+// IndexedAttestation (variable): [indices_off(4)][data(128)][sig(96)] + indices(u64 each)
+const serIndexedAtt = (j: JsonObj): Uint8Array =>
+  cat(uintLE(228, 4), serAttData(j.data), hx(j.signature),
+      cat(...(j.attesting_indices as string[]).map(x => uintLE(x, 8))))
+// AttesterSlashing (variable): [att1_off(4)][att2_off(4)] + att1 + att2
+function serAttesterSlashing(j: JsonObj): Uint8Array {
+  const a1 = serIndexedAtt(j.attestation_1), a2 = serIndexedAtt(j.attestation_2)
+  return cat(uintLE(8, 4), uintLE(8 + a1.length, 4), a1, a2)
+}
+
+const serDeposit = (j: JsonObj): Uint8Array =>        // 1240
+  cat(cat(...(j.proof as string[]).map(hx)),
+      hx(j.data.pubkey), hx(j.data.withdrawal_credentials), uintLE(j.data.amount, 8), hx(j.data.signature))
+const serSignedVoluntaryExit = (j: JsonObj): Uint8Array => // 112
+  cat(uintLE(j.message.epoch, 8), uintLE(j.message.validator_index, 8), hx(j.signature))
+const serSignedBLSChange = (j: JsonObj): Uint8Array => // 172
+  cat(uintLE(j.message.validator_index, 8), hx(j.message.from_bls_pubkey), hx(j.message.to_address), hx(j.signature))
+
+const serDepositRequest = (j: JsonObj): Uint8Array =>       // 192
+  cat(hx(j.pubkey), hx(j.withdrawal_credentials), uintLE(j.amount, 8), hx(j.signature), uintLE(j.index, 8))
+const serWithdrawalRequest = (j: JsonObj): Uint8Array =>    // 76
+  cat(hx(j.source_address), hx(j.validator_pubkey), uintLE(j.amount, 8))
+const serConsolidationRequest = (j: JsonObj): Uint8Array => // 116
+  cat(hx(j.source_address), hx(j.source_pubkey), hx(j.target_pubkey))
+function serExecutionRequests(j: JsonObj | undefined): Uint8Array {
+  if (!j) return new Uint8Array(0)
+  const dep = serFixedList((j.deposits ?? []).map(serDepositRequest))
+  const wd  = serFixedList((j.withdrawals ?? []).map(serWithdrawalRequest))
+  const con = serFixedList((j.consolidations ?? []).map(serConsolidationRequest))
+  return cat(uintLE(12, 4), uintLE(12 + dep.length, 4), uintLE(12 + dep.length + wd.length, 4), dep, wd, con)
+}
+
+// ExecutionPayloadHeader (Deneb-shaped, 17 fields; Electra/Fulu keep this shape —
+// the request roots live in the execution_requests body field, not the header).
+function serEPH(j: JsonObj): Uint8Array {
+  const fixed = cat(
+    hx(j.parent_hash), hx(j.fee_recipient), hx(j.state_root), hx(j.receipts_root),
+    hx(j.logs_bloom), hx(j.prev_randao), uintLE(j.block_number, 8), uintLE(j.gas_limit, 8),
+    uintLE(j.gas_used, 8), uintLE(j.timestamp, 8), uintLE(584, 4), uintLE(j.base_fee_per_gas, 32),
+    hx(j.block_hash), hx(j.transactions_root), hx(j.withdrawals_root),
+    uintLE(j.blob_gas_used, 8), uintLE(j.excess_blob_gas, 8),
+  )
+  return cat(fixed, hx(j.extra_data))
+}
+
+export function computeBlindedBeaconBlockBodyRoot(body: JsonObj): BeaconBlockBodyVerification {
+  const eph = body.execution_payload_header
+  if (!eph?.block_hash) throw new Error('blinded body missing execution_payload_header.block_hash')
+
+  const e1 = body.eth1_data
+  const leaves: Uint8Array[] = [
+    rootBLSSignature(hx(body.randao_reveal)),                                   // 0 randao_reveal
+    rootEth1Data(cat(hx(e1.deposit_root), uintLE(e1.deposit_count, 8), hx(e1.block_hash))), // 1 eth1_data
+    hx(body.graffiti),                                                          // 2 graffiti
+    rootListProposerSlashings(serFixedList((body.proposer_slashings ?? []).map(serProposerSlashing))),
+    rootListAttesterSlashingsElectra(serVarList((body.attester_slashings ?? []).map(serAttesterSlashing))),
+    rootListAttestationsElectra(serVarList((body.attestations ?? []).map(serAttestationElectra))),
+    rootListDeposits(serFixedList((body.deposits ?? []).map(serDeposit))),      // 6 deposits
+    rootListVoluntaryExits(serFixedList((body.voluntary_exits ?? []).map(serSignedVoluntaryExit))),
+    rootSyncAggregate(cat(hx(body.sync_aggregate.sync_committee_bits), hx(body.sync_aggregate.sync_committee_signature))),
+    rootExecutionPayloadHeader(serEPH(eph)),                                    // 9 execution_payload_header
+    rootListBLSToExecChanges(serFixedList((body.bls_to_execution_changes ?? []).map(serSignedBLSChange))),
+    rootListKZGCommitments(serFixedList((body.blob_kzg_commitments ?? []).map(hx))),
+    rootExecutionRequests(serExecutionRequests(body.execution_requests)),       // 12 execution_requests (Electra+)
+  ]
+  while (leaves.length < 16) leaves.push(ZERO[0])
+
+  return { computedRoot: hexlify(merkleizeExact(leaves)), executionBlockHash: hexlify(hx(eph.block_hash)) }
+}

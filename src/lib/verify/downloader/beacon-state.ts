@@ -12,9 +12,11 @@ import type { StateSource } from '../../../types.js'
 // These always serve the latest finalized state, so we request 'finalized' instead of a slot.
 const CHECKPOINT_SYNC_RPCS: Record<number, string[]> = {
   1: [
-    'https://beaconstate-mainnet.chainsafe.io',
-    'https://beaconstate.ethstaker.cc',
+    // Ordered fastest-first from measured throughput; the stall-timeout + failover in
+    // getBlockSummaryRoot handles any that go slow/dead, so order is only a head start.
     'https://mainnet.checkpoint.sigp.io',
+    'https://beaconstate.ethstaker.cc',
+    'https://beaconstate-mainnet.chainsafe.io',
   ],
   11155111: [
     'https://checkpoint-sync.sepolia.ethpandaops.io',
@@ -42,17 +44,31 @@ export async function getBlockSummaryRoot(
   customCheckpointUrls?: string[],
   stateSource: StateSource = 'auto',
 ): Promise<StateSummary> {
-  const ctrl = new AbortController()
+  // open(): resolve the download slot and fetch the response HEADERS (fast, race-able).
+  // consume(): download the ~300MB SSZ body and verify (slow — runs for the winner only).
+  // Splitting them is the whole point: the mainnet BeaconState is ~332 MB, so starting
+  // one download per provider (the old shared-controller stagger did) just splits
+  // bandwidth and memory across four 332 MB streams and stalls them all. Now the first
+  // provider to return a 200 wins and downloads alone; the rest are aborted.
 
-  const attempt = async (rpc: string, stateId: number | 'finalized'): Promise<StateSummary> => {
-    const label = stateId === 'finalized' ? 'finalized (checkpoint)' : `slot ${stateId}`
-    console.log(`[w3] Fetching state (${label}) from ${rpc}…`)
+  const open = async (rpc: string, ac: AbortController): Promise<OpenState> => {
+    const stateId = await fetchLiveDlSlot(rpc, ac.signal)
+    console.log(`[w3] Fetching state (slot ${stateId}) from ${rpc}…`)
     const res = await fetch(`${rpc}/eth/v2/debug/beacon/states/${stateId}`, {
       headers: { Accept: 'application/octet-stream', 'Accept-Encoding': 'gzip' },
-      signal: ctrl.signal,
+      signal: ac.signal,
     })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const stateSSZ = new Uint8Array(await res.arrayBuffer())
+    if (!res.ok) throw new Error(`${rpc}: HTTP ${res.status}`)
+    return { rpc, res }
+  }
+
+  const consume = async ({ rpc, res }: OpenState): Promise<StateSummary> => {
+    // Stream with stall detection. The state is ~136 MB gzipped over the wire (~332 MB
+    // decompressed) and the free checkpoint CDNs run 4-8 MB/s, so this legitimately takes
+    // 40-70s — but a provider that returns 200 headers and then stalls its body (chainsafe
+    // does this) would hang forever on arrayBuffer(). If no chunk arrives for STALL_MS,
+    // abort so the caller fails over to the next provider.
+    const stateSSZ = await downloadWithStallTimeout(res, 20_000)
     const verifier = computeBeaconStateRoot(stateSSZ)
 
     // slot is at byte 40 of BeaconState SSZ (genesis_time[8] + genesis_validators_root[32])
@@ -99,11 +115,11 @@ export async function getBlockSummaryRoot(
   // Consensus RPC nodes serve any recent slot so anchorSlot-32 is fine.
   const dlSlot = anchorSlot - 32
 
-  const fetchLiveDlSlot = async (rpc: string): Promise<number> => {
+  const fetchLiveDlSlot = async (rpc: string, signal: AbortSignal): Promise<number> => {
     try {
       const hRes = await fetch(`${rpc}/eth/v1/beacon/headers/finalized`, {
         headers: { Accept: 'application/json' },
-        signal: ctrl.signal,
+        signal,
       })
       if (hRes.ok) {
         const hJson = await hRes.json() as { data: { header: { message: { slot: string } } } }
@@ -123,53 +139,97 @@ export async function getBlockSummaryRoot(
       ? 'checkpoint providers' : 'consensus RPCs'} only`)
   }
 
-  const cpAttempts = (useCheckpoints ? checkpointRpcs : [])
-    .map(rpc => async () => attempt(rpc, await fetchLiveDlSlot(rpc)))
-  const cnAttempts = (useConsensus ? consensusRpcs : [])
-    .map(rpc => async () => attempt(rpc, await fetchLiveDlSlot(rpc)))
-  if (cpAttempts.length === 0 && cnAttempts.length === 0) {
+  // Interleave checkpoint providers and consensus RPCs so both types get an early slot.
+  const ordered: string[] = []
+  const cp = useCheckpoints ? checkpointRpcs : []
+  const cn = useConsensus ? consensusRpcs : []
+  for (let i = 0; i < Math.max(cp.length, cn.length); i++) {
+    if (cp[i]) ordered.push(cp[i])
+    if (cn[i]) ordered.push(cn[i])
+  }
+  if (ordered.length === 0) {
     throw new Error(stateSource === 'auto'
       ? 'No consensus RPC or checkpoint provider configured'
       : `Dev mode: no ${stateSource === 'checkpoint' ? 'checkpoint provider' : 'consensus RPC'} configured for this chain`)
   }
 
-  const ordered: (() => Promise<StateSummary>)[] = []
-  const len = Math.max(cpAttempts.length, cnAttempts.length)
-  for (let i = 0; i < len; i++) {
-    if (cpAttempts[i]) ordered.push(cpAttempts[i])
-    if (cnAttempts[i]) ordered.push(cnAttempts[i])
+  // Race the OPENS (headers) with a 3s stagger so a dead provider (501/503, fast) yields
+  // quickly; the first to return 200 wins and downloads the body alone. If the winner's
+  // body download later fails, drop it and race the remaining providers.
+  let remaining = ordered
+  let lastErr: Error = new Error('no state provider available')
+  while (remaining.length > 0) {
+    const controllers = remaining.map(() => new AbortController())
+    const opens = remaining.map((rpc, i) => (): Promise<OpenState> => open(rpc, controllers[i]))
+
+    let winner: OpenState
+    try {
+      winner = await staggeredRace(opens, 3000)
+    } catch (e) {
+      lastErr = (e as AggregateError).errors?.[0] ?? (e as Error)
+      break  // every open failed
+    }
+
+    // Commit to the winner: abort the losing opens so only one ~300MB body streams.
+    remaining.forEach((rpc, i) => { if (rpc !== winner.rpc) controllers[i].abort() })
+
+    try {
+      return await consume(winner)
+    } catch (e) {
+      lastErr = e as Error
+      console.warn(`[w3] State download from ${winner.rpc} failed (${lastErr.message}) — trying next provider`)
+      remaining = remaining.filter(r => r !== winner.rpc)
+    }
   }
 
-  const staggered = ordered.map((fn, i): Promise<StateSummary> => {
-    if (i === 0) return fn()
-    return new Promise<StateSummary>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (ctrl.signal.aborted) { reject(new DOMException('Aborted', 'AbortError')); return }
-        fn().then(resolve, reject)
-      }, i * 3000)
-      ctrl.signal.addEventListener('abort', () => {
-        clearTimeout(timer)
-        reject(new DOMException('Aborted', 'AbortError'))
-      }, { once: true })
-    })
-  })
+  console.warn('[w3] State fetch failed:', lastErr.message)
+  throw new Error(stateSource === 'auto'
+    ? 'Could not fetch and verify finalized state from any consensus RPC or checkpoint provider'
+    : `Dev mode: could not fetch and verify finalized state from any ${
+        stateSource === 'checkpoint' ? 'checkpoint provider' : 'consensus RPC'} (source pinned)`)
+}
 
-  try {
-    const result = await Promise.any(
-      staggered.map(p =>
-        p.catch(err => {
-          if ((err as DOMException).name !== 'AbortError')
-            console.warn('[w3] State fetch failed:', (err as Error).message)
-          throw err
-        }),
-      ),
-    )
-    ctrl.abort()
-    return result
-  } catch {
-    throw new Error(stateSource === 'auto'
-      ? 'Could not fetch and verify finalized state from any consensus RPC or checkpoint provider'
-      : `Dev mode: could not fetch and verify finalized state from any ${
-          stateSource === 'checkpoint' ? 'checkpoint provider' : 'consensus RPC'} (source pinned)`)
+interface OpenState { rpc: string; res: Response }
+
+// Read a response body to completion, aborting if no chunk arrives for `stallMs`.
+// A total timeout would be wrong here — a healthy 332 MB state legitimately takes
+// 40-70s — so we time the GAP between chunks instead, which catches a stalled
+// stream without penalising a slow-but-progressing one.
+async function downloadWithStallTimeout(res: Response, stallMs: number): Promise<Uint8Array> {
+  if (!res.body) return new Uint8Array(await res.arrayBuffer())
+  const reader = res.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    let timer: ReturnType<typeof setTimeout>
+    const stall = new Promise<'stall'>(resolve => { timer = setTimeout(() => resolve('stall'), stallMs) })
+    let r: ReadableStreamReadResult<Uint8Array> | 'stall'
+    try {
+      r = await Promise.race([reader.read(), stall])
+    } finally {
+      clearTimeout(timer!)
+    }
+    if (r === 'stall') {
+      await reader.cancel().catch(() => {})
+      throw new Error(`download stalled (no data for ${stallMs / 1000}s)`)
+    }
+    if (r.done) break
+    chunks.push(r.value)
+    total += r.value.length
   }
+  const out = new Uint8Array(total)
+  let p = 0
+  for (const c of chunks) { out.set(c, p); p += c.length }
+  return out
+}
+
+// Run async thunks with a stagger between starts; resolve with the first success.
+// A fast rejection (dead provider) does NOT wait out the stagger for the next start —
+// the timers are already scheduled — but a slow success holds the field without piling on.
+function staggeredRace<T>(thunks: Array<() => Promise<T>>, gapMs: number): Promise<T> {
+  return Promise.any(thunks.map((fn, i) =>
+    i === 0
+      ? fn()
+      : new Promise<T>((resolve, reject) => { setTimeout(() => fn().then(resolve, reject), i * gapMs) }),
+  ))
 }

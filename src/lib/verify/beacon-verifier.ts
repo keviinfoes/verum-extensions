@@ -10,7 +10,7 @@
 import { sha256, getBytes, hexlify } from 'ethers'
 import type { IVerifiedRpc } from '../rpc/light-client.js'
 import type { EraSource, StateSource } from '../../types.js'
-import { computeBeaconBlockBodyRoot, verifyHistoricalSummariesFieldProof } from './ssz-state-verifier.js'
+import { computeBeaconBlockBodyRoot, computeBlindedBeaconBlockBodyRoot, verifyHistoricalSummariesFieldProof } from './ssz-state-verifier.js'
 import { timestampToSlot, slotToTimestamp, sszMerkleize, readU32LE, fetchWithTimeout } from './beacon-primitives.js'
 import { getBlockSummaryRoot } from './downloader/beacon-state.js'
 import { findEraBlockRange, fetchEraBlockRootsFromExecHeaders } from './downloader/era-exec-headers.js'
@@ -130,7 +130,57 @@ async function fetchVerifiedBeaconHeader(
   return { root: json.data.root, stateRoot: msg.state_root, msg }
 }
 
+// Verify the execution block hash committed by the beacon block at `slot`, given
+// the authenticated body_root from its header.
+//
+// Primary: the BLINDED block as JSON. It yields the same body_root (the header's
+// transactions_root/withdrawals_root ARE the omitted lists' roots), is ~30x
+// smaller than the full block, and — crucially — JSON is what gateways like
+// publicnode actually serve (they refuse SSZ). Fallback: the full block as SSZ,
+// which works on Sepolia and any endpoint that honours Accept: octet-stream.
+//
+// A blinded body_root MISMATCH could be either a serialization bug or a forgery;
+// either way we fall through to the SSZ path, which is authoritative. If SSZ also
+// fails (unavailable, or its own mismatch) we reject — never a false accept.
 async function fetchVerifyBeaconBodyHash(
+  rpc: string,
+  slot: number,
+  expectedBodyRoot: string,
+): Promise<string> {
+  let blindedErr = ''
+  try {
+    return await fetchVerifyBlindedBody(rpc, slot, expectedBodyRoot)
+  } catch (e) {
+    blindedErr = (e as Error).message
+  }
+  try {
+    return await fetchVerifyFullBlockSSZ(rpc, slot, expectedBodyRoot)
+  } catch (e) {
+    throw new Error(`blinded(${blindedErr}); ssz(${(e as Error).message})`)
+  }
+}
+
+async function fetchVerifyBlindedBody(
+  rpc: string,
+  slot: number,
+  expectedBodyRoot: string,
+): Promise<string> {
+  const res = await fetchWithTimeout(
+    `${rpc}/eth/v1/beacon/blinded_blocks/${slot}`,
+    { headers: { Accept: 'application/json' } },
+    20_000,
+  )
+  if (!res.ok) throw new Error(`blinded block ${slot}: HTTP ${res.status}`)
+  const json = await res.json() as { data?: { message?: { body?: Record<string, unknown> } } }
+  const body = json.data?.message?.body
+  if (!body) throw new Error(`blinded block ${slot}: no body in response`)
+  const { computedRoot, executionBlockHash } = computeBlindedBeaconBlockBodyRoot(body)
+  if (computedRoot.toLowerCase() !== expectedBodyRoot.toLowerCase())
+    throw new Error(`blinded body root mismatch at slot ${slot}: ${computedRoot} ≠ ${expectedBodyRoot}`)
+  return executionBlockHash
+}
+
+async function fetchVerifyFullBlockSSZ(
   rpc: string,
   slot: number,
   expectedBodyRoot: string,
@@ -141,7 +191,10 @@ async function fetchVerifyBeaconBodyHash(
     { headers: { Accept: 'application/octet-stream' } },
     30_000,
   )
-  if (!res.ok) throw new Error(`Beacon block SSZ ${slot} from ${rpc}: HTTP ${res.status}`)
+  if (!res.ok) throw new Error(`beacon block SSZ ${slot}: HTTP ${res.status}`)
+  // Some gateways ignore Accept and return JSON — reject rather than misparse it.
+  const ct = res.headers.get('content-type') ?? ''
+  if (ct.includes('json')) throw new Error(`beacon block SSZ ${slot}: got JSON, not SSZ`)
   const blob = new Uint8Array(await res.arrayBuffer())
   if (blob.length < 104) throw new Error('SignedBeaconBlock SSZ too short')
   const blockSSZ = blob.slice(readU32LE(blob, 0))
@@ -149,7 +202,7 @@ async function fetchVerifyBeaconBodyHash(
   const bodySSZ = blockSSZ.slice(readU32LE(blockSSZ, 80))
   const { computedRoot, executionBlockHash } = computeBeaconBlockBodyRoot(bodySSZ)
   if (computedRoot.toLowerCase() !== expectedBodyRoot.toLowerCase())
-    throw new Error(`Body root mismatch at slot ${slot}: got ${computedRoot} ≠ ${expectedBodyRoot}`)
+    throw new Error(`body root mismatch at slot ${slot}: ${computedRoot} ≠ ${expectedBodyRoot}`)
   return executionBlockHash
 }
 

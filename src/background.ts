@@ -14,7 +14,7 @@ import { listWallets, ethRequest as walletRequest } from './lib/wallets/metamask
 import { isFrameAvailable, frameRequest } from './lib/wallets/frame-bridge.js'
 import type { IVerifiedRpc } from './lib/rpc/light-client.js'
 
-const BUILD_ID = 'settings-faq-link-2026-07-13T72'
+const BUILD_ID = 'state-stall-timeout-2026-07-16T75'
 
 console.log(`[w3] background build ${BUILD_ID}`)
 
