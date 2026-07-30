@@ -70,6 +70,14 @@
             <option value="checkpoint">Checkpoint providers only</option>
           </select>
         </div>
+        <div class="dev-row">
+          <label for="hist-source"><code>historical_summaries</code> source</label>
+          <select id="hist-source">
+            <option value="auto">Auto — era-tail, fall back to full state</option>
+            <option value="era-tail">Era-tail + LC reconstruction only (~23 MB)</option>
+            <option value="full-state">Full BeaconState download only (~136 MB)</option>
+          </select>
+        </div>
         <p class="dev-hint">The era source is only consulted for targets older than the BeaconState's
            rolling <code>block_roots</code> window (8192 slots, ~27h) — newer slots are read straight
            from the state. Era files and parquet also only exist for <em>completed</em> eras, so

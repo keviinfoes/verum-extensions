@@ -747,6 +747,8 @@ export interface BeaconStateVerification {
   getHistoricalSummariesBlob(): string
   /** Proof from historical_summaries list root → BeaconState root (5-6 sibling hashes, base64). */
   computeHistoricalSummariesFieldProof(): string
+  /** Per-field hash_tree_roots (0x-hex), in BeaconState field order. For proof reconstruction/testing. */
+  getFieldRoots(): string[]
 }
 
 /**
@@ -921,6 +923,9 @@ export function computeBeaconStateRoot(stateSSZ: Uint8Array): BeaconStateVerific
       sibs.forEach((s, i) => buf.set(s, i * 32))
       return btoa(String.fromCharCode(...buf))
     },
+    getFieldRoots(): string[] {
+      return fieldRoots.map(hexlify)
+    },
   }
 }
 
@@ -952,6 +957,64 @@ export function verifyHistoricalSummariesFieldProof(
     idx >>= 1
   }
   return hexlify(node).toLowerCase() === stateRootHex.toLowerCase()
+}
+
+/** hash_tree_root(SyncCommittee): pubkeys Vector[BLSPubkey,512] + aggregate_pubkey. */
+export function computeSyncCommitteeRoot(committeeSSZ: Uint8Array): string {
+  return hexlify(rootSyncCommittee(committeeSSZ))
+}
+
+/** SHA-256 of two 32-byte nodes — for building node(16-23) / node(22-23) from LC siblings. */
+export function hashNodes(a: Uint8Array, b: Uint8Array): Uint8Array {
+  return h(a, b)
+}
+
+/**
+ * Reconstruct hash_tree_root(BeaconState) from a historical_summaries blob + the three
+ * top field-tree siblings, WITHOUT the full state. Anchor-agnostic: the caller derives
+ *   - node(0-15), node(32-63) ← LC current_sync_committee_branch[4]/[5] (or next_sc_branch)
+ *   - node(16-23)             ← hashNodes(node16-19, hashNodes(node20-21, node22-23)),
+ *                               where node22-23 = hashNodes(scRoot(current), scRoot(next))
+ *   - node(28-31), leaf 26, next_withdrawal_index (leaf 25) ← anchor state fixed section (early-abort)
+ *   - execution_payload_header root (leaf 24) ← blinded block
+ * All inputs must come from the SAME anchor slot (finalized, so EIP-4788 can confirm it).
+ * The caller MUST verify the returned root against a Helios/4788-anchored beacon header
+ * (this reconstruction is trustless only once that anchor check passes — it fails closed).
+ */
+export function reconstructStateRootFromHistSummaries(
+  histSummariesBlob: Uint8Array,   // N×64 bytes
+  node0_15: Uint8Array,            // 32-byte sibling (validators subtree)
+  node16_23: Uint8Array,           // 32-byte sibling
+  node32_63: Uint8Array,           // 32-byte sibling
+  fixedSection: Uint8Array,        // first ≥2_736_685 bytes of the anchor state SSZ
+  execHeaderRoot: Uint8Array,      // 32-byte hash_tree_root(latest_execution_payload_header)
+): { stateRoot: string; fieldProof: string } | null {
+  if (node0_15.length !== 32 || node16_23.length !== 32 || node32_63.length !== 32 || fixedSection.length < 2_736_685) return null
+
+  const leaf25    = u64chunk(fixedSection.slice(2736633, 2736641))  // next_withdrawal_index
+  const leaf26    = u64chunk(fixedSection.slice(2736641, 2736649))  // next_withdrawal_validator_index
+  const node28_31 = h(
+    h(u64chunk(fixedSection.slice(2736653, 2736661)), u64chunk(fixedSection.slice(2736661, 2736669))),
+    h(u64chunk(fixedSection.slice(2736669, 2736677)), u64chunk(fixedSection.slice(2736677, 2736685))),
+  )
+  const node24_25 = h(execHeaderRoot, leaf25)
+
+  // leaf 27: hash_tree_root(historical_summaries) = mix_in_length(merkleize(entry_roots, 24), N)
+  const n = Math.floor(histSummariesBlob.length / 64)
+  if (n === 0) return null
+  const entryRoots: Uint8Array[] = []
+  for (let i = 0; i < n; i++)
+    entryRoots.push(h(histSummariesBlob.slice(i * 64, i * 64 + 32), histSummariesBlob.slice(i * 64 + 32, i * 64 + 64)))
+  let node = mixLen(merkleizeAtDepth(entryRoots, 24), n)
+
+  // Walk up the BeaconState field tree from field index 27. These 6 siblings ARE the
+  // historical_summaries field proof (same layout verifyHistoricalSummariesFieldProof expects).
+  const sibs = [leaf26, node24_25, node28_31, node16_23, node0_15, node32_63]
+  let idx = 27
+  for (let d = 0; d < 6; d++) { node = idx % 2 === 0 ? h(node, sibs[d]) : h(sibs[d], node); idx >>= 1 }
+  const proofBuf = new Uint8Array(sibs.length * 32)
+  sibs.forEach((s, i) => proofBuf.set(s, i * 32))
+  return { stateRoot: hexlify(node), fieldProof: btoa(String.fromCharCode(...proofBuf)) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,4 +1260,9 @@ export function computeBlindedBeaconBlockBodyRoot(body: JsonObj): BeaconBlockBod
   while (leaves.length < 16) leaves.push(ZERO[0])
 
   return { computedRoot: hexlify(merkleizeExact(leaves)), executionBlockHash: hexlify(hx(eph.block_hash)) }
+}
+
+/** hash_tree_root(ExecutionPayloadHeader) from a blinded block's execution_payload_header JSON. */
+export function computeExecutionPayloadHeaderRoot(eph: JsonObj): string {
+  return hexlify(rootExecutionPayloadHeader(serEPH(eph)))
 }

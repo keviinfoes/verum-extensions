@@ -5,6 +5,7 @@
 // use raw-snappy-compressed SSZ, which no browser API or small dependency covers.
 
 import { computeEraBlockSummaryRoot, readU32LE, fetchWithTimeout } from '../beacon-primitives.js'
+import { getBytes, hexlify } from 'ethers'
 
 // Era file servers — serve .era files with HTTP range support.
 // Format: {network}-{era:05d}-{hash:8hex}.era, directory listing at server root.
@@ -283,4 +284,153 @@ async function tryEraUrl(
 
   console.log(`[w3] Era ${era}: block_roots verified via era file ✓ (stateCompressed=${stateDataLen}B)`)
   return roots
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// historical_summaries via era-file TAIL (suffix range + snappy frame resync)
+//
+// historical_summaries sits at the SSZ tail (~offset 3.0 MB on Sepolia, ~326 MB on
+// mainnet) inside the single snappy-framed CompressedBeaconState record. block_roots
+// extraction above decompresses the FRONT; this decompresses the TAIL by fetching a
+// compressed suffix, resyncing to a snappy frame boundary, and decompressing to the end.
+// L-free: a small FRONT read gives the hs byte range + the era's block_roots, and
+// htr(block_roots) = hs[last].block_summary_root locates the last entry in the tail,
+// fixing the alignment without needing the total uncompressed length.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Snappy framed decompress starting at an arbitrary in-stream frame boundary `start`.
+function snappyFramedFrom(data: Uint8Array, start: number, need: number): Uint8Array {
+  const out = new Uint8Array(need)
+  let pos = 0, s = start
+  while (s + 4 <= data.length && pos < need) {
+    const type = data[s], len = readU24LE(data, s + 1); s += 4
+    if (s + len > data.length) break
+    if (type === 0x00 && len > 4) {
+      const blk = snappyDecompressBlock(data.subarray(s + 4, s + len))
+      const n = Math.min(blk.length, need - pos); out.set(blk.subarray(0, n), pos); pos += n
+    } else if (type === 0x01 && len > 4) {
+      const n = Math.min(len - 4, need - pos); out.set(data.subarray(s + 4, s + 4 + n), pos); pos += n
+    }
+    // 0xff stream-id, 0xfe padding, 0x80-0xfd skippable — ignore
+    s += len
+  }
+  return out.subarray(0, pos)
+}
+
+function readVarintU(data: Uint8Array, s: number): number | null {
+  let v = 0, shift = 0, i = s
+  while (i < data.length) { const b = data[i++]; v |= (b & 0x7f) << shift; if (!(b & 0x80)) return v; shift += 7; if (shift > 35) return null }
+  return null
+}
+
+// Find first offset where a run of `n` valid snappy frames begins (resync into a mid-stream slice).
+// Compressed frames are validated by their block's varint uncompressed-length (≤64 KB) over a chain,
+// making a false boundary vanishingly unlikely.
+function snappyResync(data: Uint8Array, n = 4): number {
+  for (let p = 0; p + 8 < data.length; p++) {
+    let s = p, ok = true
+    for (let i = 0; i < n; i++) {
+      if (s + 4 > data.length) { ok = false; break }
+      const type = data[s], len = readU24LE(data, s + 1)
+      const valid = type === 0x00 || type === 0x01 || type === 0xff || type === 0xfe || (type >= 0x80 && type <= 0xfd)
+      if (!valid || len < 1 || len > 70000) { ok = false; break }
+      if (type === 0x00) {
+        if (len < 5 || s + 8 > data.length) { ok = false; break }
+        const ul = readVarintU(data, s + 8)
+        if (ul === null || ul > 66000) { ok = false; break }
+      }
+      s += 4 + len
+    }
+    if (ok) return p
+  }
+  return -1
+}
+
+// historical_summaries entry count = eraFileNumber − Capella-era (one entry appended
+// per era boundary since Capella). Lets us size the blob from the era number alone,
+// so the FRONT read only needs block_roots (~700 KB) instead of the full 2.74 MB fixed
+// section. A wrong count yields a wrong leaf 27 → fails the field-proof/Helios check.
+const CAPELLA_ERA: Record<number, number> = { 1: 758, 11155111: 222, 17000: 0 }
+const HS_TAIL_FETCH = 20_000_000  // compressed suffix to cover hs + pending_* at the tail
+
+/**
+ * Fetch the raw historical_summaries blob (N×64 bytes) from an era file, without
+ * downloading the full multi-hundred-MB state. Returns null on any failure so the
+ * caller can fall back to the full-state download.
+ *
+ * NOT self-verifying on its own — the returned blob must still be anchored via the
+ * historical_summaries field proof against a Helios-verified state_root.
+ */
+export async function fetchHistoricalSummariesFromEraFile(
+  era: number, chainId: number, customEraUrls?: string[],
+): Promise<Uint8Array | null> {
+  const urls = await findEraFileUrls(era, chainId, '0x' + '00'.repeat(32), customEraUrls)
+  for (const url of urls) {
+    try {
+      const blob = await tryEraUrlHS(url, era, chainId)
+      if (blob) return blob
+    } catch (e) {
+      console.warn(`[w3] Era ${era} HS: ${url} → ${(e as Error).message}`)
+    }
+  }
+  return null
+}
+
+async function tryEraUrlHS(url: string, era: number, chainId: number): Promise<Uint8Array | null> {
+  const capella = CAPELLA_ERA[chainId]
+  if (capella === undefined) return null
+  const nEntries = era - capella
+  if (nEntries <= 0) return null
+
+  // ── locate state entry (same tail-index parse as block_roots) ──
+  const tail = await eraFetch(url, `bytes=-${ERA_TAIL_FETCH}`, 30_000)
+  if (!tail?.fileSize) return null
+  const { buf: tb, fileSize } = tail
+  const count = readU32LE(tb, tb.length - 8)
+  if (count === 0 || count > 8192) return null
+  const srTailStart = tb.length - (count * 8 + 24)
+  const offInTail = srTailStart + 16
+  const offVal = readI64LE(tb, offInTail)
+  const offAbs = (fileSize - tb.length) + offInTail
+  const stateHeaderAbsPos = offAbs + offVal - 16
+  if (stateHeaderAbsPos <= 0 || stateHeaderAbsPos >= fileSize) return null
+
+  // state record header → compressed length
+  const hdr = await eraFetch(url, `bytes=${stateHeaderAbsPos}-${stateHeaderAbsPos + 7}`, 15_000)
+  if (!hdr || (hdr.buf[0] | (hdr.buf[1] << 8)) !== E2S_STATE) return null
+  const stateDataLen = readU32LE(hdr.buf, 2)
+  const dataStart = stateHeaderAbsPos + 8
+  const dataEnd = dataStart + stateDataLen - 1
+
+  // ── FRONT: block_roots only → hs[last].block_summary_root ──
+  const front = await eraFetch(url, `bytes=${dataStart}-${Math.min(dataStart + ERA_STATE_FETCH - 1, dataEnd)}`, 60_000)
+  if (!front) return null
+  const need = BLOCK_ROOTS_SSZ_OFFSET + BLOCK_ROOTS_SSZ_LEN  // 262320
+  const frontSSZ = snappyFramedDecompress(front.buf, need)
+  if (frontSSZ.length < need) return null
+  const blockRoots: Uint8Array[] = []
+  for (let i = 0; i < 8192; i++)
+    blockRoots.push(frontSSZ.slice(BLOCK_ROOTS_SSZ_OFFSET + i * 32, BLOCK_ROOTS_SSZ_OFFSET + (i + 1) * 32))
+  const lastBSR = getBytes(computeEraBlockSummaryRoot(blockRoots))  // = hs[last].block_summary_root
+
+  // ── TAIL: suffix range → resync → decompress to end ──
+  const tailStart = Math.max(dataStart, dataEnd + 1 - HS_TAIL_FETCH)
+  const suffix = await eraFetch(url, `bytes=${tailStart}-${dataEnd}`, 120_000)
+  if (!suffix) return null
+  const rs = tailStart === dataStart ? 0 : snappyResync(suffix.buf)
+  if (rs < 0) return null
+  const tailU = snappyFramedFrom(suffix.buf, rs, 64_000_000)
+
+  // ── align via hs[last].block_summary_root (L-free) ──
+  const target = hexlify(lastBSR)
+  let q = -1
+  for (let i = tailU.length - 32; i >= 0; i--) {
+    if (tailU[i] === lastBSR[0] && hexlify(tailU.subarray(i, i + 32)) === target) { q = i; break }
+  }
+  if (q < 0) return null
+  const blobStart = q - (nEntries - 1) * 64
+  const blobEnd = q + 64
+  if (blobStart < 0 || blobEnd > tailU.length) return null
+  console.log(`[w3] Era ${era} HS: historical_summaries via era-tail ✓ (${nEntries} entries, ${(HS_TAIL_FETCH / 1e6).toFixed(0)}MB suffix)`)
+  return tailU.slice(blobStart, blobEnd)
 }

@@ -9,12 +9,12 @@ import type { TxRef } from './lib/w3/name-resolver.js'
 import { verifyViaBeacon, isEip2935Error } from './lib/verify/beacon-verifier.js'
 import type { DappProofData, EraBsrCache } from './lib/verify/beacon-verifier.js'
 import { DEFAULT_CHAINS, DEFAULT_DEV_SETTINGS } from './types.js'
-import type { BgMessage, BgResponse, VerificationUpdate, ChainConfig, VerificationResult, DevSettings, EraSource, StateSource, ForceMode } from './types.js'
+import type { BgMessage, BgResponse, VerificationUpdate, ChainConfig, VerificationResult, DevSettings, EraSource, StateSource, ForceMode, HistSource } from './types.js'
 import { listWallets, ethRequest as walletRequest } from './lib/wallets/metamask-bridge.js'
 import { isFrameAvailable, frameRequest } from './lib/wallets/frame-bridge.js'
 import type { IVerifiedRpc } from './lib/rpc/light-client.js'
 
-const BUILD_ID = 'state-stall-timeout-2026-07-16T75'
+const BUILD_ID = 'era-tail-devmode-2026-07-30T78'
 
 console.log(`[w3] background build ${BUILD_ID}`)
 
@@ -131,12 +131,13 @@ async function readEraBsrCache(): Promise<Record<number, EraBsrCache>> {
 // Dev settings (settings page). Absent keys fall back to the shipped defaults,
 // which are all 'auto' — i.e. exactly the normal behaviour.
 async function readDevSettings(): Promise<DevSettings> {
-  const stored = await chrome.storage.sync.get(['devMode', 'forceMode', 'eraSource', 'stateSource'])
+  const stored = await chrome.storage.sync.get(['devMode', 'forceMode', 'eraSource', 'stateSource', 'histSource'])
   return {
     devMode:     (stored.devMode as boolean | undefined) ?? DEFAULT_DEV_SETTINGS.devMode,
     forceMode:   (stored.forceMode as ForceMode | undefined) ?? DEFAULT_DEV_SETTINGS.forceMode,
     eraSource:   (stored.eraSource as EraSource | undefined) ?? DEFAULT_DEV_SETTINGS.eraSource,
     stateSource: (stored.stateSource as StateSource | undefined) ?? DEFAULT_DEV_SETTINGS.stateSource,
+    histSource:  (stored.histSource as HistSource | undefined) ?? DEFAULT_DEV_SETTINGS.histSource,
   }
 }
 
@@ -615,18 +616,18 @@ async function twoPhaseResolve(
   // Dev mode: pin the era block_roots source and/or the BeaconState source.
   // Off (or 'auto') leaves the normal fallback/race behaviour untouched.
   const dev = await readDevSettings()
-  if (dev.devMode && (dev.forceMode !== 'auto' || dev.eraSource !== 'auto' || dev.stateSource !== 'auto')) {
-    console.log(`[w3] Dev mode — mode: ${dev.forceMode}, era source: ${dev.eraSource}, BeaconState source: ${dev.stateSource}`)
-    if (dev.forceMode !== 'beacon' && (dev.eraSource !== 'auto' || dev.stateSource !== 'auto') && !blockIsHistorical) {
+  if (dev.devMode && (dev.forceMode !== 'auto' || dev.eraSource !== 'auto' || dev.stateSource !== 'auto' || dev.histSource !== 'auto')) {
+    console.log(`[w3] Dev mode — mode: ${dev.forceMode}, era source: ${dev.eraSource}, BeaconState source: ${dev.stateSource}, historical_summaries: ${dev.histSource}`)
+    if (dev.forceMode !== 'beacon' && (dev.eraSource !== 'auto' || dev.stateSource !== 'auto' || dev.histSource !== 'auto') && !blockIsHistorical) {
       console.warn('[w3] Dev mode — target is a recent block, so Mode 1 (Helios) will handle it and the ' +
-        'era / BeaconState sources will NOT be used. Set mode to "beacon" to force Mode 2.')
+        'era / BeaconState / historical_summaries sources will NOT be used. Set mode to "beacon" to force Mode 2.')
     }
   }
 
   // A cached proof or BSR skips the download the dev is trying to exercise, so a
   // pinned source also bypasses both caches — otherwise selecting e.g. parquet
   // would silently verify from cache and never touch parquet at all.
-  const pinned = dev.devMode && (dev.eraSource !== 'auto' || dev.stateSource !== 'auto')
+  const pinned = dev.devMode && (dev.eraSource !== 'auto' || dev.stateSource !== 'auto' || dev.histSource !== 'auto')
   if (pinned && (cachedProof || eraBsrCache[chain.chainId])) {
     console.log('[w3] Dev mode — bypassing proof/BSR cache so the pinned source actually runs')
   }
@@ -640,6 +641,7 @@ async function twoPhaseResolve(
     eraBsrCache: pinned ? undefined : eraBsrCache[chain.chainId],
     eraSource: dev.devMode ? dev.eraSource : 'auto' as const,
     stateSource: dev.devMode ? dev.stateSource : 'auto' as const,
+    histSource: dev.devMode ? dev.histSource : 'auto' as const,
   }
 
   // Dev mode can override the block-age gate. Without this, a recent target always

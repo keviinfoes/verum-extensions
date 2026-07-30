@@ -140,6 +140,11 @@ export type EraSource = 'auto' | 'era-file' | 'parquet' | 'exec-headers'
 // Where the finalized BeaconState is downloaded from (Mode 2).
 export type StateSource = 'auto' | 'consensus-rpc' | 'checkpoint'
 
+// How historical_summaries is obtained (Mode 2). 'era-tail' = era-file tail + LC-branch
+// reconstruction (~23 MB, seconds); 'full-state' = the full BeaconState download (~136 MB).
+// 'auto' tries era-tail first and falls back to full-state; the pins force one path only.
+export type HistSource = 'auto' | 'era-tail' | 'full-state'
+
 // Which verification mode runs. 'auto' picks by block age: blocks inside Helios's
 // EIP-2935 window (~27h) go to Mode 1, older ones to Mode 2. Forcing 'beacon' is
 // what makes the era / BeaconState sources above reachable for a recent block —
@@ -151,6 +156,7 @@ export interface DevSettings {
   forceMode: ForceMode
   eraSource: EraSource
   stateSource: StateSource
+  histSource: HistSource
 }
 
 export const DEFAULT_DEV_SETTINGS: DevSettings = {
@@ -158,6 +164,7 @@ export const DEFAULT_DEV_SETTINGS: DevSettings = {
   forceMode: 'auto',
   eraSource: 'auto',
   stateSource: 'auto',
+  histSource: 'auto',
 }
 
 export interface WalletInfo {

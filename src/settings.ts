@@ -1,5 +1,5 @@
 import { DEFAULT_CHAINS, DEFAULT_DEV_SETTINGS } from './types.js'
-import type { ChainConfig, EraSource, StateSource, ForceMode } from './types.js'
+import type { ChainConfig, EraSource, StateSource, ForceMode, HistSource } from './types.js'
 
 const chainsEl           = document.getElementById('chains') as HTMLDivElement
 const toast              = document.getElementById('saved-toast') as HTMLDivElement
@@ -94,13 +94,15 @@ const devOptions  = document.getElementById('dev-options') as HTMLDivElement
 const forceModeEl = document.getElementById('force-mode') as HTMLSelectElement
 const eraSourceEl = document.getElementById('era-source') as HTMLSelectElement
 const stateSrcEl  = document.getElementById('state-source') as HTMLSelectElement
+const histSrcEl   = document.getElementById('hist-source') as HTMLSelectElement
 
 async function loadDevSettings() {
-  const s = await chrome.storage.sync.get(['devMode', 'forceMode', 'eraSource', 'stateSource'])
+  const s = await chrome.storage.sync.get(['devMode', 'forceMode', 'eraSource', 'stateSource', 'histSource'])
   devModeCb.checked  = (s.devMode as boolean | undefined) ?? DEFAULT_DEV_SETTINGS.devMode
   forceModeEl.value  = (s.forceMode as string | undefined) ?? DEFAULT_DEV_SETTINGS.forceMode
   eraSourceEl.value  = (s.eraSource as string | undefined) ?? DEFAULT_DEV_SETTINGS.eraSource
   stateSrcEl.value   = (s.stateSource as string | undefined) ?? DEFAULT_DEV_SETTINGS.stateSource
+  histSrcEl.value    = (s.histSource as string | undefined) ?? DEFAULT_DEV_SETTINGS.histSource
   devOptions.classList.toggle('hidden', !devModeCb.checked)
 }
 
@@ -111,6 +113,7 @@ function saveDevSettings() {
     forceMode: forceModeEl.value as ForceMode,
     eraSource: eraSourceEl.value as EraSource,
     stateSource: stateSrcEl.value as StateSource,
+    histSource: histSrcEl.value as HistSource,
   }).then(showToast)
 }
 
@@ -118,6 +121,7 @@ devModeCb.addEventListener('change', saveDevSettings)
 forceModeEl.addEventListener('change', saveDevSettings)
 eraSourceEl.addEventListener('change', saveDevSettings)
 stateSrcEl.addEventListener('change', saveDevSettings)
+histSrcEl.addEventListener('change', saveDevSettings)
 
 loadDevSettings()
 

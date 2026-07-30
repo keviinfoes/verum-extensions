@@ -9,13 +9,14 @@
 
 import { sha256, getBytes, hexlify } from 'ethers'
 import type { IVerifiedRpc } from '../rpc/light-client.js'
-import type { EraSource, StateSource } from '../../types.js'
-import { computeBeaconBlockBodyRoot, computeBlindedBeaconBlockBodyRoot, verifyHistoricalSummariesFieldProof } from './ssz-state-verifier.js'
+import type { EraSource, StateSource, HistSource } from '../../types.js'
+import { computeBeaconBlockBodyRoot, computeBlindedBeaconBlockBodyRoot, verifyHistoricalSummariesFieldProof,
+  reconstructStateRootFromHistSummaries, computeSyncCommitteeRoot, hashNodes, computeExecutionPayloadHeaderRoot } from './ssz-state-verifier.js'
 import { timestampToSlot, slotToTimestamp, sszMerkleize, readU32LE, fetchWithTimeout } from './beacon-primitives.js'
-import { getBlockSummaryRoot } from './downloader/beacon-state.js'
+import { getBlockSummaryRoot, fetchAnchorFixedSection } from './downloader/beacon-state.js'
 import { findEraBlockRange, fetchEraBlockRootsFromExecHeaders } from './downloader/era-exec-headers.js'
 import { fetchEraBlockRootsFromParquet } from './downloader/era-parquet.js'
-import { fetchEraBlockRootsFromEraFile } from './downloader/era-file.js'
+import { fetchEraBlockRootsFromEraFile, fetchHistoricalSummariesFromEraFile } from './downloader/era-file.js'
 
 export { timestampToSlot, slotToTimestamp, fetchWithTimeout } from './beacon-primitives.js'
 
@@ -270,6 +271,92 @@ async function confirmWithHelios(
   }
 }
 
+// SyncCommittee SSZ: pubkeys Vector[BLSPubkey,512] (48 B each) ++ aggregate_pubkey (48 B).
+function syncCommitteeSSZ(sc: { pubkeys: string[]; aggregate_pubkey: string }): Uint8Array {
+  const out = new Uint8Array(512 * 48 + 48)
+  sc.pubkeys.forEach((pk, i) => out.set(getBytes(pk), i * 48))
+  out.set(getBytes(sc.aggregate_pubkey), 512 * 48)
+  return out
+}
+
+// Fast path: reconstruct the finalized state_root from the era-tail historical_summaries
+// blob + LC-branch siblings + a 2.74 MB early-abort — WITHOUT the ~136 MB state download.
+// Fails closed: returns null on ANY issue, and the reconstructed root is only trusted once
+// it equals the SSZ-verified beacon header's state_root (whose block root the caller then
+// confirms via EIP-4788). A bug can only cost the optimization, never a false accept.
+async function tryEraTailStateSummary(
+  consensusRpcs: string[], chainId: number, anchorSlot: number,
+  checkpointUrls: string[] | undefined, eraFileUrls: string[] | undefined,
+): Promise<{ blob: Uint8Array; effectiveStateRoot: string; effectiveSlot: number; effectiveBeaconRoot: string; fieldProof: string } | null> {
+  try {
+    // 1. early-abort the finalized-32 state's fixed section → node(28-31), leaf 26, leaf 25 + slot S
+    const anchor = await fetchAnchorFixedSection(chainId, checkpointUrls, anchorSlot)
+    if (!anchor) return null
+    const S = anchor.slot
+    const era = Math.floor(S / 8192)
+
+    // 2. historical_summaries blob from the era-file tail
+    const blob = await fetchHistoricalSummariesFromEraFile(era, chainId, eraFileUrls)
+    if (!blob) return null
+
+    // 3. SSZ-verified beacon header at S → block root + committed state_root
+    let hdr: { root: string; stateRoot: string } | null = null
+    for (const rpc of consensusRpcs) {
+      try { const v = await fetchVerifiedBeaconHeader(rpc, S); hdr = { root: v.root, stateRoot: v.stateRoot }; break } catch { /* next */ }
+    }
+    if (!hdr) return null
+
+    // 4/5. bootstrap(blockRoot) → current_sync_committee(+branch); update(period) → next_sync_committee
+    let bootstrap: any = null, upd: any = null
+    const period = Math.floor(S / 32 / 256)
+    for (const rpc of consensusRpcs) {
+      try {
+        const b = await fetchWithTimeout(`${rpc}/eth/v1/beacon/light_client/bootstrap/${hdr.root}`, { headers: { Accept: 'application/json' } }, 15_000)
+        if (!b.ok) continue
+        bootstrap = (await b.json()).data
+        const u = await fetchWithTimeout(`${rpc}/eth/v1/beacon/light_client/updates?start_period=${period}&count=1`, { headers: { Accept: 'application/json' } }, 15_000)
+        if (!u.ok) continue
+        upd = (await u.json())[0]?.data
+        if (bootstrap?.current_sync_committee_branch && upd?.next_sync_committee) break
+      } catch { /* next */ }
+    }
+    if (!bootstrap?.current_sync_committee_branch || !bootstrap?.current_sync_committee || !upd?.next_sync_committee) return null
+
+    // 6. derive the three top field-tree siblings
+    const br = (bootstrap.current_sync_committee_branch as string[]).map((x) => getBytes(x))
+    if (br.length < 6) return null
+    const node0_15 = br[4], node32_63 = br[5], node16_19 = br[2], node20_21 = br[1]
+    const leaf22 = getBytes(computeSyncCommitteeRoot(syncCommitteeSSZ(bootstrap.current_sync_committee)))
+    const leaf23 = getBytes(computeSyncCommitteeRoot(syncCommitteeSSZ(upd.next_sync_committee)))
+    const node16_23 = hashNodes(node16_19, hashNodes(node20_21, hashNodes(leaf22, leaf23)))
+
+    // 7. execution_payload_header root from the blinded block at S
+    let execHeaderRoot: Uint8Array | null = null
+    for (const rpc of consensusRpcs) {
+      try {
+        const bl = await fetchWithTimeout(`${rpc}/eth/v1/beacon/blinded_blocks/${S}`, { headers: { Accept: 'application/json' } }, 20_000)
+        if (!bl.ok) continue
+        const body = (await bl.json()).data?.message?.body
+        if (body?.execution_payload_header) { execHeaderRoot = getBytes(computeExecutionPayloadHeaderRoot(body.execution_payload_header)); break }
+      } catch { /* next */ }
+    }
+    if (!execHeaderRoot) return null
+
+    // 8. reconstruct + 9. anchor to the SSZ-verified header's state_root (fails closed)
+    const recon = reconstructStateRootFromHistSummaries(blob, node0_15, node16_23, node32_63, anchor.fixedSection, execHeaderRoot)
+    if (!recon) return null
+    if (recon.stateRoot.toLowerCase() !== hdr.stateRoot.toLowerCase()) {
+      console.warn(`[w3] era-tail reconstruct ≠ header state_root (${recon.stateRoot.slice(0,10)}… vs ${hdr.stateRoot.slice(0,10)}…) — full-state fallback`)
+      return null
+    }
+    console.log(`[w3] historical_summaries via era-tail + LC reconstruction ✓ (slot ${S}, no full-state download)`)
+    return { blob, effectiveStateRoot: recon.stateRoot, effectiveSlot: S, effectiveBeaconRoot: hdr.root, fieldProof: recon.fieldProof }
+  } catch (e) {
+    console.warn(`[w3] era-tail reconstruction failed (${(e as Error).message}) — full-state fallback`)
+    return null
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -305,6 +392,7 @@ export interface BeaconVerifyOptions {
   // Dev mode: pin one source instead of the automatic fallback chain.
   eraSource?: EraSource
   stateSource?: StateSource
+  histSource?: HistSource
 }
 
 export interface BeaconVerification {
@@ -405,44 +493,68 @@ export async function verifyViaBeacon(
 
   if (!eraBsrHit) {
     const primaryHsIndex = historicalSummariesIndex(primary.era, chainId)
-    const [stateSummary, primaryRange] = await Promise.all([
-      getBlockSummaryRoot(consensusRpcs, anchor.slot, anchor.stateRoot, primaryHsIndex, primary.era, chainId, slots.map(s => s.slot), options?.checkpointUrls, options?.stateSource),
+
+    // Fast path: era-tail historical_summaries + LC-branch reconstruction (~23 MB, seconds)
+    // instead of the full ~136 MB / 60 s-hash state download. Fails closed → full download.
+    // Dev mode: histSource='full-state' skips era-tail; 'era-tail' forces it and does NOT
+    // fall back (so a failure is visible instead of masked by the full download).
+    const wantEraTail = options?.histSource !== 'full-state'
+    const [eraTail, primaryRange] = await Promise.all([
+      wantEraTail ? tryEraTailStateSummary(consensusRpcs, chainId, anchor.slot, options?.checkpointUrls, options?.eraFileUrls) : Promise.resolve(null),
       findEraBlockRange(execRpcs, primary.era * 8192, chainId),
     ])
-    if (stateSummary.blockSummaryRoot) bsrByEra.set(primary.era, stateSummary.blockSummaryRoot)
-    blockRootsAtSlots = stateSummary.blockRootsAtSlots
     rangeByEra.set(primary.era, primaryRange)
-    effectiveStateRoot = stateSummary.effectiveStateRoot
-    effectiveSlot = stateSummary.effectiveSlot
 
-    // Other target eras' block_summary_roots come from the same blob — the getter reads
-    // from the state whose full hash_tree_root was just verified, so it's authenticated.
-    const blobRaw = Uint8Array.from(atob(stateSummary.getHistoricalSummariesBlob()), c => c.charCodeAt(0))
-    for (const e of uniqueEras) {
-      if (bsrByEra.has(e)) continue
-      const idx = historicalSummariesIndex(e, chainId)
-      if (idx >= 0 && (idx + 1) * 64 <= blobRaw.length)
-        bsrByEra.set(e, hexlify(blobRaw.slice(idx * 64, idx * 64 + 32)))
-    }
+    if (!eraTail && options?.histSource === 'era-tail') {
+      console.warn('[w3] Dev mode — histSource=era-tail forced, but reconstruction failed; NOT falling back to full state')
+    } else if (eraTail) {
+      effectiveStateRoot = eraTail.effectiveStateRoot
+      effectiveSlot = eraTail.effectiveSlot
+      effectiveBeaconRoot = eraTail.effectiveBeaconRoot
+      for (const e of uniqueEras) {
+        const idx = historicalSummariesIndex(e, chainId)
+        if (idx >= 0 && (idx + 1) * 64 <= eraTail.blob.length)
+          bsrByEra.set(e, hexlify(eraTail.blob.slice(idx * 64, idx * 64 + 32)))
+      }
+      let s = ''
+      for (let i = 0; i < eraTail.blob.length; i++) s += String.fromCharCode(eraTail.blob[i])
+      newBsrCache = { effectiveSlot, effectiveBeaconRoot, stateRoot: effectiveStateRoot, fieldProof: eraTail.fieldProof, histSummaries: btoa(s) }
+    } else {
+      const stateSummary = await getBlockSummaryRoot(consensusRpcs, anchor.slot, anchor.stateRoot, primaryHsIndex, primary.era, chainId, slots.map(s => s.slot), options?.checkpointUrls, options?.stateSource)
+      if (stateSummary.blockSummaryRoot) bsrByEra.set(primary.era, stateSummary.blockSummaryRoot)
+      blockRootsAtSlots = stateSummary.blockRootsAtSlots
+      effectiveStateRoot = stateSummary.effectiveStateRoot
+      effectiveSlot = stateSummary.effectiveSlot
 
-    // Fetch effectiveBeaconRoot: beacon block root at effectiveSlot, SSZ-verified by
-    // requiring header.state_root == effectiveStateRoot (ties root to the verified state).
-    for (const rpc of consensusRpcs) {
-      try {
-        const { root, stateRoot } = await fetchVerifiedBeaconHeader(rpc, effectiveSlot)
-        if (stateRoot.toLowerCase() === effectiveStateRoot.toLowerCase()) {
-          effectiveBeaconRoot = root
-          break
+      // Other target eras' block_summary_roots come from the same blob — the getter reads
+      // from the state whose full hash_tree_root was just verified, so it's authenticated.
+      const blobRaw = Uint8Array.from(atob(stateSummary.getHistoricalSummariesBlob()), c => c.charCodeAt(0))
+      for (const e of uniqueEras) {
+        if (bsrByEra.has(e)) continue
+        const idx = historicalSummariesIndex(e, chainId)
+        if (idx >= 0 && (idx + 1) * 64 <= blobRaw.length)
+          bsrByEra.set(e, hexlify(blobRaw.slice(idx * 64, idx * 64 + 32)))
+      }
+
+      // Fetch effectiveBeaconRoot: beacon block root at effectiveSlot, SSZ-verified by
+      // requiring header.state_root == effectiveStateRoot (ties root to the verified state).
+      for (const rpc of consensusRpcs) {
+        try {
+          const { root, stateRoot } = await fetchVerifiedBeaconHeader(rpc, effectiveSlot)
+          if (stateRoot.toLowerCase() === effectiveStateRoot.toLowerCase()) {
+            effectiveBeaconRoot = root
+            break
+          }
+        } catch { /* try next */ }
+      }
+      if (effectiveBeaconRoot) {
+        newBsrCache = {
+          effectiveSlot,
+          effectiveBeaconRoot,
+          stateRoot: effectiveStateRoot,
+          fieldProof: stateSummary.computeHistoricalSummariesFieldProof(),
+          histSummaries: stateSummary.getHistoricalSummariesBlob(),
         }
-      } catch { /* try next */ }
-    }
-    if (effectiveBeaconRoot) {
-      newBsrCache = {
-        effectiveSlot,
-        effectiveBeaconRoot,
-        stateRoot: effectiveStateRoot,
-        fieldProof: stateSummary.computeHistoricalSummariesFieldProof(),
-        histSummaries: stateSummary.getHistoricalSummariesBlob(),
       }
     }
   }

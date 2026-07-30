@@ -233,3 +233,46 @@ function staggeredRace<T>(thunks: Array<() => Promise<T>>, gapMs: number): Promi
       : new Promise<T>((resolve, reject) => { setTimeout(() => fn().then(resolve, reject), i * gapMs) }),
   ))
 }
+
+// Early-abort fetch of a finalized BeaconState's fixed section (first `needBytes`).
+// Streams the gzip'd state from a checkpoint provider and aborts once needBytes are
+// decompressed — ~1 MB over the wire instead of the full ~136 MB. Used by the
+// historical_summaries field-proof reconstruction (era-tail fast path). Returns the
+// fixed section + the state's slot, or null.
+export async function fetchAnchorFixedSection(
+  chainId: number,
+  customCheckpointUrls: string[] | undefined,
+  anchorSlot: number,
+  needBytes = 2_740_000,
+): Promise<{ fixedSection: Uint8Array; slot: number } | null> {
+  const rpcs = customCheckpointUrls !== undefined ? customCheckpointUrls : (CHECKPOINT_SYNC_RPCS[chainId] ?? [])
+  // Anchor at anchorSlot-32 (previous epoch boundary), NOT the finalized head: EIP-4788
+  // confirmation probes slot+1..+64, which must stay ≤ Helios's finalized head to be in the ring.
+  const stateId = anchorSlot > 64 ? String(anchorSlot - 32) : 'finalized'
+  for (const rpc of rpcs) {
+    const ac = new AbortController()
+    try {
+      const res = await fetch(`${rpc}/eth/v2/debug/beacon/states/${stateId}`, {
+        headers: { Accept: 'application/octet-stream', 'Accept-Encoding': 'gzip' },
+        signal: ac.signal,
+      })
+      if (!res.ok || !res.body) { ac.abort(); continue }
+      const reader = res.body.getReader()
+      const chunks: Uint8Array[] = []
+      let total = 0
+      while (total < needBytes) {
+        const { done, value } = await reader.read()
+        if (done) break
+        chunks.push(value); total += value.length
+      }
+      ac.abort()  // stop the underlying download
+      if (total < needBytes) continue
+      const out = new Uint8Array(total); let p = 0
+      for (const c of chunks) { out.set(c, p); p += c.length }
+      const slot = readU32LE(out, 40)  // BeaconState.slot @ byte 40
+      console.log(`[w3] anchor fixed section: ${(total / 1e6).toFixed(2)}MB early-abort from ${rpc} (slot ${slot})`)
+      return { fixedSection: out.subarray(0, needBytes), slot }
+    } catch { try { ac.abort() } catch {}; continue }
+  }
+  return null
+}
