@@ -13,7 +13,7 @@ import type { EraSource, StateSource, HistSource } from '../../types.js'
 import { computeBeaconBlockBodyRoot, computeBlindedBeaconBlockBodyRoot, verifyHistoricalSummariesFieldProof,
   reconstructStateRootFromHistSummaries, computeSyncCommitteeRoot, hashNodes, computeExecutionPayloadHeaderRoot } from './ssz-state-verifier.js'
 import { timestampToSlot, slotToTimestamp, sszMerkleize, readU32LE, fetchWithTimeout } from './beacon-primitives.js'
-import { getBlockSummaryRoot, fetchAnchorFixedSection } from './downloader/beacon-state.js'
+import { getBlockSummaryRoot, fetchFixedSectionAtSlot } from './downloader/beacon-state.js'
 import { findEraBlockRange, fetchEraBlockRootsFromExecHeaders } from './downloader/era-exec-headers.js'
 import { fetchEraBlockRootsFromParquet } from './downloader/era-parquet.js'
 import { fetchEraBlockRootsFromEraFile, fetchHistoricalSummariesFromEraFile } from './downloader/era-file.js'
@@ -30,7 +30,10 @@ const CAPELLA_ERA: Record<number, number> = {
   17000:    1,     // holesky CAPELLA_FORK_EPOCH 256 / 256
 }
 
-function historicalSummariesIndex(era: number, chainId: number): number {
+// Exported (alongside merkleProof/merkleVerify/beaconHeaderRoot/fetchVerifiedBeaconHeader/
+// fetchVerifyBeaconBodyHash/EIP4788_CONTRACT below) so the Mode-2 trust-chain proof test in
+// test/beacon-flow-proof.ts can exercise each verification step against the real code.
+export function historicalSummariesIndex(era: number, chainId: number): number {
   const idx = era - (CAPELLA_ERA[chainId] ?? 0)
   if (idx < 0) throw new Error(`Era ${era} is before Capella on chain ${chainId}`)
   return idx
@@ -49,7 +52,7 @@ function uint64LeBytes(n: bigint): Uint8Array {
 }
 
 // Returns the sibling hashes needed to prove leaf at `index` is in the tree.
-function merkleProof(leaves: Uint8Array[], index: number): Uint8Array[] {
+export function merkleProof(leaves: Uint8Array[], index: number): Uint8Array[] {
   let layer = Array.from({ length: 8192 }, (_, i) => leaves[i] ?? new Uint8Array(32))
   const path: Uint8Array[] = []
   let idx = index
@@ -69,7 +72,7 @@ function merkleProof(leaves: Uint8Array[], index: number): Uint8Array[] {
 }
 
 // Recomputes the Merkle root from a leaf + its proof path. Index determines left/right at each level.
-function merkleVerify(leaf: Uint8Array, index: number, path: Uint8Array[]): Uint8Array {
+export function merkleVerify(leaf: Uint8Array, index: number, path: Uint8Array[]): Uint8Array {
   let node: Uint8Array = leaf.slice()
   let idx = index
   for (const sibling of path) {
@@ -102,7 +105,7 @@ interface BeaconHeaderMsg {
   parent_root: string; state_root: string; body_root: string
 }
 
-function beaconHeaderRoot(msg: BeaconHeaderMsg): string {
+export function beaconHeaderRoot(msg: BeaconHeaderMsg): string {
   const leaves: Uint8Array[] = [
     uint64LeBytes(BigInt(msg.slot)),
     uint64LeBytes(BigInt(msg.proposer_index)),
@@ -114,7 +117,7 @@ function beaconHeaderRoot(msg: BeaconHeaderMsg): string {
   return hexlify(sszMerkleize(leaves))
 }
 
-async function fetchVerifiedBeaconHeader(
+export async function fetchVerifiedBeaconHeader(
   rpc: string,
   id: number | string,
 ): Promise<{ root: string; stateRoot: string; msg: BeaconHeaderMsg }> {
@@ -143,7 +146,7 @@ async function fetchVerifiedBeaconHeader(
 // A blinded body_root MISMATCH could be either a serialization bug or a forgery;
 // either way we fall through to the SSZ path, which is authoritative. If SSZ also
 // fails (unavailable, or its own mismatch) we reject — never a false accept.
-async function fetchVerifyBeaconBodyHash(
+export async function fetchVerifyBeaconBodyHash(
   rpc: string,
   slot: number,
   expectedBodyRoot: string,
@@ -212,7 +215,7 @@ async function fetchVerifyFullBlockSSZ(
 // ---------------------------------------------------------------------------
 
 // EIP-4788 ring buffer contract — same address on all chains post-Cancun
-const EIP4788_CONTRACT = '0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02'
+export const EIP4788_CONTRACT = '0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02'
 
 // Fast consensus anchor — does not need Helios. Helios is checked separately at the end
 // of verifyViaBeacon so it can run in parallel with the full verification pipeline.
@@ -289,26 +292,50 @@ async function tryEraTailStateSummary(
   checkpointUrls: string[] | undefined, eraFileUrls: string[] | undefined,
 ): Promise<{ blob: Uint8Array; effectiveStateRoot: string; effectiveSlot: number; effectiveBeaconRoot: string; fieldProof: string } | null> {
   try {
-    // 1. early-abort the finalized-32 state's fixed section → node(28-31), leaf 26, leaf 25 + slot S
-    const anchor = await fetchAnchorFixedSection(chainId, checkpointUrls, anchorSlot)
-    if (!anchor) return null
-    const S = anchor.slot
-    const era = Math.floor(S / 8192)
-
-    // 2. historical_summaries blob from the era-file tail
+    // historical_summaries changes only at era boundaries, so the current era's blob lives in
+    // exactly one place: era file `era` (its state at slot era·8192, count = era − Capella).
+    // That file publishes ~15-30 min AFTER the era boundary (once the boundary state finalizes
+    // and the archive uploads it), so this path has one unavoidable dead zone — the first
+    // ~tens of minutes of each era — where it 404s and we fall back to the full-state download.
+    //
+    // We anchor NOT at the era boundary but at a RECENT epoch-boundary slot near the finalized
+    // head: checkpoint providers only serve debug states for roughly the last ~64 slots, and a
+    // recent slot is comfortably inside the EIP-4788 ring for Helios confirmation. Any recent
+    // slot in this era has the same historical_summaries as the era file, so the blob still
+    // reconstructs it. (The previous version used the anchor's OWN era for the blob — always
+    // the current, still-unpublished one — so the era file 404'd on every call and this path
+    // never actually fired outside a lucky moment.)
+    const era = Math.floor(anchorSlot / 8192)
     const blob = await fetchHistoricalSummariesFromEraFile(era, chainId, eraFileUrls)
-    if (!blob) return null
-
-    // 3. SSZ-verified beacon header at S → block root + committed state_root
-    let hdr: { root: string; stateRoot: string } | null = null
-    for (const rpc of consensusRpcs) {
-      try { const v = await fetchVerifiedBeaconHeader(rpc, S); hdr = { root: v.root, stateRoot: v.stateRoot }; break } catch { /* next */ }
+    if (!blob) {
+      console.warn(`[w3] era-tail: era file ${era} not published yet (≈first 15-30 min after an era boundary) — full-state fallback`)
+      return null
     }
-    if (!hdr) return null
 
-    // 4/5. bootstrap(blockRoot) → current_sync_committee(+branch); update(period) → next_sync_committee
+    // Anchor at a recent epoch-boundary slot (multiple of 32 — what LC bootstrap serves) that is
+    // still in era `era` and served by checkpoint providers (last ~64 slots). Start 32 slots
+    // behind the anchor (keeps EIP-4788 probes ≤ finalized head) and walk back if it was missed.
+    let hdr: { root: string; stateRoot: string } | null = null
+    let anchorS = 0
+    let fixedSection: Uint8Array | null = null
+    for (let cand = anchorSlot - 32; cand >= anchorSlot - 64 && cand >= era * 8192; cand -= 32) {
+      let h: { root: string; stateRoot: string } | null = null
+      for (const rpc of consensusRpcs) {
+        try { const v = await fetchVerifiedBeaconHeader(rpc, cand); h = { root: v.root, stateRoot: v.stateRoot }; break } catch { /* next */ }
+      }
+      if (!h) continue  // missed slot → try the previous epoch boundary
+      const fx = await fetchFixedSectionAtSlot(chainId, checkpointUrls, cand)
+      if (!fx || fx.slot !== cand) continue
+      hdr = h; anchorS = cand; fixedSection = fx.fixedSection; break
+    }
+    if (!hdr || !fixedSection) {
+      console.warn(`[w3] era-tail: no recent checkpoint-served epoch boundary near slot ${anchorSlot} — full-state fallback`)
+      return null
+    }
+
+    // bootstrap(blockRoot) → current_sync_committee(+branch); update(period) → next_sync_committee
     let bootstrap: any = null, upd: any = null
-    const period = Math.floor(S / 32 / 256)
+    const period = Math.floor(anchorS / 32 / 256)
     for (const rpc of consensusRpcs) {
       try {
         const b = await fetchWithTimeout(`${rpc}/eth/v1/beacon/light_client/bootstrap/${hdr.root}`, { headers: { Accept: 'application/json' } }, 15_000)
@@ -320,9 +347,12 @@ async function tryEraTailStateSummary(
         if (bootstrap?.current_sync_committee_branch && upd?.next_sync_committee) break
       } catch { /* next */ }
     }
-    if (!bootstrap?.current_sync_committee_branch || !bootstrap?.current_sync_committee || !upd?.next_sync_committee) return null
+    if (!bootstrap?.current_sync_committee_branch || !bootstrap?.current_sync_committee || !upd?.next_sync_committee) {
+      console.warn(`[w3] era-tail: LC bootstrap/update unavailable at slot ${anchorS} — full-state fallback`)
+      return null
+    }
 
-    // 6. derive the three top field-tree siblings
+    // derive the three top field-tree siblings
     const br = (bootstrap.current_sync_committee_branch as string[]).map((x) => getBytes(x))
     if (br.length < 6) return null
     const node0_15 = br[4], node32_63 = br[5], node16_19 = br[2], node20_21 = br[1]
@@ -330,27 +360,30 @@ async function tryEraTailStateSummary(
     const leaf23 = getBytes(computeSyncCommitteeRoot(syncCommitteeSSZ(upd.next_sync_committee)))
     const node16_23 = hashNodes(node16_19, hashNodes(node20_21, hashNodes(leaf22, leaf23)))
 
-    // 7. execution_payload_header root from the blinded block at S
+    // execution_payload_header root from the blinded block at the anchor slot
     let execHeaderRoot: Uint8Array | null = null
     for (const rpc of consensusRpcs) {
       try {
-        const bl = await fetchWithTimeout(`${rpc}/eth/v1/beacon/blinded_blocks/${S}`, { headers: { Accept: 'application/json' } }, 20_000)
+        const bl = await fetchWithTimeout(`${rpc}/eth/v1/beacon/blinded_blocks/${anchorS}`, { headers: { Accept: 'application/json' } }, 20_000)
         if (!bl.ok) continue
         const body = (await bl.json()).data?.message?.body
         if (body?.execution_payload_header) { execHeaderRoot = getBytes(computeExecutionPayloadHeaderRoot(body.execution_payload_header)); break }
       } catch { /* next */ }
     }
-    if (!execHeaderRoot) return null
+    if (!execHeaderRoot) {
+      console.warn(`[w3] era-tail: blinded block unavailable at slot ${anchorS} — full-state fallback`)
+      return null
+    }
 
-    // 8. reconstruct + 9. anchor to the SSZ-verified header's state_root (fails closed)
-    const recon = reconstructStateRootFromHistSummaries(blob, node0_15, node16_23, node32_63, anchor.fixedSection, execHeaderRoot)
+    // reconstruct + anchor to the SSZ-verified header's state_root (fails closed)
+    const recon = reconstructStateRootFromHistSummaries(blob, node0_15, node16_23, node32_63, fixedSection, execHeaderRoot)
     if (!recon) return null
     if (recon.stateRoot.toLowerCase() !== hdr.stateRoot.toLowerCase()) {
       console.warn(`[w3] era-tail reconstruct ≠ header state_root (${recon.stateRoot.slice(0,10)}… vs ${hdr.stateRoot.slice(0,10)}…) — full-state fallback`)
       return null
     }
-    console.log(`[w3] historical_summaries via era-tail + LC reconstruction ✓ (slot ${S}, no full-state download)`)
-    return { blob, effectiveStateRoot: recon.stateRoot, effectiveSlot: S, effectiveBeaconRoot: hdr.root, fieldProof: recon.fieldProof }
+    console.log(`[w3] historical_summaries via era-tail + LC reconstruction ✓ (anchor slot ${anchorS}, no full-state download)`)
+    return { blob, effectiveStateRoot: recon.stateRoot, effectiveSlot: anchorS, effectiveBeaconRoot: hdr.root, fieldProof: recon.fieldProof }
   } catch (e) {
     console.warn(`[w3] era-tail reconstruction failed (${(e as Error).message}) — full-state fallback`)
     return null
@@ -393,7 +426,15 @@ export interface BeaconVerifyOptions {
   eraSource?: EraSource
   stateSource?: StateSource
   histSource?: HistSource
+  // Returns true once a newer navigation for the same tab has superseded this run. Checked at
+  // each expensive boundary so a stale verification aborts BEFORE the ~334 MB BeaconState
+  // download instead of running the whole pipeline and having only its badge write discarded.
+  shouldAbort?: () => boolean
 }
+
+// Thrown by verifyViaBeacon when options.shouldAbort() fires. The caller treats it as a quiet,
+// expected outcome (a newer navigation won), not a verification failure.
+export const SUPERSEDED = 'superseded by newer navigation'
 
 export interface BeaconVerification {
   slot: number
@@ -434,7 +475,11 @@ export async function verifyViaBeacon(
   const execRpcs = executionRpcs?.length ? executionRpcs : []
   if (!execRpcs.length) throw new Error('No execution RPCs provided for era block root verification')
 
+  // Abort early at each expensive boundary if a newer navigation has superseded this run.
+  const bail = () => { if (options?.shouldAbort?.()) throw new Error(SUPERSEDED) }
+
   // Step 1: Fast consensus anchor (~100 ms). Helios runs in parallel and is checked last.
+  bail()
   const anchor = await getAnchorStateRoot(consensusRpcs)
   const currentEra = Math.floor(anchor.slot / 8192)
 
@@ -492,6 +537,7 @@ export async function verifyViaBeacon(
   }
 
   if (!eraBsrHit) {
+    bail()  // last chance before the era-tail / ~334 MB full-state download
     const primaryHsIndex = historicalSummariesIndex(primary.era, chainId)
 
     // Fast path: era-tail historical_summaries + LC-branch reconstruction (~23 MB, seconds)
@@ -566,6 +612,7 @@ export async function verifyViaBeacon(
     (cachedPaths && cachedPaths.length === slots.length ? cachedPaths[i] : null) ?? null
   const eraRootsByEra = new Map<number, Uint8Array[]>()
 
+  bail()
   for (const e of uniqueEras) {
     const needed = slots.some((s, i) => s.era === e && !blockRootsAtSlots[s.slot] && !cachedPathFor(i))
     if (!needed) {
@@ -630,6 +677,7 @@ export async function verifyViaBeacon(
   const rootBySlot = new Map<number, string>()
   const execHashBySlot = new Map<number, string>()
 
+  bail()
   for (let i = 0; i < slots.length; i++) {
     const s = slots[i]
 

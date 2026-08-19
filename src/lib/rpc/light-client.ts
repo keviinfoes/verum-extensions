@@ -258,7 +258,7 @@ export class RpcClient implements IVerifiedRpc {
 // candidate: per-request consensus failover inside the proxy replaces it and
 // halves the startup load. Throws if init fails — callers must not fall back
 // to an unverified RPC.
-export async function createVerifiedRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
+export async function createVerifiedRpc(chain: ChainConfig, forceFresh = false): Promise<IVerifiedRpc> {
   const network = heliosNetwork(chain.chainId)
   console.log(`[w3] Helios proxy: ${chain.rpcs.length} exec + ${chain.consensusRpcs.length} consensus RPCs for chainId ${chain.chainId}`)
 
@@ -268,7 +268,7 @@ export async function createVerifiedRpc(chain: ChainConfig): Promise<IVerifiedRp
   _proxyRpcs.set(consKey, chain.consensusRpcs)
 
   try {
-    return await HeliosWasmClient.create(network, `https://${consKey}`, [`https://${execKey}/`])
+    return await HeliosWasmClient.create(network, `https://${consKey}`, [`https://${execKey}/`], forceFresh)
   } catch (err) {
     _proxyRpcs.delete(execKey)
     _proxyRpcs.delete(consKey)

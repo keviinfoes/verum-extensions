@@ -96,6 +96,20 @@ async function getText(rpc: IVerifiedRpc, resolver: string, node: Uint8Array, ke
 // Main resolver
 // ---------------------------------------------------------------------------
 
+// ENS/GNS re-verification: after phase 1 resolves a name via a plain RPC, the name is
+// re-resolved through Helios (trustless, at `finalized`) and the two chunk lists compared.
+// Returns true if Helios confirms the same chunks, false if it resolves to definitively
+// different non-empty chunks (possible forgery), undefined if Helios couldn't resolve
+// (error or empty result — unverified, not proof of forgery).
+export function compareEnsChunks(heliosChunks: TxRef[], phase1Chunks: TxRef[]): boolean | undefined {
+  if (heliosChunks.length === 0) return undefined
+  return heliosChunks.length === phase1Chunks.length
+    && heliosChunks.every((c, i) => {
+      const p = phase1Chunks[i]
+      return c.blockNumber === p.blockNumber && c.txIndex === p.txIndex
+    })
+}
+
 export async function resolveEns(
   name: string,
   rpc: IVerifiedRpc,

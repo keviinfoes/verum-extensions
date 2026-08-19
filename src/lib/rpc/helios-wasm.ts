@@ -21,9 +21,14 @@ export class HeliosWasmClient implements IVerifiedRpc {
     network: Network,
     consensusRpc: string,
     executionRpcs: string[],
+    forceFresh = false,
   ): Promise<HeliosWasmClient> {
     const checkpointKey = `helios_checkpoint_${network}`
-    const stored = await chrome.storage.session.get(checkpointKey)
+    // A wedged-instance restart passes forceFresh so the replacement re-anchors
+    // from a freshly-fetched finalized root instead of the checkpoint cached by
+    // the instance that just wedged — reusing that value rebuilds the same anchor
+    // and re-wedges. The fresh root is still saved below for the next warm start.
+    const stored = forceFresh ? {} : await chrome.storage.session.get(checkpointKey)
     // Legacy entries are bare strings; current format carries savedAt so a stale
     // checkpoint (bootstrap endpoints 404 old roots) can be skipped instead of
     // burning a doomed sync attempt before the live-root retry.

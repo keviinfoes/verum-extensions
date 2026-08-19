@@ -354,9 +354,10 @@ const CAPELLA_ERA: Record<number, number> = { 1: 758, 11155111: 222, 17000: 0 }
 const HS_TAIL_FETCH = 20_000_000  // compressed suffix to cover hs + pending_* at the tail
 
 /**
- * Fetch the raw historical_summaries blob (N×64 bytes) from an era file, without
- * downloading the full multi-hundred-MB state. Returns null on any failure so the
- * caller can fall back to the full-state download.
+ * Fetch the raw historical_summaries blob (N×64 bytes) from a (published) era file, without
+ * downloading the full multi-hundred-MB state — just a small FRONT read (block_roots, to fix
+ * the tail alignment) and a ~20MB TAIL suffix. Returns null on any failure so the caller can
+ * fall back to the full-state download.
  *
  * NOT self-verifying on its own — the returned blob must still be anchored via the
  * historical_summaries field proof against a Helios-verified state_root.

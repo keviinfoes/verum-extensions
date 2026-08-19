@@ -438,6 +438,12 @@ function pickWallet(wallets: Array<{ name: string; id: string }>): Promise<strin
 // ---------------------------------------------------------------------------
 
 
+// Monotonic navigation token. Each navigate() claims the next value; if a newer navigate()
+// starts while an older one is still setting up, the older one sees its token is stale and
+// bails before opening a second web3-resolve port (which would kick off a redundant, expensive
+// Phase-2 pipeline in the background for the same tab).
+let navSeq = 0
+
 const initialUrl = location.hash.slice(1)
 if (initialUrl) {
   navigate(initialUrl)
@@ -456,6 +462,8 @@ window.addEventListener('hashchange', () => {
 // ---------------------------------------------------------------------------
 
 async function navigate(web3Url: string, attempt = 0) {
+  const navToken = ++navSeq
+
   // Hide stale dapp content immediately — before any await — so the old dapp
   // never flashes through while storage is read or content arrives fast (local mode).
   dappHost.classList.remove('dapp-visible')
@@ -500,12 +508,17 @@ async function navigate(web3Url: string, attempt = 0) {
   setPhase('loading')
   loadingText.textContent = 'Loading…'
 
+  // A newer navigate() started while we were reading storage / parsing — don't open a second
+  // resolve port; the newer one owns the tab now.
+  if (navToken !== navSeq) return
+
   let contentReceived = false
   await new Promise<void>((resolve) => {
     const port = chrome.runtime.connect({ name: 'web3-resolve' })
     port.postMessage({ type: 'resolve', url: web3Url } as BgMessage)
 
     port.onMessage.addListener((msg: BgResponse) => {
+      if (navToken !== navSeq) { resolve(); return }  // superseded — ignore this run's updates
       if (msg.type === 'error') {
         showError(msg.message)
         resolve()

@@ -4,9 +4,10 @@ import { getVerifiedCalldataByLocation, verifyTxInBlock } from './lib/verify/tx-
 import type { RpcBlockFull } from './lib/verify/tx-verifier.js'
 import { getCalldataViaPortal } from './lib/rpc/portal.js'
 import { parseCalldata, assembleContent } from './lib/w3/content.js'
-import { resolveEns } from './lib/w3/name-resolver.js'
+import { resolveEns, compareEnsChunks } from './lib/w3/name-resolver.js'
 import type { TxRef } from './lib/w3/name-resolver.js'
-import { verifyViaBeacon, isEip2935Error } from './lib/verify/beacon-verifier.js'
+import { verifyViaBeacon, isEip2935Error, SUPERSEDED } from './lib/verify/beacon-verifier.js'
+import { timestampToSlot } from './lib/verify/beacon-primitives.js'
 import type { DappProofData, EraBsrCache } from './lib/verify/beacon-verifier.js'
 import { DEFAULT_CHAINS, DEFAULT_DEV_SETTINGS } from './types.js'
 import type { BgMessage, BgResponse, VerificationUpdate, ChainConfig, VerificationResult, DevSettings, EraSource, StateSource, ForceMode, HistSource } from './types.js'
@@ -14,7 +15,7 @@ import { listWallets, ethRequest as walletRequest } from './lib/wallets/metamask
 import { isFrameAvailable, frameRequest } from './lib/wallets/frame-bridge.js'
 import type { IVerifiedRpc } from './lib/rpc/light-client.js'
 
-const BUILD_ID = 'era-tail-devmode-2026-07-30T78'
+const BUILD_ID = 'clear-stale-proof-on-nav-2026-08-19T1'
 
 console.log(`[w3] background build ${BUILD_ID}`)
 
@@ -45,6 +46,49 @@ function evictChainRpc(chainId: number) {
   rpcCache.delete(chainId)
   old?.then(rpc => (rpc as { shutdown?: () => Promise<void> }).shutdown?.().catch(() => {})).catch(() => {})
 }
+
+// Diagnostic-only: after repeated wedged restarts, probe the configured consensus
+// endpoints directly for their current optimistic head. The OOS "N seconds behind"
+// lag is head-timestamp vs wall-clock, and the head only advances via consensus
+// optimistic updates — so a genuinely stale feed and a healthy feed with a wedged
+// WASM instance produce the SAME symptom from the instance's side. This records
+// which one it actually is so the log stops mislabeling a healthy feed as stale.
+// Never throws; hits the real consensus URLs, not the proxy sentinels.
+async function logConsensusLiveness(chain: ChainConfig, emsg: string, n: number): Promise<void> {
+  const expectedSlot = timestampToSlot(Math.floor(Date.now() / 1000), chain.chainId)
+  for (const rpc of chain.consensusRpcs) {
+    try {
+      const ctrl = new AbortController()
+      const timer = setTimeout(() => ctrl.abort(), 8_000)
+      const res = await fetch(rpc.replace(/\/$/, '') + '/eth/v1/beacon/light_client/optimistic_update',
+        { headers: { Accept: 'application/json' }, signal: ctrl.signal })
+      clearTimeout(timer)
+      if (!res.ok) continue
+      const body = await res.json() as { data?: { attested_header?: { beacon?: { slot?: string } } } }
+      const slot = Number(body?.data?.attested_header?.beacon?.slot)
+      if (!Number.isFinite(slot)) continue
+      const behind = (expectedSlot - slot) * 12
+      const host = new URL(rpc).hostname
+      if (behind > OOS_RESTART_LAG_SECONDS) {
+        console.warn(`[w3] ${emsg} — ${n} consecutive wedged restarts; consensus feed IS stale ` +
+          `(${host} optimistic head ${behind}s behind wall-clock), backing off 15s`)
+      } else {
+        console.warn(`[w3] ${emsg} — ${n} consecutive wedged restarts, but consensus is current ` +
+          `(${host} optimistic head ${behind}s behind) — WASM wedged against a healthy feed; ` +
+          `re-anchoring fresh, backing off 15s`)
+      }
+      return
+    } catch { /* endpoint unreachable — try the next */ }
+  }
+  console.warn(`[w3] ${emsg} — ${n} consecutive wedged restarts; consensus endpoints unreachable ` +
+    `for a liveness probe, backing off 15s`)
+}
+// Chains whose next createVerifiedRpc must re-anchor from a freshly-fetched
+// finalized root rather than the cached checkpoint. Set by the wedged-restart
+// path: evictChainRpc tears down the WASM but does NOT clear the cached
+// checkpoint, so without this the replacement rebuilds the same anchor and
+// re-wedges. Consumed (and cleared) in getOrCreateRpc.
+const forceFreshAnchor = new Set<number>()
 const freshRpcCache = new Map<number, Promise<IVerifiedRpc>>()
 // Stores the already-resolved Helios instance once freshRpcCache settles.
 // ethRpcCall can check this synchronously and skip the 100ms race entirely.
@@ -149,7 +193,9 @@ function writeEraBsrCache(cache: Record<number, EraBsrCache>): void {
 // Used by beacon verification which needs Helios quickly within its 35s timeout.
 function getOrCreateRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
   if (!rpcCache.has(chain.chainId)) {
-    const p = createVerifiedRpc(chain)
+    // Set.delete returns true iff the chain was flagged for a fresh re-anchor,
+    // clearing the flag atomically so only this create honors it.
+    const p = createVerifiedRpc(chain, forceFreshAnchor.delete(chain.chainId))
     p.catch(() => {
       // Both consensus RPCs failed (likely rate-limited). Wait 60s before
       // allowing a retry — clearing immediately causes a tight hammering loop
@@ -184,6 +230,7 @@ function getOrCreateFreshRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
       // can serve all calls. Fast 500ms retries (vs old 1s new-block wait).
       const t0 = Date.now()
       let lastLag = '?'
+      let wedged = false
       for (let i = 0; i < 120; i++) {
         try {
           await rpc.request<string>('eth_blockNumber', [], true)  // quickFail — skip internal 3s retry
@@ -192,17 +239,23 @@ function getOrCreateFreshRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
         } catch (err: any) {
           if (!(err?.message ?? '').includes('out of sync')) return rpc  // non-OOS error, proceed
           lastLag = (err.message as string).match(/(\d+) seconds? behind/)?.[1] ?? '?'
+          // A lag at/beyond the restart threshold isn't drift waiting to heal —
+          // the WASM's internal update loop has wedged and the head won't advance
+          // (classic long-open-page symptom: lag *grows* each poll). Don't wait out
+          // the full 60s cycle; the keepalive path can't rescue us here because the
+          // instance isn't in freshRpcReady yet. Bail now for an immediate restart.
+          if (Number(lastLag) >= OOS_RESTART_LAG_SECONDS) { wedged = true; break }
         }
         if (i > 0 && i % 10 === 0) {
           console.log(`[w3] Helios OOS probe still waiting (${Math.round((Date.now() - t0) / 1000)}s, ${lastLag}s behind)…`)
         }
         await new Promise(r => setTimeout(r, 500))
       }
-      // Probe exhausted — Helios execution head still stale. Clear self from the
-      // cache so the next ethRpcCall or ping creates a fresh probe rather than
-      // returning this rejected promise. Do NOT set freshRpcReady with an OOS instance.
+      // Probe exhausted (or wedged). Clear self from the cache so the rejection
+      // handler / next ping recreates a probe rather than returning this rejected
+      // promise. Do NOT set freshRpcReady with an OOS instance.
       freshRpcCache.delete(chain.chainId)
-      throw new Error('Helios OOS probe exhausted')
+      throw new Error(wedged ? `Helios OOS wedged (${lastLag}s behind)` : 'Helios OOS probe exhausted')
     })
     p.then(
       (rpc) => {
@@ -214,7 +267,33 @@ function getOrCreateFreshRpc(chain: ChainConfig): Promise<IVerifiedRpc> {
       },
       (err: any) => {
         heliosSyncingSignaled.delete(chain.chainId)
-        if ((err?.message ?? '').includes('OOS probe exhausted')) {
+        const emsg = err?.message ?? ''
+        if (emsg.includes('OOS wedged')) {
+          // Lag past the restart threshold — don't burn two 60s exhaustion cycles
+          // first. Evict the wedged WASM instance and re-probe on a fresh one now;
+          // bootstrap re-anchors to the current finalized checkpoint, so the
+          // replacement comes up current instead of 150s+ behind. Guard against a
+          // genuinely dead consensus feed (fresh instance immediately wedged again):
+          // after a few immediate restarts, back off so we don't hammer bootstrap.
+          const n = (oosExhaustionCount.get(chain.chainId) ?? 0) + 1
+          oosExhaustionCount.set(chain.chainId, n)
+          // The replacement must re-anchor from a fresh finalized root — the
+          // cached checkpoint survives eviction and would reproduce this wedge.
+          forceFreshAnchor.add(chain.chainId)
+          evictChainRpc(chain.chainId)
+          if (n >= 3) {
+            oosExhaustionCount.set(chain.chainId, 0)
+            // Don't assume the consensus feed is stale here: a healthy feed with a
+            // WASM instance wedged against it looks identical from this vantage. Probe
+            // the real consensus head so the log records which failure this actually
+            // is, then back off 15s regardless.
+            void logConsensusLiveness(chain, emsg, n)
+            setTimeout(() => getOrCreateFreshRpc(chain), 15_000)
+          } else {
+            console.warn(`[w3] ${emsg} — restarting WASM instance immediately (attempt ${n})`)
+            getOrCreateFreshRpc(chain)
+          }
+        } else if (emsg.includes('OOS probe exhausted')) {
           const n = (oosExhaustionCount.get(chain.chainId) ?? 0) + 1
           oosExhaustionCount.set(chain.chainId, n)
           if (n >= 2) {
@@ -251,18 +330,6 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
   return true
 }
 
-// Returns true if Helios confirms the same chunks as phase 1, false if it resolves
-// to definitively different non-empty chunks (forged), undefined if Helios couldn't
-// resolve (error or empty result — unverified, not forged).
-function compareEnsChunks(heliosChunks: TxRef[], phase1Chunks: TxRef[]): boolean | undefined {
-  if (heliosChunks.length === 0) return undefined
-  return heliosChunks.length === phase1Chunks.length
-    && heliosChunks.every((c, i) => {
-      const p = phase1Chunks[i]
-      return c.blockNumber === p.blockNumber && c.txIndex === p.txIndex
-    })
-}
-
 // Retrieve calldata from a local Portal node when the execution RPC doesn't
 // have the historical transaction. Requires blockNumber + txIndex in the ENS record.
 async function fetchCalldataFromPortal(
@@ -295,10 +362,28 @@ async function fetchCalldataFromPortal(
 // ---------------------------------------------------------------------------
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  // A committed top-level URL change invalidates the previous page's verification
+  // for this tab. Without this, navigating away (or to a new w3:// page) left the
+  // old `proof_${tabId}` in session storage, so the popup kept showing the prior
+  // page's proof even though its badge was gone. Bump the generation first so any
+  // in-flight phase 2 for the old page sees itself superseded and can't re-write
+  // the proof after we clear it; then clear the badge + stored proof so the popup
+  // reads idle until the new page (if any) produces its own proof.
+  if (changeInfo.url) {
+    tabVerGen.set(tabId, (tabVerGen.get(tabId) ?? 0) + 1)
+    clearBadge(tabId)
+  }
   const url = changeInfo.url ?? tab.pendingUrl ?? tab.url ?? ''
   if (url.startsWith('w3://')) {
     chrome.tabs.update(tabId, { url: rendererFor(url) })
   }
+})
+
+// Drop per-tab verification state when a tab closes so a reused tab id can't
+// surface a closed tab's stale proof.
+chrome.tabs.onRemoved.addListener((tabId) => {
+  tabVerGen.delete(tabId)
+  clearBadge(tabId)
 })
 
 // ---------------------------------------------------------------------------
@@ -510,6 +595,16 @@ async function twoPhaseResolve(
   // ── Phase 2: Helios verification in background ────────────────────────────
   if (!tabId) return
 
+  // A newer navigation for this tab may have started while Phase 1 was in flight (e.g. a
+  // double navigate() at boot). Phase 2 is the expensive part — a ~334 MB BeaconState download
+  // and 60 s hash — so bail before starting it rather than racing a redundant pipeline whose
+  // result the supersede guard would only discard at the badge write.
+  if (isSuperseded()) {
+    console.log('[w3] Phase 2 skipped — superseded by a newer navigation for this tab')
+    port.disconnect()
+    return
+  }
+
   // ── Portal path: if a local Portal node is configured, use it first ───────
   // Portal nodes verify calldata ∈ tx ∈ block ∈ canonical chain before storing,
   // so a successful fetch from the user's own node needs no re-verification —
@@ -642,6 +737,7 @@ async function twoPhaseResolve(
     eraSource: dev.devMode ? dev.eraSource : 'auto' as const,
     stateSource: dev.devMode ? dev.stateSource : 'auto' as const,
     histSource: dev.devMode ? dev.histSource : 'auto' as const,
+    shouldAbort: isSuperseded,  // bail out of the pipeline if a newer navigation supersedes us
   }
 
   // Dev mode can override the block-age gate. Without this, a recent target always
@@ -722,6 +818,13 @@ async function twoPhaseResolve(
         },
       }
     } catch (beaconErr) {
+      // Superseded by a newer navigation (or aborted mid-flight because of one) — a quiet,
+      // expected outcome, not a failure. Drop this stale run without touching the badge.
+      if ((beaconErr as Error).message === SUPERSEDED || isSuperseded()) {
+        console.log('[w3] Mode 2 — discarded: superseded by a newer navigation for this tab')
+        port.disconnect()
+        return
+      }
       console.error('[w3] Mode 2 — beacon pipeline failed:', beaconErr)
       update = {
         type: 'verification-update',
@@ -867,6 +970,11 @@ async function twoPhaseResolve(
           },
         }
       } catch (beaconErr) {
+        if ((beaconErr as Error).message === SUPERSEDED || isSuperseded()) {
+          console.log('[w3] Mode 2 — discarded: superseded by a newer navigation for this tab')
+          port.disconnect()
+          return
+        }
         console.error('[w3] Mode 2 — beacon pipeline also failed:', beaconErr)
         update = {
           type: 'verification-update',

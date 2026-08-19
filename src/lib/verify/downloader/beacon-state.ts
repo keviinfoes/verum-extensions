@@ -52,6 +52,9 @@ export async function getBlockSummaryRoot(
   // provider to return a 200 wins and downloads alone; the rest are aborted.
 
   const open = async (rpc: string, ac: AbortController): Promise<OpenState> => {
+    // A staggered loser whose timer fires after the winner already aborted it: skip quietly so
+    // it doesn't log a misleading "Fetching state" for a download that never actually starts.
+    if (ac.signal.aborted) throw new Error('open aborted before start')
     const stateId = await fetchLiveDlSlot(rpc, ac.signal)
     console.log(`[w3] Fetching state (slot ${stateId}) from ${rpc}…`)
     const res = await fetch(`${rpc}/eth/v2/debug/beacon/states/${stateId}`, {
@@ -234,21 +237,20 @@ function staggeredRace<T>(thunks: Array<() => Promise<T>>, gapMs: number): Promi
   ))
 }
 
-// Early-abort fetch of a finalized BeaconState's fixed section (first `needBytes`).
+// Early-abort fetch of a BeaconState's fixed section (first `needBytes`) at an exact slot.
 // Streams the gzip'd state from a checkpoint provider and aborts once needBytes are
-// decompressed — ~1 MB over the wire instead of the full ~136 MB. Used by the
-// historical_summaries field-proof reconstruction (era-tail fast path). Returns the
-// fixed section + the state's slot, or null.
-export async function fetchAnchorFixedSection(
+// decompressed — ~2.75 MB over the wire instead of the full ~136 MB. Used by the
+// historical_summaries field-proof reconstruction (era-tail fast path) when the era
+// boundary slot is missed and the fixed section can't come from the era file. Returns
+// the fixed section + the state's slot, or null.
+export async function fetchFixedSectionAtSlot(
   chainId: number,
   customCheckpointUrls: string[] | undefined,
-  anchorSlot: number,
+  stateSlot: number,
   needBytes = 2_740_000,
 ): Promise<{ fixedSection: Uint8Array; slot: number } | null> {
   const rpcs = customCheckpointUrls !== undefined ? customCheckpointUrls : (CHECKPOINT_SYNC_RPCS[chainId] ?? [])
-  // Anchor at anchorSlot-32 (previous epoch boundary), NOT the finalized head: EIP-4788
-  // confirmation probes slot+1..+64, which must stay ≤ Helios's finalized head to be in the ring.
-  const stateId = anchorSlot > 64 ? String(anchorSlot - 32) : 'finalized'
+  const stateId = String(stateSlot)
   for (const rpc of rpcs) {
     const ac = new AbortController()
     try {

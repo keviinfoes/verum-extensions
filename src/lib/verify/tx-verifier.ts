@@ -207,8 +207,7 @@ function serializeTx(tx: RpcTx): Uint8Array {
     )
     return concat([new Uint8Array([0x03]), inner])
   }
-  // EIP-7702 set-code transaction (Pectra). MetaMask's smart accounts send these,
-  // and one anywhere in a block breaks the whole trie rebuild if unhandled.
+  // EIP-7702 set-code transaction (Pectra).
   // Same fields as type 2 plus authorization_list before the signature.
   if (type === 4) {
     const inner = getBytes(

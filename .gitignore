@@ -32,3 +32,4 @@ scripts/.strawmap-tmp/
 # Logs
 *.log
 npm-debug.log*
+test/.verification-flow-proof.mjs
