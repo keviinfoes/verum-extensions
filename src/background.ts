@@ -1142,9 +1142,15 @@ async function _ethRpcCall(chainId: number, cacheKey: string, method: string, pa
     // Timeout after 45s so message channels don't stay open indefinitely;
     // resolve with stale cache or error so the dapp can handle it gracefully.
     return new Promise<{ result?: unknown; error?: string }>(resolve => {
+      const timer = setTimeout(() => {
+        resolve(heliosReadCache.has(cacheKey)
+          ? { result: heliosReadCache.get(cacheKey) }
+          : { error: 'Helios not ready (45s timeout)' })
+      }, 45_000)
       const queue = pendingReads.get(chain.chainId) ?? []
       if (!pendingReads.has(chain.chainId)) pendingReads.set(chain.chainId, queue)
       queue.push(async (helios) => {
+        clearTimeout(timer)
         const isCacheableQ = CACHEABLE_METHODS.has(method)
         const releaseQ = isCacheableQ ? null : await acquireEthCallSlot()
         try {

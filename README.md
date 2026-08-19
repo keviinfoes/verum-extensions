@@ -44,3 +44,7 @@ node scripts/set-ens.js <name.eth> <rpc-url> <private-key> <block:idx> [<block:i
 # Point an owned GNS (.gwei) name at coordinates
 node scripts/set-gns.js <name.gwei> <rpc-url> <private-key> <block:idx> [<block:idx> ...]
 ```
+
+---
+
+Built with [Claude Code](https://claude.ai/code)
