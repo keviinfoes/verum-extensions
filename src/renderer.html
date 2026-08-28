@@ -48,7 +48,7 @@
   <!-- Dapp renders here; div is the fixed viewport element, iframe is its block child.
        Sandbox src is set eagerly so it loads while the div is still hidden. -->
   <div id="dapp-host">
-    <iframe id="dapp-frame" src="dapp-sandbox.html"></iframe>
+    <iframe id="dapp-frame" src="dapp-sandbox.html" allow="clipboard-write"></iframe>
   </div>
 
   <!-- Raw content viewer for non-dapp files (PDF, plain text, binary).

@@ -9,6 +9,14 @@ const EIP4788_PROBE = '0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02'
 
 export class HeliosWasmClient implements IVerifiedRpc {
   private lastCheckpointSave = 0
+  // Number of provider.request() calls currently awaiting the WASM, and a barrier that
+  // shutdown() waits on. Tearing down the WASM (provider.shutdown()) while a request is
+  // mid-flight re-enters the same wasm-bindgen object → "recursive use of an object".
+  // This lets an OOS-wedge restart evict-and-replace the instance without crashing an
+  // in-flight verification call on it.
+  private inFlight = 0
+  private idleWaiters: Array<() => void> = []
+  private shuttingDown = false
   private constructor(
     private readonly provider: HeliosProvider,
     private readonly checkpointKey: string,
@@ -206,15 +214,32 @@ export class HeliosWasmClient implements IVerifiedRpc {
   }
 
   async request<T>(method: string, params: unknown[], quickFail = false): Promise<T> {
+    this.inFlight++
+    try {
+      return await this._request<T>(method, params, quickFail)
+    } finally {
+      if (--this.inFlight === 0) {
+        const waiters = this.idleWaiters
+        this.idleWaiters = []
+        for (const w of waiters) w()
+      }
+    }
+  }
+
+  private async _request<T>(method: string, params: unknown[], quickFail = false): Promise<T> {
     // Guard against WASM hangs: if provider.request() never resolves (WASM panic,
     // OOM, etc.) the acquireEthCallSlot slot held by the caller is never released.
-    // After 4 stuck calls the semaphore fills and the extension freezes until
-    // a manual reload. The timeout ensures slots are always released within 20s.
+    // The timeout ensures slots are always released. A heavy aggregator eth_call
+    // (e.g. a DEX quoter touching dozens of pools) legitimately takes tens of seconds
+    // under Helios because it fetches eth_getProof for all touched state — a 20s cap
+    // failed those calls, and dapps that split-and-retry on failure (mc3-style) then
+    // storm the RPC forever. 45s lets the big call complete so it never has to split.
+    const startedAt = Date.now()
     const call = (): Promise<T> =>
       Promise.race([
         this.provider.request({ method, params: params as unknown[] }) as Promise<T>,
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Helios WASM call timeout')), 20_000),
+          setTimeout(() => reject(new Error('Helios WASM call timeout')), 45_000),
         ),
       ])
     try {
@@ -231,6 +256,7 @@ export class HeliosWasmClient implements IVerifiedRpc {
         this.saveCheckpoint()
         return result
       }
+      console.warn(`[w3] Helios ${method} FAILED after ${Date.now() - startedAt}ms — ${err?.message ?? err}`)
       throw err
     }
   }
@@ -246,5 +272,19 @@ export class HeliosWasmClient implements IVerifiedRpc {
 
   isHeliosBacked(): boolean { return true }
 
-  async shutdown(): Promise<void> { await this.provider.shutdown() }
+  async shutdown(): Promise<void> {
+    if (this.shuttingDown) return
+    this.shuttingDown = true
+    // Wait for in-flight requests to settle before tearing down the WASM — calling
+    // provider.shutdown() while a request holds the wasm-bindgen borrow panics with
+    // "recursive use of an object". Bounded so a genuinely hung call can't block eviction
+    // forever (the 45s request timeout releases it anyway).
+    if (this.inFlight > 0) {
+      await Promise.race([
+        new Promise<void>(resolve => this.idleWaiters.push(resolve)),
+        new Promise<void>(resolve => setTimeout(resolve, 46_000)),
+      ])
+    }
+    await this.provider.shutdown().catch(() => {})
+  }
 }

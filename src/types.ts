@@ -1,13 +1,20 @@
 export interface Web3URL {
   raw: string
   chainId: number
-  target: EnsTarget | TxTarget
+  target: EnsTarget | TxTarget | ContractTarget
   path: string
 }
 
 export interface EnsTarget {
   type: 'ens'
   name: string
+}
+
+// A raw contract address as the ERC-4804 authority (web3://0x…). No name resolution —
+// the contract is served directly via ERC-5219 request() / ERC-8244 html().
+export interface ContractTarget {
+  type: 'contract'
+  address: string
 }
 
 export interface TxTarget {
@@ -180,7 +187,7 @@ export type BgMessage =
 
 export type BgResponse =
   | { type: 'content'; assembled: number[]; contentType: string }
-  | { type: 'error'; message: string }
+  | { type: 'error'; message: string; ipfs?: boolean }   // ipfs: name is an IPFS site — open its gateway
   | VerificationUpdate
 
 export interface VerificationUpdate {
@@ -198,12 +205,16 @@ export interface VerificationUpdate {
     url: string
     blockNumber: number
     blockHash: string
-    txHash: string
-    txIndex: number
+    // tx-calldata targets only — a contract-served (ERC-5219/8244) page has no tx.
+    txHash?: string
+    txIndex?: number
     contentType: string
     payloadSize: string
     // One entry per chunk (multi-chunk dapps) — the singular fields above describe
     // the last chunk; all chunks listed here were verified.
     chunks?: Array<{ blockNumber: number; txIndex: number; txHash: string }>
+    // Contract-served (ERC-5219/8244) targets only.
+    contractAddress?: string
+    cacheControl?: string   // ERC-5219 Cache-Control header: "immutable" ⇒ pinned artifact
   }
 }

@@ -44,7 +44,8 @@ function bundleCacheKey(parsed: ReturnType<typeof parseWeb3URL>): string {
   if (parsed.target.type === 'tx') {
     return parsed.target.refs.map(r => `${r.blockNumber}:${r.txIndex}`).join('+')
   }
-  return `${parsed.chainId}:${parsed.target.name}`
+  const host = parsed.target.type === 'contract' ? parsed.target.address : parsed.target.name
+  return `${parsed.chainId}:${host}`
 }
 
 function setPhase(phase: Phase) {
@@ -125,7 +126,7 @@ document.addEventListener('visibilitychange', () => {
 // When Helios finishes syncing, trigger a re-fetch in the dapp so data that
 // was served by the plain RpcClient gets replaced with verified Helios reads.
 chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === 'helios-syncing' && msg.chainId === currentChainId && !currentLocalMode) {
+  if (msg.type === 'helios-syncing' && msg.chainId === currentChainId && !currentLocalMode && !currentTrustedReads) {
     heliosBadge.classList.remove('hidden')
   }
   if (msg.type === 'helios-ready' && msg.chainId === currentChainId) {
@@ -133,7 +134,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     heliosBadge.classList.add('hidden')
     dappFrame.contentWindow?.postMessage({ type: 'wallet-event', method: 'heliosReady' }, '*')
   }
-  if (msg.type === 'helios-oos' && msg.chainId === currentChainId && !currentLocalMode) {
+  if (msg.type === 'helios-oos' && msg.chainId === currentChainId && !currentLocalMode && !currentTrustedReads) {
     heliosIsReady = false
     heliosBadge.classList.remove('hidden')
   }
@@ -148,8 +149,24 @@ let selectedWalletName: string = 'wallet'
 let connectInProgress = false
 let connectSuppressedUntil = 0
 let currentChainId = 1
+let currentPageUrl = ''
+let currentFragment = ''
+let pendingGatewayFallback = ''  // gateway URL to open if the target is an IPFS site
 let currentLocalMode = false
 let heliosIsReady = false
+// Trusted-reads mode ("Helios reads" switched off): runtime reads bypass Helios, so the
+// "updating Helios" badge is irrelevant and must not be shown. Mirrors the session flag.
+let currentTrustedReads = true  // default: trusted RPC (see background.ts)
+chrome.storage.session.get('trustedReads').then(v => {
+  currentTrustedReads = v.trustedReads !== false
+  if (currentTrustedReads) heliosBadge.classList.add('hidden')
+})
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'session' && 'trustedReads' in changes) {
+    currentTrustedReads = changes.trustedReads.newValue !== false
+    if (currentTrustedReads) heliosBadge.classList.add('hidden')
+  }
+})
 // Queued connect requests that arrived while the picker was open.
 // Resolved with the same result as the original to avoid spurious errors.
 let connectWaiters: Array<(result: unknown, error?: string) => void> = []
@@ -174,6 +191,9 @@ window.addEventListener('message', async (e) => {
   if (e.source !== dappFrame.contentWindow) return
 
   if (e.data.type === 'w3-navigate' && typeof e.data.url === 'string') {
+    // Remember the gateway fallback for this navigation: if the target turns out to be an
+    // IPFS site verum can't serve, we open this instead of showing an error.
+    pendingGatewayFallback = typeof e.data.fallback === 'string' ? e.data.fallback : ''
     location.hash = e.data.url
     return
   }
@@ -481,6 +501,16 @@ async function navigate(web3Url: string, attempt = 0) {
     const defaultChain = (stored.defaultChain as number | undefined) ?? 1
     parsedUrl = parseWeb3URL(web3Url, defaultChain)
     currentChainId = parsedUrl.chainId
+    // Host-only base for rewriting a dapp's self-referential share links (it builds them
+    // from location.*, which is about:srcdoc in the sandbox). No path/hash — the dapp
+    // appends its own.
+    const host = parsedUrl.target.type === 'contract' ? parsedUrl.target.address
+      : parsedUrl.target.type === 'ens' ? parsedUrl.target.name : ''
+    currentPageUrl = `w3://${host}${parsedUrl.chainId !== 1 ? ':' + parsedUrl.chainId : ''}`
+    // Fragment (#…) is dapp client-side state (share links). Carry it to the sandbox so
+    // the dapp restores its state on load; parseWeb3URL strips it from resolution.
+    const fragIdx = web3Url.indexOf('#')
+    currentFragment = fragIdx !== -1 ? web3Url.slice(fragIdx) : ''
     heliosIsReady = false
     document.title = formatWeb3URL(parsedUrl)
   } catch (err) {
@@ -520,7 +550,17 @@ async function navigate(web3Url: string, attempt = 0) {
     port.onMessage.addListener((msg: BgResponse) => {
       if (navToken !== navSeq) { resolve(); return }  // superseded — ignore this run's updates
       if (msg.type === 'error') {
-        showError(msg.message)
+        // IPFS site verum can't serve (e.g. docs.zswap.wei) — open its gateway in a new
+        // tab and return to the page we came from, instead of stranding the user on an
+        // error screen. Only when we came from a gateway link that gave us a fallback URL.
+        if (msg.ipfs && pendingGatewayFallback) {
+          const fb = pendingGatewayFallback
+          pendingGatewayFallback = ''
+          window.open(fb, '_blank')
+          history.back()   // the w3-navigate pushed an entry; step back to the previous page
+        } else {
+          showError(msg.message)
+        }
         resolve()
       } else if (msg.type === 'content') {
         contentReceived = true
@@ -750,7 +790,12 @@ function renderContent(data: Uint8Array, contentType: string, assetMap: Record<s
   }
 
   pageHasScripts = /<script[\s>]/i.test(html)
-  sendToSandbox({ type: 'render', html, assetMap, chainId: currentChainId })
+  // Detect the OS color scheme reliably here (extension page), and pass it to the sandbox.
+  // In a freshly-created srcdoc iframe, matchMedia('(prefers-color-scheme:dark)') can
+  // return the wrong value at parse time, so dapps reading it at init (zSwap) sometimes
+  // render light. The sandbox shims matchMedia to return this value consistently.
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
+  sendToSandbox({ type: 'render', html, assetMap, chainId: currentChainId, pageUrl: currentPageUrl, fragment: currentFragment, prefersDark })
   // Now that we know the page can make eth calls, start the live-head Helios
   // instance — it is no longer spawned during verification, so without this the
   // dapp's first read would have to wait for the whole sync.

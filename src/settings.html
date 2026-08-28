@@ -17,6 +17,17 @@
     <div class="chain-selector-row">
       <select id="default-chain-select"></select>
       <button id="add-chain-toggle" title="Add chain">+</button>
+      <div class="reads-control">
+        <span class="switch-title">Helios reads</span>
+        <span class="info-icon" tabindex="0" aria-label="About Helios reads">i
+          <span class="info-tip">Use Helios for verified RPC reads. Helios verification significantly
+            slows down reads. Read-heavy applications require the faster "trusted" RPC reads.</span>
+        </span>
+        <label class="switch">
+          <input type="checkbox" id="helios-reads" />
+          <span class="slider"></span>
+        </label>
+      </div>
     </div>
     <div id="add-chain" class="hidden">
       <div class="row">

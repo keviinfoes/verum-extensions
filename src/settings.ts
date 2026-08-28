@@ -13,11 +13,23 @@ const defaultChainSel = document.getElementById('default-chain-select') as HTMLS
 const clearCacheBtn   = document.getElementById('clear-cache-btn') as HTMLButtonElement
 const cacheInfo       = document.getElementById('cache-info') as HTMLSpanElement
 
+// "Helios reads" switch — ON means dApp runtime reads go through Helios (verified, slow);
+// OFF means they're served from the fast RPC (trusted, fast — needed by read-heavy dApps).
+// Backed by the session-scoped `trustedReads` flag (its inverse), so it resets to the safe
+// verified default (Helios ON) on browser restart. Content is always Helios-verified at load.
+const heliosReadsSwitch = document.getElementById('helios-reads') as HTMLInputElement
+// Default is trusted RPC (Helios reads OFF) for max dApp compatibility — the switch is on
+// only when the user has explicitly enabled Helios-verified reads (trustedReads === false).
+chrome.storage.session.get('trustedReads').then(v => { heliosReadsSwitch.checked = v.trustedReads === false })
+heliosReadsSwitch.addEventListener('change', () => {
+  chrome.storage.session.set({ trustedReads: !heliosReadsSwitch.checked })
+})
+
 // The FAQ is deployed as calldata under verum.gwei. Open it through the renderer
 // so it goes through the normal verified w3:// path, not an HTTP mirror.
 document.getElementById('faq-link')!.addEventListener('click', (e) => {
   e.preventDefault()
-  chrome.tabs.create({ url: chrome.runtime.getURL('renderer.html') + '#w3://1:verum.gwei' })
+  chrome.tabs.create({ url: chrome.runtime.getURL('renderer.html') + '#w3://verum.gwei' })
 })
 
 async function updateCacheInfo() {

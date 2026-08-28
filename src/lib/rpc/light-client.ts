@@ -24,6 +24,155 @@ const _proxyRpcs       = new Map<string, string[]>()  // sentinel key → rpcs
 const _proxyIdx        = new Map<string, number>()    // sentinel key → round-robin counter
 const _proxyBlacklist  = new Map<string, Set<string>>() // sentinel key → permanently broken RPCs
 
+// Diagnostic: tally exec JSON-RPC sub-requests (method → count, total ms) that Helios's
+// WASM fires through the proxy, and flush a compact summary every 2s of activity. Reveals
+// whether one eth_call spawns a batched createAccessList+getProof or thousands of serial
+// getProofs — the difference between "slow but fixable" and "fundamentally serial".
+// Proxy-level cache for deterministic exec reads. Helios re-verifies every proof/code
+// against the trusted state root, so caching cannot weaken the trust model — it only
+// removes redundant network round-trips. A DEX quoter's mc3-style split/retry re-reads
+// the SAME immutable bytecode and SAME-block pool proofs thousands of times; without
+// this, that floods (and gets rate-limited by) the public RPCs. Keys:
+//   code:<proxyKey>:<address>                      (bytecode is immutable → never expires)
+//   proof:<proxyKey>:<block>:<address>:<slots>     (deterministic at a fixed block number)
+const _rpcCache = new Map<string, unknown>()
+const _RPC_CACHE_CAP = 40_000
+function rpcCacheSet(key: string, value: unknown) {
+  if (_rpcCache.size >= _RPC_CACHE_CAP) _rpcCache.clear()  // bounded; entries rebuild cheaply
+  _rpcCache.set(key, value)
+}
+
+// ── JSON-RPC request coalescing (eth_getProof, eth_createAccessList) ─────────
+// Helios fires each of these as its own HTTP POST; a DEX quote does hundreds
+// concurrently, flooding (and getting rate-limited by) public RPCs — which is
+// what balloons createAccessList to 8–32s under load. Buffer the concurrent ones
+// per method and send them as ONE JSON-RPC batch POST — same requests, same
+// verification (Helios still gets + verifies each result), just far fewer HTTP
+// round-trips. Any sub-request that errors/looks malformed falls back to a single
+// fetch, so a provider that doesn't batch degrades to the per-request path.
+interface Pending { req: { id: unknown; method: string; params: unknown[] }; resolve: (r: Response) => void }
+const _batchCfg: Record<string, { max: number; windowMs: number; timeoutMs: number }> = {
+  eth_getProof: { max: 30, windowMs: 10, timeoutMs: 10_000 },
+  // NB: eth_createAccessList is intentionally NOT batched. Batching clusters its results so
+  // many eth-calls enter their next WASM phase at once → concurrent re-entry of the Helios
+  // provider object → "recursive use of an object" panic. It's inherent to batching a result
+  // that makes the WASM *continue* executing, so no resolve-timing tweak fixes it.
+}
+const _batches = new Map<string, { method: string; items: Pending[]; rpcs: string[]; startIdx: number; timer: ReturnType<typeof setTimeout> | null }>()
+
+function enqueueBatch(proxyKey: string, method: string, rpcs: string[], startIdx: number, req: Pending['req']): Promise<Response> {
+  const cfg = _batchCfg[method]
+  const key = `${proxyKey}:${method}`
+  return new Promise((resolve) => {
+    let b = _batches.get(key)
+    if (!b) { b = { method, items: [], rpcs, startIdx, timer: null }; _batches.set(key, b) }
+    b.items.push({ req, resolve })
+    if (b.items.length >= cfg.max) void flushBatch(key)
+    else if (!b.timer) b.timer = setTimeout(() => void flushBatch(key), cfg.windowMs)
+  })
+}
+
+function jsonRpcResponse(id: unknown, payload: object, url: string): Response {
+  const resp = new Response(JSON.stringify({ jsonrpc: '2.0', id, ...payload }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  // A synthesized Response has url="" — Helios parses response.url() and Url::parse("") panics.
+  try { Object.defineProperty(resp, 'url', { value: url, configurable: true }) } catch { /* ignore */ }
+  return resp
+}
+
+async function flushBatch(key: string): Promise<void> {
+  const b = _batches.get(key)
+  if (!b || b.items.length === 0) return
+  _batches.delete(key)
+  if (b.timer) clearTimeout(b.timer)
+  const { items, rpcs, startIdx, method } = b
+  const cfg = _batchCfg[method]
+  const body = JSON.stringify(items.map((it, i) => ({ jsonrpc: '2.0', id: i, method: it.req.method, params: it.req.params })))
+
+  const t0 = Date.now()
+  let arr: Array<{ id?: unknown; result?: unknown; error?: unknown }> | null = null
+  let usedRpc = rpcs[startIdx % rpcs.length]
+  for (let attempt = 0; attempt < rpcs.length; attempt++) {
+    const rpc = rpcs[(startIdx + attempt) % rpcs.length]
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), cfg.timeoutMs)
+    try {
+      const res = await _nativeFetch(rpc.replace(/\/$/, ''), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, signal: ctrl.signal })
+      clearTimeout(timer)
+      if (!res.ok) continue
+      const parsed = await res.json()
+      if (!Array.isArray(parsed) || parsed.length !== items.length) continue  // provider didn't batch as expected → next RPC
+      arr = parsed as Array<{ id?: unknown }>
+      usedRpc = rpc
+      break
+    } catch { clearTimeout(timer); continue }
+  }
+  proxyTally([`${method}:batch×${items.length}`], Date.now() - t0)
+
+  // createAccessList results make the WASM CONTINUE executing (fetch proofs next), so
+  // resolving several back-to-back synchronously lets a continuation re-enter the WASM
+  // mid-borrow → "recursive use of an object". Defer those onto their own macrotask so the
+  // stack unwinds first (same reason cache hits defer). getProof results are terminal for
+  // that call's fetch phase, so they stay synchronous (no latency on the hot path).
+  const deferResolve = method === 'eth_createAccessList'
+  const byId = arr ? new Map(arr.map((r) => [Number(r.id), r])) : null
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]
+    const sub = byId?.get(i)
+    if (sub && 'result' in sub && sub.result != null && !sub.error) {
+      const resp = jsonRpcResponse(item.req.id, { result: sub.result }, usedRpc)
+      if (deferResolve) setTimeout(() => item.resolve(resp), 0)
+      else item.resolve(resp)
+    } else {
+      // Missing / errored / malformed sub-response → single fetch (its own network I/O is
+      // already macrotask-separated). Don't block the loop; on total failure hand back an
+      // error response so the promise still settles instead of hanging the WASM.
+      void singleFallback(rpcs, startIdx, item.req, cfg.timeoutMs).then(
+        (r) => item.resolve(r),
+        () => item.resolve(jsonRpcResponse(item.req.id, { error: { code: -32603, message: 'batch fallback failed' } }, usedRpc)),
+      )
+    }
+  }
+}
+
+async function singleFallback(rpcs: string[], startIdx: number, req: Pending['req'], timeoutMs: number): Promise<Response> {
+  const single = JSON.stringify({ jsonrpc: '2.0', id: req.id, method: req.method, params: req.params })
+  for (let attempt = 0; attempt < rpcs.length; attempt++) {
+    const rpc = rpcs[(startIdx + attempt) % rpcs.length]
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+    try {
+      const res = await _nativeFetch(rpc.replace(/\/$/, ''), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: single, signal: ctrl.signal })
+      clearTimeout(timer)
+      if (!res.ok) { if (attempt < rpcs.length - 1) continue; return res }
+      const clone = res.clone()
+      let json: { result?: unknown; error?: unknown } | undefined
+      try { json = await clone.json() } catch { /* malformed */ }
+      // Never hand malformed input to Helios's WASM (it can trap the instance).
+      if (!json || typeof json !== 'object' || (!('result' in json) && !('error' in json))) {
+        if (attempt < rpcs.length - 1) continue
+        throw new Error('malformed batch-fallback response')
+      }
+      if (json.error && attempt < rpcs.length - 1) continue  // fetch failed at this provider → next
+      return res
+    } catch { clearTimeout(timer); if (attempt < rpcs.length - 1) continue; throw new Error('batch fallback exhausted') }
+  }
+  throw new Error('batch fallback exhausted')
+}
+
+const _proxyStats = new Map<string, { n: number; ms: number }>()
+let _proxyFlush: ReturnType<typeof setTimeout> | null = null
+function proxyTally(methods: string[], ms: number) {
+  for (const method of methods) {
+    const s = _proxyStats.get(method) ?? { n: 0, ms: 0 }
+    s.n++; s.ms += ms / methods.length; _proxyStats.set(method, s)
+  }
+  if (!_proxyFlush) _proxyFlush = setTimeout(() => {
+    const parts = [...(_proxyStats)].map(([m, s]) => `${m}×${s.n} (avg ${Math.round(s.ms / s.n)}ms)`)
+    console.log('[w3] proxy exec /2s:', parts.join(', '))
+    _proxyStats.clear(); _proxyFlush = null
+  }, 2000)
+}
+
 const SLOTS_PER_PERIOD = 32 * 256  // 8192 — one sync-committee period
 
 // ---------------------------------------------------------------------------
@@ -125,6 +274,63 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
         fetchBody = input.body ? await input.clone().arrayBuffer() : undefined
       }
 
+      // Parse the JSON-RPC method(s), and for a single deterministic read compute a
+      // cache key + capture the request id so a hit can be answered without a round-trip.
+      let execMethods: string[] = []
+      let cache: { key: string; id: unknown; method: string } | null = null
+      let singleReq: { id: unknown; method: string; params: unknown[] } | null = null
+      if (!isCons) {
+        try {
+          const raw = fetchBody ?? (init?.body as unknown)
+          const text = raw instanceof ArrayBuffer ? new TextDecoder().decode(raw)
+            : typeof raw === 'string' ? raw : ''
+          if (text) {
+            const j = JSON.parse(text)
+            if (Array.isArray(j)) {
+              execMethods = j.map((x) => x?.method).filter(Boolean)
+            } else if (j?.method) {
+              execMethods = [j.method]
+              singleReq = { id: j.id, method: j.method, params: j.params }
+              const p = j.params
+              if (j.method === 'eth_getCode' && p?.[0]) {
+                cache = { key: `code:${proxyKey}:${String(p[0]).toLowerCase()}`, id: j.id, method: 'eth_getCode' }
+              } else if (j.method === 'eth_getBlockByHash' && p?.[0]) {
+                // A block addressed by hash is immutable → cache forever, like bytecode.
+                cache = { key: `blkhash:${proxyKey}:${String(p[0]).toLowerCase()}:${p[1] ? 1 : 0}`, id: j.id, method: 'eth_getBlockByHash' }
+              }
+              // NB: eth_createAccessList and eth_getProof are intentionally NOT cached —
+              // measured to get zero hits (a quoter's calls are unique per poll), so caching
+              // only adds overhead. Only immutable reads (code, block-by-hash) are cached.
+              // NB: eth_getProof is deliberately NOT cached — it got zero hits (a quoter's
+              // slot-sets are unique) so there's no benefit, and account/state proofs are
+              // the most correctness-sensitive thing to cache. Only immutable reads above.
+            }
+          }
+        } catch { /* not JSON-RPC — ignore */ }
+      }
+
+      // Cache hit → synthesize the JSON-RPC response (Helios still re-verifies it).
+      if (cache && _rpcCache.has(cache.key)) {
+        proxyTally([`${cache.method}:cached`], 0)
+        // Yield a full macrotask before resolving. A real fetch does network I/O and
+        // fully unwinds the WASM stack; resolving synchronously (microtask only) lets the
+        // WASM continuation re-enter while the original call still holds its borrow →
+        // "recursive use of an object" panic. This defer mimics real async I/O.
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        const body = JSON.stringify({ jsonrpc: '2.0', id: cache.id, result: _rpcCache.get(cache.key) })
+        const resp = new Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } })
+        // A synthesized Response has url="" — Helios's WASM HTTP layer parses response.url()
+        // and Url::parse("") panics. Give it a real RPC url (shadowing the prototype getter).
+        try { Object.defineProperty(resp, 'url', { value: rpcs[startIdx % rpcs.length], configurable: true }) } catch { /* ignore */ }
+        return resp
+      }
+
+      // Coalesce buffered getProof / createAccessList into batched POSTs (see _batchCfg).
+      if (singleReq && _batchCfg[singleReq.method] && Array.isArray(singleReq.params)) {
+        return await enqueueBatch(proxyKey, singleReq.method, rpcs, startIdx, singleReq)
+      }
+      const _t0 = Date.now()
+
       // Try each RPC in order; on timeout/error failover to the next immediately.
       // Helios never sees a network error — it just perceives a slow response.
       for (let attempt = 0; attempt < rpcs.length; attempt++) {
@@ -199,6 +405,10 @@ const _nativeFetch = globalThis.fetch.bind(globalThis) as typeof fetch
             }
             if (!isRevert && attempt < rpcs.length - 1) continue
           }
+          if (cache && !json?.error && json?.result !== undefined && json.result !== null) {
+            rpcCacheSet(cache.key, json.result)
+          }
+          if (execMethods.length) proxyTally(execMethods, Date.now() - _t0)
           return res
         } catch {
           clearTimeout(timer)

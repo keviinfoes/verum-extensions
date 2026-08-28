@@ -63,20 +63,27 @@ function showProof(d: any) {
 
   const pending = d.pending === true
   const beaconTrusted = d.beaconVerified && d.beaconHeliosAnchored
+  // Contract-served (ERC-5219/8244) pages have a contract address instead of a tx/ENS
+  // record. They reuse the ensVerified signal (Helios byte-compare of the served body),
+  // but must NOT show ENS wording — there's no ENS record involved.
+  const contractServed = typeof d.contractAddress === 'string'
   // Any dotted name target (myapp.eth, myapp.gwei, …) — block:txIndex refs have no dots.
-  const isEns = typeof d.url === 'string' && /(?:w3|portal):\/\/(?:\d+:)?[^/:]*\.[^/:]+/.test(d.url)
+  const isEns = !contractServed && typeof d.url === 'string' && /(?:w3|portal):\/\/(?:\d+:)?[^/:]*\.[^/:]+/.test(d.url)
   const ensBlocked = isEns && d.ensVerified !== true && !pending && !d.localMode
-  const cls = d.localMode ? 'verified' : ensBlocked ? 'unverified' : d.portalVerified ? 'portal' : d.heliosBacked ? 'verified' : beaconTrusted ? 'beacon' : pending ? 'pending' : 'unverified'
+  const contractBlocked = contractServed && d.ensVerified !== true && !pending && !d.localMode
+  const cls = d.localMode ? 'verified' : ensBlocked || contractBlocked ? 'unverified' : d.portalVerified ? 'portal' : d.heliosBacked ? 'verified' : beaconTrusted ? 'beacon' : pending ? 'pending' : 'unverified'
   verdict.className = cls
   document.getElementById('verdict-icon')!.textContent =
     d.localMode       ? '✓' :
-    ensBlocked        ? '⚠️' :
+    ensBlocked || contractBlocked ? '⚠️' :
     d.portalVerified  ? '⚡' :
     d.heliosBacked    ? '🔒' :
     beaconTrusted     ? '✓' :
     pending           ? '⟳' : '⚠️'
   document.getElementById('verdict-text')!.textContent =
     d.localMode       ? 'Local node — RPC trusted' :
+    contractBlocked && d.ensVerified === false ? 'Content differs from Helios — possible forgery' :
+    contractBlocked   ? 'Unverified — Helios could not confirm content' :
     ensBlocked && d.ensVerified === false ? 'ENS forged — record differs from Helios' :
     ensBlocked        ? 'Unverified — ENS not confirmed by Helios' :
     d.portalVerified  ? 'Portal Network verified' :
@@ -101,7 +108,18 @@ function showProof(d: any) {
   showRow('pf-chunks-row', multiChunk)
   showRow('pf-block-row', !multiChunk)
   showRow('pf-block-hash-row', !multiChunk)
-  showRow('pf-tx-index-row', !multiChunk)
+  showRow('pf-tx-index-row', !multiChunk && !contractServed)
+  showRow('pf-contract-row', contractServed)
+  showRow('pf-cache-row', contractServed)
+
+  if (contractServed) {
+    set('pf-contract', d.contractAddress)
+    const immutable = typeof d.cacheControl === 'string' && /immutable/i.test(d.cacheControl)
+    set('pf-cache', pending ? 'Verifying…' : immutable ? 'Immutable — pinned artifact' : 'Live — current contract state')
+    // The tx-model rows are reused with contract-appropriate labels.
+    set('pf-trie-label', 'Body match')
+    set('pf-ens-label', 'Name → contract')
+  }
 
   if (multiChunk) {
     set('pf-chunks', chunks!.map(c => `${c.blockNumber}:${c.txIndex}`).join(', '))
@@ -114,7 +132,9 @@ function showProof(d: any) {
     if (d.txHash) { txHashRow.classList.remove('hidden'); set('pf-tx-hash', d.txHash) }
     else { txHashRow.classList.add('hidden') }
   }
-  set('pf-trie',       d.localMode ? 'N/A — local node trusted' : d.trieVerified ? 'YES — cryptographically proven' : pending ? 'Verifying…' : 'NO')
+  set('pf-trie',       d.localMode ? 'N/A — local node trusted'
+    : contractServed ? (pending ? 'Verifying…' : d.trieVerified ? 'YES — matches Helios eth_call' : 'NO — differs from Helios')
+    : d.trieVerified  ? 'YES — cryptographically proven' : pending ? 'Verifying…' : 'NO')
   let headerText = d.localMode ? 'N/A — local node trusted' : 'NO — trusted RPC only'
   if (d.portalVerified) {
     headerText = 'YES — Portal Network (sync committee BLS, local node)'

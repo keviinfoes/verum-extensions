@@ -4,8 +4,10 @@ import { getVerifiedCalldataByLocation, verifyTxInBlock } from './lib/verify/tx-
 import type { RpcBlockFull } from './lib/verify/tx-verifier.js'
 import { getCalldataViaPortal } from './lib/rpc/portal.js'
 import { parseCalldata, assembleContent } from './lib/w3/content.js'
-import { resolveEns, compareEnsChunks } from './lib/w3/name-resolver.js'
-import type { TxRef } from './lib/w3/name-resolver.js'
+import { resolveEns, resolveName, nameIsIpfs, compareEnsChunks } from './lib/w3/name-resolver.js'
+import type { TxRef, NameResolution } from './lib/w3/name-resolver.js'
+import { fetchContractContent } from './lib/w3/erc5219.js'
+import type { ContractContent } from './lib/w3/erc5219.js'
 import { verifyViaBeacon, isEip2935Error, SUPERSEDED } from './lib/verify/beacon-verifier.js'
 import { timestampToSlot } from './lib/verify/beacon-primitives.js'
 import type { DappProofData, EraBsrCache } from './lib/verify/beacon-verifier.js'
@@ -15,7 +17,7 @@ import { listWallets, ethRequest as walletRequest } from './lib/wallets/metamask
 import { isFrameAvailable, frameRequest } from './lib/wallets/frame-bridge.js'
 import type { IVerifiedRpc } from './lib/rpc/light-client.js'
 
-const BUILD_ID = 'clear-stale-proof-on-nav-2026-08-19T1'
+const BUILD_ID = 'revert-renderer-html-2026-08-28T12'
 
 console.log(`[w3] background build ${BUILD_ID}`)
 
@@ -122,13 +124,33 @@ const CACHEABLE_METHODS = new Set([
 const heliosReadCache = new Map<string, unknown>()
 const MAX_READ_CACHE = 200
 
+// Trusted-reads toggle: when on, dapp RUNTIME reads (eth_call quotes, balances, …) are
+// served from the fast execution RPC WITHOUT Helios verification, so a read-heavy dapp
+// (DEX quoter firing hundreds of eth_calls) responds at normal-RPC speed instead of
+// waiting on per-slot eth_getProof. Page CONTENT stays Helios-verified regardless — this
+// only affects post-load reads. Transient (chrome.storage.session): resets each browser
+// session, so the safe verified default returns automatically. Mirrored in memory to
+// avoid a storage round-trip per read; kept in sync via storage.onChanged below.
+// Defaults to true (trusted RPC): read-heavy dApps work out of the box like on any normal
+// wallet/RPC. Helios-verified reads are opt-in via the "Helios reads" switch. Page CONTENT
+// is still Helios-verified at load regardless — only post-load reads follow this flag.
+let trustedReads = true
+chrome.storage.session.get('trustedReads').then(v => { trustedReads = v.trustedReads !== false }).catch(() => {})
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'session' && 'trustedReads' in changes) trustedReads = changes.trustedReads.newValue !== false
+})
+
 // Concurrency limit for non-cacheable Helios reads (eth_call, eth_getLogs, …).
 // Each concurrent call holds a large ABI-encoded result in memory while the IPC
 // clone travels to the renderer. 20+ simultaneous clones exhaust the renderer
 // heap and Chrome kills the process (error 5). Cap at 4 concurrent slots so at
 // most 4 large results exist in memory at once.
 let ethCallSlots = 0
-const ETH_CALL_MAX_SLOTS = 4
+// Read-heavy dapps (DEX quoters that fan out multicalls across many venues) need
+// more parallel Helios reads to complete a quote in reasonable time. Quote results
+// are small, so the memory concern behind this cap (large content clones) doesn't
+// apply to them — 8 balances throughput against the renderer-heap limit.
+const ETH_CALL_MAX_SLOTS = 8
 const ethCallWaiters: Array<() => void> = []
 function acquireEthCallSlot(): Promise<() => void> {
   const release = () => { ethCallSlots--; ethCallWaiters.shift()?.() }
@@ -375,7 +397,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   }
   const url = changeInfo.url ?? tab.pendingUrl ?? tab.url ?? ''
   if (url.startsWith('w3://')) {
-    chrome.tabs.update(tabId, { url: rendererFor(url) })
+    // The tab may navigate again or close before this lands — swallow "No tab with id".
+    chrome.tabs.update(tabId, { url: rendererFor(url) }).catch(() => {})
   }
 })
 
@@ -414,7 +437,14 @@ chrome.runtime.onConnect.addListener((port) => {
     port.onMessage.addListener((message: BgMessage) => {
       if (message.type === 'resolve') {
         const tabId = port.sender?.tab?.id
-        twoPhaseResolve(message.url, tabId, port)
+        // Any rejection that escapes twoPhaseResolve's own try blocks would otherwise
+        // be an unhandled rejection that leaves the port open — the renderer then hangs
+        // on "Loading…" forever. Surface it as an error and close the port instead.
+        twoPhaseResolve(message.url, tabId, port).catch((err) => {
+          console.error('[w3] twoPhaseResolve crashed:', err)
+          try { port.postMessage({ type: 'error', message: `Internal error: ${(err as Error).message}` }) } catch {}
+          try { port.disconnect() } catch {}
+        })
       }
     })
     return
@@ -530,13 +560,43 @@ async function twoPhaseResolve(
   let phase1EnsChunks: TxRef[] = []
   let ensVerified: boolean | undefined = undefined
 
+  // ── Name resolution: tx-calldata (`w3` record) vs contract-served (ERC-6821) ─
+  // A name may point at a `w3` tx-calldata record (existing path) or, via ERC-6821
+  // contentcontract/addr, at a contract that serves the page (ERC-5219/8244). The
+  // latter is a different pipeline entirely — dispatch and return.
+  const fastRpc = new RpcClient(execRpcs)
+  let preResolvedChunks: TxRef[] | undefined
+  // Raw contract address (web3://0x…): no name resolution — serve the contract directly.
+  if (parsed.target.type === 'contract') {
+    await resolveContractServed(rawUrl, tabId, port, send, parsed, chains, { address: parsed.target.address }, isSuperseded)
+    return
+  }
+  if (parsed.target.type === 'ens') {
+    let resolution: NameResolution
+    try {
+      resolution = await resolveName(parsed.target.name, fastRpc)
+    } catch (err) {
+      if (tabId) clearBadge(tabId)
+      // A name with only a contenthash (no w3/contentcontract/addr) is an IPFS site →
+      // flag it so a gateway-link navigation opens the gateway instead of erroring.
+      const ipfs = await nameIsIpfs(parsed.target.name, new RpcClient(execRpcs)).catch(() => false)
+      send({ type: 'error', message: (err as Error).message, ipfs })
+      port.disconnect()
+      return
+    }
+    if (resolution.kind === 'contract') {
+      await resolveContractServed(rawUrl, tabId, port, send, parsed, chains, resolution, isSuperseded)
+      return
+    }
+    preResolvedChunks = resolution.chunks
+  }
+
   try {
-    const fastRpc = new RpcClient(execRpcs)
     const target = parsed.target
 
     const txRefs: TxRef[] = target.type === 'tx'
       ? target.refs.map(r => ({ blockNumber: r.blockNumber, txIndex: r.txIndex }))
-      : (await resolveEns(target.name, fastRpc)).chunks
+      : preResolvedChunks!
     phase1EnsChunks = txRefs
     const results = await Promise.all(txRefs.map(async (chunk) => {
       // Block-indexed record — use Portal or direct block fetch
@@ -1009,12 +1069,205 @@ async function twoPhaseResolve(
 }
 
 // ---------------------------------------------------------------------------
+// Contract-served pages (ERC-5219 / ERC-8244, resolved via ERC-6821)
+//
+// Unlike the tx-calldata pipeline, the content is the return value of a view
+// eth_call — a current-state read. So verification is simply: re-run the same call
+// through Helios at the same pinned block and byte-compare. No trie/beacon/era, and
+// no 27h boundary (an immutable old version contract verifies at any age, since it's
+// just a current-state read of frozen bytecode).
+// ---------------------------------------------------------------------------
+
+async function resolveContractServed(
+  rawUrl: string,
+  tabId: number | undefined,
+  port: chrome.runtime.Port,
+  send: (msg: BgResponse) => void,
+  parsed: ReturnType<typeof parseWeb3URL>,
+  chains: Record<number, ChainConfig>,
+  contract: { address: string; chainId?: number; chainLabel?: string },
+  isSuperseded: () => boolean,
+) {
+  const address = contract.address
+
+  // ERC-6821 lets `contentcontract` point at a contract on ANOTHER chain (a numeric
+  // chainId, or an EIP-3770 short name like "w3q-g" = web3q). verum verifies against
+  // Ethereum's Helios anchor, so it can't prove content on a different chain — resolve
+  // the pointer (we read it), but refuse to serve what we can't verify, with the reason.
+  const SAME_CHAIN_ALIASES: Record<number, string[]> = {
+    1: ['eth', 'ethereum', 'mainnet'],
+    11155111: ['sep', 'sepolia'],
+  }
+  let crossChain: string | undefined
+  if (contract.chainLabel) {
+    if (!(SAME_CHAIN_ALIASES[parsed.chainId] ?? []).includes(contract.chainLabel.toLowerCase()))
+      crossChain = `chain "${contract.chainLabel}"`
+  } else if (contract.chainId !== undefined && contract.chainId !== parsed.chainId) {
+    crossChain = `chainId ${contract.chainId}`
+  }
+  if (crossChain) {
+    if (tabId) clearBadge(tabId)
+    send({ type: 'error', message: `${address} is on ${crossChain}, a different chain than the URL. verum only serves content it can verify against Ethereum's Helios anchor, so cross-chain content isn't supported.` })
+    port.disconnect()
+    return
+  }
+
+  const chainId = parsed.chainId
+  const chain = chains[chainId]
+  if (!chain) {
+    if (tabId) clearBadge(tabId)
+    send({ type: 'error', message: `Unsupported chainId ${chainId}.` })
+    port.disconnect()
+    return
+  }
+  const execRpcs = chain.localMode ? chain.rpcs.slice(0, 1) : chain.rpcs
+  console.log('[w3] Contract-served (ERC-5219/8244) —', address, 'on chain', chainId)
+
+  // ── Phase 1: plain-RPC eth_call, paint immediately ───────────────────────
+  if (tabId) setBadgeLoading(tabId)
+  let content: ContractContent
+  let blockNumber = 0
+  let blockHash = ''
+  // Both the plain-RPC read and the Helios re-call use the 'finalized' tag — the same
+  // pattern the ENS re-verification uses, which Helios serves reliably. (A concrete
+  // historical block *number* is not reliably served by Helios and made the two reads
+  // land on different state, which surfaced as a false "differs from Helios".)
+  const blockTag = 'finalized'
+  try {
+    const fastRpc = new RpcClient(execRpcs)
+    // Finalized block is only for the proof panel's block number/hash — not the call tag.
+    const fin = await fastRpc.request<{ number: string; hash: string }>('eth_getBlockByNumber', ['finalized', false])
+    blockNumber = parseInt(fin.number, 16)
+    blockHash = fin.hash
+    content = await fetchContractContent(fastRpc, address, parsed.path, blockTag)
+  } catch (err) {
+    if (tabId) clearBadge(tabId)
+    // The contract didn't serve web3 content. If this was a NAME and it has an IPFS
+    // contenthash, it's a traditional IPFS site (e.g. docs.zswap.wei) that verum can't
+    // serve — flag it so the renderer opens the original gateway URL instead of erroring.
+    // Only a real IPFS contenthash triggers this, not any resolution failure.
+    let ipfs = false
+    if (parsed.target.type === 'ens') {
+      ipfs = await nameIsIpfs(parsed.target.name, new RpcClient(execRpcs)).catch(() => false)
+    }
+    send({ type: 'error', message: (err as Error).message, ipfs })
+    port.disconnect()
+    return
+  }
+
+  send({ type: 'content', assembled: Array.from(content.body), contentType: content.contentType })
+
+  if (tabId) {
+    chrome.storage.session.set({
+      [`proof_${tabId}`]: {
+        url: rawUrl, contentType: content.contentType,
+        payloadSize: formatBytes(content.body.length),
+        heliosBacked: false, trieVerified: false, pending: true,
+        blockNumber, blockHash,
+        contractAddress: address, cacheControl: content.cacheControl,
+      },
+    })
+  }
+
+  if (!tabId) return
+  if (isSuperseded()) { port.disconnect(); return }
+
+  // ── Phase 2: re-run through Helios at the same block, byte-compare ────────
+  let update: VerificationUpdate
+  try {
+    if (chain.localMode) {
+      console.log('[w3] Contract-served — local mode: trusted to local exec RPC, no Helios check')
+      update = contractUpdate(rawUrl, address, content, blockNumber, blockHash,
+        { heliosBacked: false, trieVerified: false, verified: true, localMode: true })
+    } else {
+      // Verify through Helios, byte-comparing the served body. The base Helios instance
+      // can be evicted/restarted mid-call by the OOS-wedge machinery (155s-behind stale
+      // consensus is common here) — that surfaces as "Provider has been shut down". Retry
+      // a few times, each getting whatever instance is current, so a restart underneath us
+      // lands the next attempt on the fresh (now-synced) instance instead of failing.
+      let verified: ContractContent | undefined
+      let heliosBackedFlag = false
+      let lastErr: unknown
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const heliosRpc = await Promise.race([
+          getOrCreateRpc(chain),
+          new Promise<undefined>(r => setTimeout(() => r(undefined), 35_000)),
+        ]).catch(() => undefined)
+        if (!heliosRpc) { lastErr = new Error('Helios not available (35s timeout — still syncing or consensus RPC unreachable)'); break }
+        try {
+          verified = await fetchContractContent(heliosRpc, address, parsed.path, blockTag)
+          heliosBackedFlag = heliosRpc.isHeliosBacked()
+          break
+        } catch (e) {
+          lastErr = e
+          const m = ((e as Error)?.message ?? '').toLowerCase()
+          const transient = m.includes('shut down') || m.includes('out of sync') || m.includes('wasm call timeout')
+          if (!transient) throw e
+          console.warn(`[w3] Contract-served — Helios instance restarted mid-verify (attempt ${attempt + 1}) — retrying`)
+          await new Promise(r => setTimeout(r, 1500))
+        }
+      }
+      if (!verified) throw lastErr ?? new Error('Helios verification failed')
+
+      const match = bytesEqual(verified.body, content.body)
+      console.log(match
+        ? '[w3] Contract-served — Helios re-call matches rendered bytes ✓'
+        : '[w3] Contract-served — Helios body MISMATCH (possible forgery or state drift)')
+      update = contractUpdate(rawUrl, address, verified, blockNumber, blockHash,
+        { heliosBacked: heliosBackedFlag && match, trieVerified: match, verified: match })
+    }
+  } catch (err) {
+    // Helios errored / unavailable (e.g. sync timeout, or a concurrent-call WASM error) —
+    // that's UNVERIFIED ("could not confirm"), NOT a forgery. Only a successful Helios call
+    // that returns different bytes is a mismatch (verified:false above).
+    console.warn('[w3] Contract-served — verification unavailable —', (err as Error).message)
+    update = contractUpdate(rawUrl, address, content, blockNumber, blockHash,
+      { heliosBacked: false, trieVerified: false, verified: undefined })
+  }
+
+  if (isSuperseded()) { port.disconnect(); return }
+  await updateBadge(tabId, update)
+  send(update)
+  port.disconnect()
+}
+
+function contractUpdate(
+  rawUrl: string,
+  address: string,
+  content: ContractContent,
+  blockNumber: number,
+  blockHash: string,
+  flags: { heliosBacked: boolean; trieVerified: boolean; verified: boolean | undefined; localMode?: boolean },
+): VerificationUpdate {
+  return {
+    type: 'verification-update',
+    heliosBacked: flags.heliosBacked,
+    trieVerified: flags.trieVerified,
+    localMode: flags.localMode,
+    // The byte-compare through Helios confirms both the name→contract resolution and
+    // the served body. Reuse ensVerified as that signal — it gates the badge (updateBadge
+    // requires it for a dotted-name target) and drives the popup's "Name → contract" row.
+    ensVerified: flags.verified,
+    proof: {
+      url: rawUrl,
+      blockNumber,
+      blockHash,
+      contentType: content.contentType,
+      payloadSize: formatBytes(content.body.length),
+      contractAddress: address,
+      cacheControl: content.cacheControl,
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Badge
 // ---------------------------------------------------------------------------
 
 function setBadgeLoading(tabId: number) {
-  chrome.action.setBadgeText({ text: '···', tabId })
-  chrome.action.setBadgeBackgroundColor({ color: '#8b949e', tabId })
+  // Tab may be gone by the time these land — swallow "No tab with id".
+  chrome.action.setBadgeText({ text: '···', tabId }).catch(() => {})
+  chrome.action.setBadgeBackgroundColor({ color: '#8b949e', tabId }).catch(() => {})
 }
 
 async function updateBadge(tabId: number, update: VerificationUpdate) {
@@ -1059,7 +1312,8 @@ async function updateBadge(tabId: number, update: VerificationUpdate) {
 }
 
 function clearBadge(tabId: number) {
-  chrome.action.setBadgeText({ text: '', tabId })
+  // clearBadge runs from onUpdated/onRemoved where the tab may already be gone.
+  chrome.action.setBadgeText({ text: '', tabId }).catch(() => {})
   chrome.storage.session.remove(`proof_${tabId}`)
 }
 
@@ -1124,6 +1378,19 @@ async function _ethRpcCall(chainId: number, cacheKey: string, method: string, pa
     heliosSyncingSignaled.delete(chain.chainId)
     try {
       const result = await new RpcClient(chain.rpcs.slice(0, 1)).request<unknown>(method, params)
+      return { result }
+    } catch (err: any) {
+      return { error: (err as Error).message ?? String(err) }
+    }
+  }
+
+  // Trusted-reads mode: forward runtime reads to the fast execution RPC, no Helios.
+  // (Content was still Helios-verified at load; this only speeds up post-load reads
+  // like DEX quotes.) Not cached in heliosReadCache — those results are unverified and
+  // must not pollute the verified cache used by the Helios path.
+  if (trustedReads) {
+    try {
+      const result = await new RpcClient(chain.rpcs).request<unknown>(method, params)
       return { result }
     } catch (err: any) {
       return { error: (err as Error).message ?? String(err) }
