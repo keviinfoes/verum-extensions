@@ -1,8 +1,8 @@
-# web3
+# Verum
 
-Browser extension for browsing `w3://` pages stored as calldata on Ethereum, verified by Helios light client.
+Browser extension for browsing `w3://` pages stored on Ethereum, verified by Helios light client.
 
-See [VERIFICATION.md](VERIFICATION.md) for the full verification flow.
+See [VERIFICATION.md](VERIFICATION.md) for the verification flows.
 
 ## Setup
 
@@ -13,8 +13,7 @@ npm install
 ## Build
 
 ```bash
-npm run build       # one-time build
-npm run dev         # watch mode
+npm run build 
 ```
 
 ## Load extension
@@ -25,25 +24,15 @@ npm run dev         # watch mode
 
 ## Usage
 
-In the address bar, type `w3` + Tab, then enter a `ENS/GNS` name or `blockNumber:txIndex[+blockNumber:txIndex+...]`.
+### Visit a website
+In the address bar, type `w3` + Tab, then enter:
+- name: `.eth/.wei/.gwei`
+- calldata source: `blockNumber:txIndex[+blockNumber:txIndex+...]`
+- contract source: `0x`
 
-## Deploy a website to Ethereum
+### Deploy a website 
 
-**From the extension:** click **⬆ Deploy** in the popup, follow deployment flow with a live preview.
-
-**From the CLI:**
-
-```bash
-# Deploy — <file> or --dir <directory> -> prints [[blockNumber, txIndex], ...] coordinates.
-PRIVATE_KEY=0x... [RPC_URL=...] node scripts/encode-w3fs.js <file> | node scripts/publish.js
-PRIVATE_KEY=0x... [RPC_URL=...] node scripts/encode-w3fs.js --dir <directory> | node scripts/publish.js
-
-# Point an owned ENS (.eth) name at coordinates
-node scripts/set-ens.js <name.eth> <rpc-url> <private-key> <block:idx> [<block:idx> ...]
-
-# Point an owned GNS (.gwei) name at coordinates
-node scripts/set-gns.js <name.gwei> <rpc-url> <private-key> <block:idx> [<block:idx> ...]
-```
+**From the extension:** click **⬆ Deploy** in the popup, follow deployment flow. Deploys as calldata.
 
 ---
 
