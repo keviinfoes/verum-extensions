@@ -17,7 +17,7 @@ import { listWallets, ethRequest as walletRequest } from './lib/wallets/metamask
 import { isFrameAvailable, frameRequest } from './lib/wallets/frame-bridge.js'
 import type { IVerifiedRpc } from './lib/rpc/light-client.js'
 
-const BUILD_ID = 'revert-renderer-html-2026-08-28T12'
+const BUILD_ID = 'hash-router-nav-2026-08-31T03'
 
 console.log(`[w3] background build ${BUILD_ID}`)
 
@@ -1332,6 +1332,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     ethRpcCall(msg.chainId, msg.method, msg.params ?? []).then(sendResponse)
     return true
   }
+  if (msg.type === 'broadcast-raw-tx') {
+    broadcastRawTx(msg.chainId, msg.rawTx, msg.endpoint ?? null).then(sendResponse)
+    return true
+  }
   if (msg.type === 'warmup-helios' && msg.chainId) {
     chrome.storage.sync.get('chains').then(stored => {
       const chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
@@ -1347,6 +1351,38 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true
   }
 })
+
+// Broadcast an already-signed raw tx. The dapp's fetch shim rerouted an
+// eth_sendRawTransaction here and the user approved a target in the renderer:
+//  - endpoint set  → POST to the dapp's own RPC (preserves MEV protection, e.g. mevblocker).
+//    Sent from the service worker, which is not bound by the sandbox page CSP.
+//  - endpoint null → broadcast via verum's configured RPC set.
+async function broadcastRawTx(chainId: number, rawTx: string, endpoint: string | null): Promise<{ result?: unknown; error?: string }> {
+  if (endpoint) {
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: [rawTx] }),
+      })
+      const j = await res.json() as { result?: unknown; error?: { message?: string } }
+      if (j.error) return { error: j.error.message ?? JSON.stringify(j.error) }
+      return { result: j.result }
+    } catch (err: any) {
+      return { error: (err as Error).message ?? String(err) }
+    }
+  }
+  const stored = await chrome.storage.sync.get('chains')
+  const chains = (stored.chains as Record<number, ChainConfig> | undefined) ?? DEFAULT_CHAINS
+  const chain = chains[chainId]
+  if (!chain) return { error: `No chain config for chainId ${chainId}` }
+  try {
+    const result = await new RpcClient(chain.rpcs).request<unknown>('eth_sendRawTransaction', [rawTx])
+    return { result }
+  } catch (err: any) {
+    return { error: (err as Error).message ?? String(err) }
+  }
+}
 
 // Thin shell: deduplicates identical concurrent reads synchronously (before any
 // await) so that wagmi's parallel hydration calls don't each spawn a separate

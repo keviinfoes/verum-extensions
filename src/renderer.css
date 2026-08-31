@@ -199,6 +199,57 @@ html, body {
 }
 #unverified-modal-accept:hover { background: rgba(210,153,34,0.15); }
 
+/* ---- Broadcast approval modal ---- */
+#broadcast-backdrop {
+  position: fixed; inset: 0; z-index: 110; background: rgba(0,0,0,0.6);
+  backdrop-filter: blur(4px);
+}
+#broadcast-box {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%);
+  z-index: 111; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 16px; padding: 28px 30px;
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  text-align: center; max-width: 400px; width: calc(100% - 48px);
+}
+#broadcast-icon { font-size: 26px; }
+#broadcast-title { font-size: 16px; font-weight: 700; color: var(--text); }
+#broadcast-desc { color: var(--text-muted); font-size: 13px; line-height: 1.5; margin: 0; }
+#broadcast-details {
+  width: 100%; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.broadcast-row { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.broadcast-row-label { color: var(--text-muted); flex: none; }
+.broadcast-row-value {
+  color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all; text-align: right;
+}
+#broadcast-remember {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--text-muted); font-size: 12px; cursor: pointer; align-self: flex-start;
+}
+#broadcast-remember input { cursor: pointer; }
+#broadcast-actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+#broadcast-cancel {
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text-muted); border-radius: 8px;
+  padding: 8px 16px; cursor: pointer; font-size: 13px; transition: border-color 0.15s;
+}
+#broadcast-cancel:hover { border-color: var(--text); color: var(--text); }
+#broadcast-verum {
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text); border-radius: 8px;
+  padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 500; transition: border-color 0.15s;
+}
+#broadcast-verum:hover { border-color: var(--accent); color: var(--accent); }
+#broadcast-endpoint {
+  background: transparent; border: 1px solid var(--accent);
+  color: var(--accent); border-radius: 8px;
+  padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 500; transition: background 0.15s;
+}
+#broadcast-endpoint:hover { background: rgba(88,166,255,0.12); }
+
 /* ---- Wallet picker ---- */
 #wallet-picker-backdrop {
   position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 100;

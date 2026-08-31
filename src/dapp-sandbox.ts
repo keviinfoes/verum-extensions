@@ -127,16 +127,24 @@ return '<scr' + 'ipt>(function(){' +
   'try{window.URL=PU;}catch(e){}' +
   // window.ethereum stub: relays EIP-1193 calls to parent.
   'var _cbs={};' +
+  // Shared bridge: post one JSON-RPC method to the renderer and resolve when the
+  // matching eth-response returns. `endpoint` is carried only for raw broadcasts (see
+  // the fetch shim) so the renderer can offer to keep the dapp\'s chosen RPC.
+  'function _send(method,params,endpoint){' +
+    'return new Promise(function(res,rej){' +
+      'var id=(Math.random()*1e17).toString(36);' +
+      '_cbs[id]={res:res,rej:rej};' +
+      'var m={type:"eth-request",id:id,method:method,params:params||[]};' +
+      'if(endpoint)m.endpoint=endpoint;' +
+      'window.parent.postMessage(m,"*");' +
+    '});' +
+  '}' +
   'var _eth={' +
     'isMetaMask:true,chainId:"' + chainIdHex + '",isConnected:function(){return true;},' +
     '_handlers:{},' +
     'request:function(a){' +
       'if(a.method==="eth_chainId")return Promise.resolve("' + chainIdHex + '");' +
-      'return new Promise(function(res,rej){' +
-        'var id=(Math.random()*1e17).toString(36);' +
-        '_cbs[id]={res:res,rej:rej};' +
-        'window.parent.postMessage({type:"eth-request",id:id,method:a.method,params:a.params||[]},"*");' +
-      '});' +
+      'return _send(a.method,a.params,null);' +
     '},' +
     'enable:function(){return this.request({method:"eth_requestAccounts",params:[]});},' +
     'send:function(m,p){if(typeof m==="string")return this.request({method:m,params:p||[]});return this.request(m);},' +
@@ -147,6 +155,41 @@ return '<scr' + 'ipt>(function(){' +
     'disconnect:function(){window.parent.postMessage({type:"eth-disconnect"},"*");}' +
   '};' +
   'window.ethereum=_eth;' +
+  // fetch shim: many dapps bypass window.ethereum and POST JSON-RPC straight to a
+  // hardcoded RPC (tenderly/drpc/mevblocker/…) via fetch. Those requests are blocked by
+  // the sandbox CSP (default-src does not allow external connect-src), so every read
+  // fails. Detect a JSON-RPC POST (single or batch) and reroute it through the same
+  // verified bridge window.ethereum uses — reads go to Helios/trusted RPC per the toggle;
+  // eth_sendRawTransaction carries the original endpoint so the renderer can ask the user
+  // whether to keep it (MEV protection). The CSP never opens; anything not JSON-RPC-shaped
+  // passes straight to native fetch untouched.
+  'try{' +
+    'var _nf=window.fetch?window.fetch.bind(window):null;' +
+    'var _isRpc=function(o){return o&&typeof o==="object"&&typeof o.method==="string"&&/^(eth|net|web3|wallet|personal)_/.test(o.method);};' +
+    'var _rpcResp=function(req,ep){var id=(req&&req.id!=null)?req.id:null;' +
+      'var e=(req&&req.method==="eth_sendRawTransaction")?ep:null;' +
+      'return _send(req.method,req.params||[],e).then(function(r){return{jsonrpc:"2.0",id:id,result:r};},' +
+        'function(err){return{jsonrpc:"2.0",id:id,error:{code:-32603,message:String(err&&err.message||err)}};});};' +
+    'window.fetch=function(input,init){' +
+      'try{' +
+        'var method=(init&&init.method)||(input&&typeof input!=="string"&&input.method)||"GET";' +
+        'if(String(method).toUpperCase()==="POST"){' +
+          'var body=(init&&init.body!=null)?init.body:null;' +
+          'if(typeof body==="string"){' +
+            'var j=null;try{j=JSON.parse(body);}catch(e){}' +
+            'var one=_isRpc(j);' +
+            'var batch=Array.isArray(j)&&j.length>0&&j.every(_isRpc);' +
+            'if(one||batch){' +
+              'var ep=(typeof input==="string")?input:(input&&input.url)||"";' +
+              'var pr=one?_rpcResp(j,ep):Promise.all(j.map(function(x){return _rpcResp(x,ep);}));' +
+              'return pr.then(function(out){return new Response(JSON.stringify(out),{status:200,headers:{"content-type":"application/json"}});});' +
+            '}' +
+          '}' +
+        '}' +
+      '}catch(e){}' +
+      'return _nf?_nf(input,init):Promise.reject(new Error("fetch unavailable"));' +
+    '};' +
+  '}catch(e){}' +
   // EIP-6963: announce provider so wagmi latest uses us as the injected connector.
   'var _info={uuid:"w3-verum-injected",name:"Verum",icon:"",rdns:"w3.verum"};' +
   'function _announce(){' +
@@ -199,6 +242,24 @@ return '<scr' + 'ipt>(function(){' +
     'var h=(typeof a.href==="string")?a.href:(a.href&&a.href.baseVal)||a.getAttribute("xlink:href")||a.getAttribute("href");' +
     'if(!h)return;' +
     'try{var u=new URL(h,"https://dapp.w3fs/");' +
+      // Same-document hash navigation (SPA hash router). A srcdoc iframe\'s base URL is the
+      // containing frame (dapp-sandbox.html), so <a href="#/route"> resolves to
+      // dapp-sandbox.html#/route — a default click NAVIGATES the frame there (blank page)
+      // instead of a same-document hash change. Detect a link that differs from the current
+      // document only by its #fragment and apply it as a local hash change, so the dapp\'s
+      // router reacts in place. Uses document.baseURI so it matches however the anchor resolved.
+      'try{var _b=new URL(document.baseURI);var _hh=new URL(h,document.baseURI);' +
+        // Same-document (origin+path+query match, fragment may differ or be empty): covers
+        // <a href="#/route">, <a href="#"> and <a href=""> — all of which would otherwise
+        // cross-navigate the frame to dapp-sandbox.html (blank). Apply as a local hash change
+        // so the dapp\'s hash router reacts in place; an unchanged hash still re-fires
+        // hashchange so re-clicking the active route re-runs the router.
+        'if(_hh.origin===_b.origin&&_hh.pathname===_b.pathname&&_hh.search===_b.search){' +
+          'e.preventDefault();' +
+          'if(location.hash!==_hh.hash)location.hash=_hh.hash;' +
+          'else window.dispatchEvent(new HashChangeEvent("hashchange"));' +
+          'return;' +
+        '}}catch(_e){}' +
       'if(u.hostname==="dapp.w3fs")return;' +
       'if(u.protocol==="w3:"){' +
         'e.preventDefault();window.parent.postMessage({type:"w3-navigate",url:h},"*");return;' +

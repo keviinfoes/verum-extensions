@@ -95,6 +95,161 @@ const toastWalletLabel   = document.getElementById('toast-wallet-label') as HTML
 
 frameToastClose.addEventListener('click', () => frameToast.classList.add('hidden'))
 
+// ---------------------------------------------------------------------------
+// Broadcast approval — raw tx broadcast target chooser (fetch-origin sends)
+// ---------------------------------------------------------------------------
+
+const broadcastModal    = document.getElementById('broadcast-modal') as HTMLDivElement
+const broadcastBackdrop = document.getElementById('broadcast-backdrop') as HTMLDivElement
+const broadcastDesc     = document.getElementById('broadcast-desc') as HTMLParagraphElement
+const broadcastDetails  = document.getElementById('broadcast-details') as HTMLDivElement
+const broadcastRememberCb = document.getElementById('broadcast-remember-cb') as HTMLInputElement
+const broadcastEndpointHost = document.getElementById('broadcast-endpoint-host') as HTMLSpanElement
+const broadcastCancel   = document.getElementById('broadcast-cancel') as HTMLButtonElement
+const broadcastVerum    = document.getElementById('broadcast-verum') as HTMLButtonElement
+const broadcastEndpoint = document.getElementById('broadcast-endpoint') as HTMLButtonElement
+
+type BroadcastChoice = { useEndpoint: string | null }
+
+// Per-dapp remembered broadcast target (keyed by w3:// host). Default off — the checkbox
+// is unchecked each time, so a choice is remembered only when the user opts in.
+const broadcastPrefs = new Map<string, 'endpoint' | 'verum'>()
+chrome.storage.session.get('broadcastPrefs').then(v => {
+  const p = v.broadcastPrefs as Record<string, 'endpoint' | 'verum'> | undefined
+  if (p) for (const k in p) broadcastPrefs.set(k, p[k])
+}).catch(() => {})
+function persistBroadcastPrefs() {
+  const obj: Record<string, string> = {}
+  broadcastPrefs.forEach((v, k) => { obj[k] = v })
+  chrome.storage.session.set({ broadcastPrefs: obj }).catch(() => {})
+}
+
+// Grant the dapp's endpoint host at broadcast time. Common RPC hosts are already in
+// host_permissions (contains() → true, no prompt); anything else triggers Chrome's
+// optional-permission prompt, which needs the user gesture from the approval click.
+async function ensureHostPermission(endpoint: string): Promise<boolean> {
+  try {
+    const origin = new URL(endpoint).origin + '/*'
+    if (await chrome.permissions.contains({ origins: [origin] })) return true
+    return await chrome.permissions.request({ origins: [origin] })
+  } catch { return false }
+}
+
+async function confirmBroadcast(rawTx: string, endpoint: string): Promise<BroadcastChoice | null> {
+  const remembered = broadcastPrefs.get(currentPageUrl)
+  if (remembered === 'verum') return { useEndpoint: null }
+  if (remembered === 'endpoint') {
+    return (await ensureHostPermission(endpoint)) ? { useEndpoint: endpoint } : null
+  }
+
+  let host = endpoint
+  try { host = new URL(endpoint).host } catch {}
+  broadcastEndpointHost.textContent = host
+  broadcastDesc.textContent = 'This dApp wants to broadcast a signed transaction.'
+  broadcastRememberCb.checked = false
+
+  // Best-effort decode of the signed tx so the user sees where funds go before approving.
+  broadcastDetails.innerHTML = ''
+  const addRow = (label: string, value: string) => {
+    const row = document.createElement('div')
+    row.className = 'broadcast-row'
+    const l = document.createElement('span'); l.className = 'broadcast-row-label'; l.textContent = label
+    const v = document.createElement('span'); v.className = 'broadcast-row-value'; v.textContent = value
+    row.append(l, v); broadcastDetails.appendChild(row)
+  }
+  addRow('Endpoint', host)
+  const dec = decodeRawTx(rawTx)
+  if (dec) {
+    if (dec.to) addRow('To', dec.to)
+    else addRow('To', 'Contract creation')
+    addRow('Value', formatEth(dec.value) + ' ETH')
+    if (dec.dataLen > 0) addRow('Data', dec.dataLen + ' bytes')
+  } else {
+    addRow('Details', 'Unable to decode — review endpoint')
+  }
+
+  return new Promise<BroadcastChoice | null>((resolve) => {
+    const cleanup = () => {
+      broadcastModal.classList.add('hidden')
+      broadcastCancel.onclick = null
+      broadcastVerum.onclick = null
+      broadcastEndpoint.onclick = null
+      broadcastBackdrop.onclick = null
+    }
+    const remember = (target: 'endpoint' | 'verum') => {
+      if (broadcastRememberCb.checked) { broadcastPrefs.set(currentPageUrl, target); persistBroadcastPrefs() }
+    }
+    broadcastCancel.onclick = () => { cleanup(); resolve(null) }
+    broadcastBackdrop.onclick = () => { cleanup(); resolve(null) }
+    broadcastVerum.onclick = () => { remember('verum'); cleanup(); resolve({ useEndpoint: null }) }
+    broadcastEndpoint.onclick = async () => {
+      const ok = await ensureHostPermission(endpoint)
+      if (!ok) { cleanup(); resolve(null); return }
+      remember('endpoint'); cleanup(); resolve({ useEndpoint: endpoint })
+    }
+    broadcastModal.classList.remove('hidden')
+  })
+}
+
+// Minimal signed-tx decoder (legacy + EIP-2930/1559/4844). Returns to/value/dataLen for
+// the approval UI only — never used for verification. Best-effort; returns null on any
+// malformed input rather than throwing.
+function decodeRawTx(raw: string): { to: string | null; value: bigint; dataLen: number } | null {
+  try {
+    const hex = raw.startsWith('0x') ? raw.slice(2) : raw
+    if (hex.length < 2) return null
+    const bytes = new Uint8Array(hex.length / 2)
+    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16)
+    let type = 0
+    let payload = bytes
+    if (bytes[0] >= 0x01 && bytes[0] <= 0x04) { type = bytes[0]; payload = bytes.slice(1) }
+    const items = rlpDecodeList(payload)
+    // Field offsets by tx type (fields before accessList are all we index):
+    //  legacy:   [nonce, gasPrice, gasLimit, to, value, data, …]
+    //  2930:     [chainId, nonce, gasPrice, gasLimit, to, value, data, …]
+    //  1559/4844:[chainId, nonce, maxPrio, maxFee, gasLimit, to, value, data, …]
+    const off = type === 0 ? { to: 3, val: 4, data: 5 }
+      : type === 1 ? { to: 4, val: 5, data: 6 }
+      : { to: 5, val: 6, data: 7 }
+    const toB = items[off.to]
+    const to = toB && toB.length ? '0x' + bytesToHex(toB) : null
+    const value = items[off.val] ? bytesToBigInt(items[off.val]) : 0n
+    const dataLen = items[off.data] ? items[off.data].length : 0
+    return { to, value, dataLen }
+  } catch { return null }
+}
+
+function rlpReadItem(b: Uint8Array, p: number): [Uint8Array, number] {
+  const first = b[p]
+  if (first < 0x80) return [b.slice(p, p + 1), p + 1]
+  if (first < 0xb8) { const s = p + 1; const len = first - 0x80; return [b.slice(s, s + len), s + len] }
+  if (first < 0xc0) { const ll = first - 0xb7; const len = bytesToNum(b.slice(p + 1, p + 1 + ll)); const s = p + 1 + ll; return [b.slice(s, s + len), s + len] }
+  if (first < 0xf8) { const s = p + 1; const len = first - 0xc0; return [b.slice(s, s + len), s + len] }
+  const ll = first - 0xf7; const len = bytesToNum(b.slice(p + 1, p + 1 + ll)); const s = p + 1 + ll
+  return [b.slice(s, s + len), s + len]
+}
+function rlpDecodeList(b: Uint8Array): Uint8Array[] {
+  const first = b[0]
+  let start: number, end: number
+  if (first >= 0xf8) { const ll = first - 0xf7; const len = bytesToNum(b.slice(1, 1 + ll)); start = 1 + ll; end = start + len }
+  else if (first >= 0xc0) { const len = first - 0xc0; start = 1; end = 1 + len }
+  else throw new Error('not an RLP list')
+  const items: Uint8Array[] = []
+  let p = start
+  while (p < end) { const [content, next] = rlpReadItem(b, p); items.push(content); p = next }
+  return items
+}
+function bytesToNum(b: Uint8Array): number { let n = 0; for (const x of b) n = n * 256 + x; return n }
+function bytesToBigInt(b: Uint8Array): bigint { let n = 0n; for (const x of b) n = (n << 8n) | BigInt(x); return n }
+function bytesToHex(b: Uint8Array): string { let s = ''; for (const x of b) s += x.toString(16).padStart(2, '0'); return s }
+function formatEth(wei: bigint): string {
+  const whole = wei / 1_000_000_000_000_000_000n
+  const frac = wei % 1_000_000_000_000_000_000n
+  if (frac === 0n) return whole.toString()
+  const fracStr = frac.toString().padStart(18, '0').replace(/0+$/, '')
+  return `${whole}.${fracStr.slice(0, 6)}`
+}
+
 
 // Keep-alive port: an open port resets Chrome's 30s SW idle timer natively
 // without burning any RPC credits. Reconnects if the SW is killed and restarts.
@@ -235,6 +390,23 @@ window.addEventListener('message', async (e) => {
 
   const sendBack = (result: unknown, error?: string) =>
     dappFrame.contentWindow?.postMessage({ type: 'eth-response', id, result, error }, '*')
+
+  // Raw-fetch broadcast: the polyfill's fetch shim rerouted an eth_sendRawTransaction that
+  // the dapp POSTed straight to a hardcoded RPC (e.g. mevblocker). The tx is already signed;
+  // we only need the user to approve WHERE it goes — the dapp's endpoint (preserving MEV
+  // protection) or verum's RPC set. `endpoint` is only ever set for these fetch-origin sends;
+  // reads via fetch have no endpoint and fall through to the normal read path below.
+  const endpoint: string | undefined = typeof e.data.endpoint === 'string' ? e.data.endpoint : undefined
+  if (method === 'eth_sendRawTransaction' && endpoint) {
+    const rawTx = (Array.isArray(params) ? params[0] : params) as string
+    const choice = await confirmBroadcast(rawTx, endpoint)
+    if (!choice) { sendBack(undefined, 'User rejected the request.'); return }
+    const resp = await chrome.runtime.sendMessage({
+      type: 'broadcast-raw-tx', chainId: currentChainId, rawTx, endpoint: choice.useEndpoint,
+    })
+    sendBack(resp?.result, resp?.error)
+    return
+  }
 
   // eth_chainId can always be answered from the URL — no wallet connection needed.
   // Returning "Not connected" here causes some dApps to reset their connect UI.

@@ -72,6 +72,23 @@
     </div>
   </div>
 
+  <!-- Broadcast approval — raw tx broadcast target chooser (fetch-origin sends) -->
+  <div id="broadcast-modal" class="hidden">
+    <div id="broadcast-backdrop"></div>
+    <div id="broadcast-box">
+      <span id="broadcast-icon">📡</span>
+      <h3 id="broadcast-title">Broadcast transaction?</h3>
+      <p id="broadcast-desc">This dApp wants to broadcast a signed transaction.</p>
+      <div id="broadcast-details"></div>
+      <label id="broadcast-remember"><input type="checkbox" id="broadcast-remember-cb" /> Remember for this dApp</label>
+      <div id="broadcast-actions">
+        <button id="broadcast-cancel">Cancel</button>
+        <button id="broadcast-verum">Via verum RPCs</button>
+        <button id="broadcast-endpoint">Via <span id="broadcast-endpoint-host">endpoint</span></button>
+      </div>
+    </div>
+  </div>
+
   <!-- Verifying badge — shown until Helios confirms or denies -->
   <div id="verify-badge" class="hidden">
     <span id="verify-icon">⟳</span>
