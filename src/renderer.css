@@ -43,13 +43,36 @@ html, body {
 @keyframes spin { to { transform: rotate(360deg); } }
 #loading-text { color: var(--text-muted); font-size: 14px; }
 
-#error-panel h2  { color: var(--red); font-size: 20px; }
+#error-panel h2  { color: var(--text); font-size: 22px; font-weight: 600; }
 #error-message {
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 16px;
-  max-width: 700px; width: 100%;
-  font-size: 13px; white-space: pre-wrap; word-break: break-all;
+  max-width: 360px; width: 100%;
+  margin-top: 22px;
+  color: var(--text); font-size: 13px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
 }
+#error-message strong { color: #fff; font-weight: 600; margin-right: 4px; }
+
+/* ---- Rocket mini-game (shown inside the error panel) ---- */
+#rocket-game {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  margin-top: 4px;
+}
+#rocket-game canvas {
+  width: 360px; max-width: 100%; height: auto;
+  background: transparent; touch-action: none; cursor: pointer;
+}
+#rocket-game .rg-bar {
+  display: flex; align-items: center; gap: 12px;
+  width: 360px; max-width: 100%; justify-content: space-between;
+}
+#rocket-game .rg-hint { color: var(--text-muted); font-size: 12px; }
+#rocket-game .rg-restart {
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 12px; font-size: 12px; cursor: pointer;
+}
+#rocket-game .rg-restart:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+#rocket-game .rg-restart:disabled { opacity: 0.4; cursor: default; }
 
 /* ---- Verifying badge — bottom-left, disappears once verified ---- */
 #verify-badge {

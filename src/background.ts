@@ -17,7 +17,7 @@ import { listWallets, ethRequest as walletRequest } from './lib/wallets/metamask
 import { isFrameAvailable, frameRequest } from './lib/wallets/frame-bridge.js'
 import type { IVerifiedRpc } from './lib/rpc/light-client.js'
 
-const BUILD_ID = 'hash-router-nav-2026-08-31T03'
+const BUILD_ID = 'rocket-error-game-2026-09-03T05'
 
 console.log(`[w3] background build ${BUILD_ID}`)
 

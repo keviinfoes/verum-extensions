@@ -1,6 +1,7 @@
 import { formatWeb3URL, parseWeb3URL } from './lib/w3/url-parser.js'
 import { parseBundle, bundleFileAt } from './lib/w3/content.js'
 import { buildDappHtml } from './lib/w3/dapp-html.js'
+import { startRocketGame, stopRocketGame } from './rocket-game.js'
 import type { BgMessage, BgResponse, VerificationUpdate } from './types.js'
 
 const splash          = document.getElementById('splash') as HTMLDivElement
@@ -52,6 +53,7 @@ function setPhase(phase: Phase) {
   splash.classList.toggle('hidden',      phase !== 'idle')
   loading.classList.toggle('hidden',     phase !== 'loading')
   errorPanel.classList.toggle('hidden',  phase !== 'error')
+  if (phase === 'error') startRocketGame(errorPanel); else stopRocketGame()
   dappHost.classList.toggle('dapp-visible', phase === 'ok' && renderMode === 'dapp')
   rawView.classList.toggle('raw-visible', phase === 'ok' && renderMode === 'raw')
   verifyBadge.classList.toggle('hidden', phase !== 'ok')
@@ -977,5 +979,12 @@ function renderContent(data: Uint8Array, contentType: string, assetMap: Record<s
 
 // ---------------------------------------------------------------------------
 
-function showError(msg: string) { errorMessage.textContent = msg; setPhase('error') }
+function showError(msg: string) {
+  errorMessage.textContent = ''
+  const label = document.createElement('strong')
+  label.textContent = 'Error'
+  errorMessage.appendChild(label)
+  errorMessage.appendChild(document.createTextNode(' ' + msg))
+  setPhase('error')
+}
 function esc(s: string) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') }
