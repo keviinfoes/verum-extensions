@@ -1,0 +1,19 @@
+name: Helios version check
+
+# Fails when our pinned @a16z/helios drifts from the latest published version,
+# so we get notified to bump + rebuild + ship (Helios' WASM is bundled at build
+# time). Runs weekly and on demand.
+on:
+  schedule:
+    - cron: '0 9 * * 1'   # Mondays 09:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check-helios:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm run check:helios

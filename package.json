@@ -6,7 +6,8 @@
     "build": "vite build",
     "watch": "vite build --watch",
     "dev": "vite build --watch",
-    "test": "esbuild test/verification-flow-proof.ts --bundle --platform=node --format=esm --outfile=test/.verification-flow-proof.mjs --log-level=error && node test/.verification-flow-proof.mjs"
+    "test": "esbuild test/verification-flow-proof.ts --bundle --platform=node --format=esm --outfile=test/.verification-flow-proof.mjs --log-level=error && node test/.verification-flow-proof.mjs",
+    "check:helios": "node scripts/check-helios.mjs"
   },
   "dependencies": {
     "@a16z/helios": "^0.11.1",

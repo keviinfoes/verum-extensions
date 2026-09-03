@@ -33,9 +33,21 @@ async function ethCall(rpc: IVerifiedRpc, to: string, data: string, block: strin
   return rpc.request<string>('eth_call', [{ to, data }, block])
 }
 
+// A failed eth_call has two very different meanings that MUST NOT be conflated:
+//  - infra error (Helios shut down mid-restart, out of sync, WASM timeout, no RPC) → the read
+//    couldn't run; the caller must rethrow so it can retry on a fresh instance. Masking this
+//    as "contract has no interface" produces a wrong "not a web3:// content site" verdict.
+//  - genuine execution revert / empty return → the contract doesn't implement the interface.
+function isInfraError(e: unknown): boolean {
+  const m = ((e as Error)?.message ?? '').toLowerCase()
+  return m.includes('shut down') || m.includes('out of sync') ||
+         m.includes('wasm call timeout') || m.includes('not available') ||
+         m.includes('all rpcs failed')
+}
+
 // Map the URL path/query onto ERC-5219 resource[] + params[]. "/a/b?x=1&y=2" →
 // resource ["a","b"], params [["x","1"],["y","2"]]. Root "/" → resource [].
-export function resourceParamsFromPath(path: string): { resource: string[]; params: [string, string][] } {
+function resourceParamsFromPath(path: string): { resource: string[]; params: [string, string][] } {
   const qIdx = path.indexOf('?')
   const pathname = qIdx === -1 ? path : path.slice(0, qIdx)
   const query = qIdx === -1 ? '' : path.slice(qIdx + 1)
@@ -70,11 +82,9 @@ async function readResolveMode(rpc: IVerifiedRpc, to: string, block: string): Pr
     return new TextDecoder().decode(bytes.slice(0, end))
   } catch (e) {
     // A contract with no resolveMode() reverts → treat as "" (auto). But an infra error
-    // (Helios shut down / OOS / timeout) must propagate so the caller retries, not be
-    // mistaken for a contract that simply doesn't implement resolveMode.
-    const m = ((e as Error)?.message ?? '').toLowerCase()
-    if (m.includes('shut down') || m.includes('out of sync') || m.includes('wasm call timeout') ||
-        m.includes('not available') || m.includes('all rpcs failed')) throw e
+    // must propagate so the caller retries, not be mistaken for a contract that simply
+    // doesn't implement resolveMode.
+    if (isInfraError(e)) throw e
     return ''
   }
 }
@@ -91,26 +101,13 @@ export async function fetchContractContent(
   const mode = await readResolveMode(rpc, address, block)
   console.log(`[w3] erc5219 ${address} resolveMode="${mode}"`)
 
-  // A failed eth_call has two very different meanings and they MUST NOT be conflated:
-  //  - infra error (Helios shut down mid-restart, out of sync, WASM timeout) → the read
-  //    couldn't run; rethrow so the caller can retry on a fresh instance. Masking this as
-  //    "contract has no interface" produced the wrong "not a web3:// content site" verdict.
-  //  - genuine execution revert / empty return → the contract doesn't implement this
-  //    interface; return null so the caller falls through to the other one.
-  const isInfra = (e: unknown): boolean => {
-    const m = ((e as Error)?.message ?? '').toLowerCase()
-    return m.includes('shut down') || m.includes('out of sync') ||
-           m.includes('wasm call timeout') || m.includes('not available') ||
-           m.includes('all rpcs failed')
-  }
-
   // ERC-5219 request(resource, params) → (status, body, headers). Returns null if the
   // contract doesn't implement it (reverts / empty); rethrows infra errors.
   const tryRequest = async (): Promise<ContractContent | null> => {
     const { resource, params } = resourceParamsFromPath(path)
     const data = iface.encodeFunctionData('request', [resource, params])
     let res: string
-    try { res = await ethCall(rpc, address, data, block) } catch (e) { if (isInfra(e)) throw e; return null }
+    try { res = await ethCall(rpc, address, data, block) } catch (e) { if (isInfraError(e)) throw e; return null }
     if (!res || res === '0x') return null
     let decoded
     try { decoded = iface.decodeFunctionResult('request', res) } catch { return null }
@@ -133,7 +130,7 @@ export async function fetchContractContent(
   const tryHtml = async (): Promise<ContractContent | null> => {
     const data = iface.encodeFunctionData('html', [])
     let res: string
-    try { res = await ethCall(rpc, address, data, block) } catch (e) { if (isInfra(e)) throw e; return null }
+    try { res = await ethCall(rpc, address, data, block) } catch (e) { if (isInfraError(e)) throw e; return null }
     if (!res || res === '0x') return null
     let decoded
     try { decoded = iface.decodeFunctionResult('html', res) } catch { return null }
